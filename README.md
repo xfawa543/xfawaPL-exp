@@ -1,4 +1,4 @@
-xfawaPL-exp
+# xfawaPL-exp
 
 xfawaPL 的实验性语法与社区脑洞实验室。
 
@@ -10,7 +10,7 @@ xfawaPL 的实验性语法与社区脑洞实验室。
 
 ---
 
-🧪 这里是什么？
+## 🧪 这里是什么？
 
 "xfawaPL-exp" 不代表 xfawaPL 的正式语法。
 
