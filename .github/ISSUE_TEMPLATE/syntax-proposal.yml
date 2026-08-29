@@ -1,0 +1,105 @@
+name: Syntax Proposal
+description: Propose a new experimental syntax for xfawaPL
+title: "[Syntax] "
+labels:
+  - syntax-proposal
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        # 💡 xfawaPL Syntax Proposal
+
+        Have an idea for a new xfawaPL syntax?
+
+        It does not need to be fully designed or technically possible.
+        A good idea is enough.
+
+        The syntax may be redesigned during experimentation.
+
+  - type: input
+    id: syntax-name
+    attributes:
+      label: Syntax Name
+      description: What would you call this syntax?
+      placeholder: "watch"
+    validations:
+      required: true
+
+  - type: textarea
+    id: syntax
+    attributes:
+      label: Syntax
+      description: |
+        Show what you imagine the syntax could look like.
+        It can be incomplete or only a rough idea.
+      placeholder: |
+        watch player.health {
+            print(player.health)
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What should it do?
+      description: Explain what you expect this syntax to do.
+      placeholder: |
+        Execute the code block whenever player.health changes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reason
+    attributes:
+      label: Why is it useful?
+      description: What problem does this syntax solve?
+      placeholder: |
+        It allows programs to react to changes without manually checking
+        the value every frame.
+    validations:
+      required: true
+
+  - type: textarea
+    id: existing-syntax
+    attributes:
+      label: Relation to Existing Syntax
+      description: |
+        Optional. Does this syntax extend, replace, or work together
+        with any existing xfawaPL syntax?
+      placeholder: |
+        This could work together with if and watch.
+
+  - type: textarea
+    id: execution
+    attributes:
+      label: How should it work?
+      description: |
+        Optional. If you have ideas about execution, parameters,
+        limitations, or runtime behavior, describe them here.
+      placeholder: |
+        Only execute when the value actually changes,
+        rather than every frame.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternative Designs
+      description: |
+        Optional. If you have other ideas for how the syntax could look,
+        put them here.
+      placeholder: |
+        Another possible form:
+
+        watch(player.health) {
+            print(player.health)
+        }
+
+  - type: checkboxes
+    id: understanding
+    attributes:
+      label: Before submitting
+      options:
+        - label: I understand that this is an experimental proposal and may be modified or rejected.
+          required: true
