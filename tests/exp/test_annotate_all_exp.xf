@@ -1,0 +1,26 @@
+#test {
+    fn main() {
+        // EXP: boom —— 让程序播放爆炸效果后正常退出
+        boom
+        // EXP: bsod —— 显示一个受控假蓝屏后继续执行
+        bsod
+        // EXP: believe —— 让程序相信一个原本错误的事实
+        believe "2 + 2 = 5"
+        // EXP: lie —— 修改变量的被观察值（真实值不变）
+        lie answer = 42 {
+            print(answer)
+        }
+        // EXP: un —— 禁用某个语言行为
+        un print
+        // EXP: ignore —— 忽略该语句，不执行
+        ignore.print("skip")
+        // EXP: do —— 强制执行该语句，不受 un 影响
+        do.print("force")
+        // EXP: please —— 先输出 thank you! 再执行
+        please.print("hello")
+        // EXP: shutup —— 立即压制后续所有 warning（荒诞恐吓）
+        shutup
+        // EXP: ... —— 随机执行一个允许调用的安全动作
+        ...
+    }
+}

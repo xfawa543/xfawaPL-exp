@@ -1,0 +1,7 @@
+// EXP-001 Test 6 — oversized repeat value must be rejected (safety limit)
+#test {
+    fn main() {
+        // repeat: 999999999
+        print("A")
+    }
+}

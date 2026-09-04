@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        shutup
+        x = 1
+        print(x)
+    }
+}

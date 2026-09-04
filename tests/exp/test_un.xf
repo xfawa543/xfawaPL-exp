@@ -1,0 +1,8 @@
+#test {
+    fn main() {
+        un print
+        print("A")
+        !print("B")
+        print("C")
+    }
+}

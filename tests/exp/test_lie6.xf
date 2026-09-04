@@ -1,0 +1,13 @@
+#test {
+    fn main() {
+        x = 10
+        lie x = 99 {
+            print(x)
+            lie x = 88 {
+                print(x)
+            }
+            print(x)
+        }
+        print(x)
+    }
+}

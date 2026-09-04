@@ -1,0 +1,7 @@
+// EXP-001 Test 3 — repeat: 3 makes the following statement emit three times
+#test {
+    fn main() {
+        // repeat: 3
+        print("A")
+    }
+}

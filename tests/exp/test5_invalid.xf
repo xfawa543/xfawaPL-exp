@@ -1,0 +1,7 @@
+// EXP-001 Test 5 — invalid repeat value must yield a normal compile error
+#test {
+    fn main() {
+        // repeat: banana
+        print("A")
+    }
+}

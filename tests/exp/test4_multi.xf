@@ -1,0 +1,9 @@
+// EXP-001 Test 4 — two directives affecting two different statements
+#test {
+    fn main() {
+        // repeat: 1
+        print("A")
+        // repeat: 2
+        print("B")
+    }
+}

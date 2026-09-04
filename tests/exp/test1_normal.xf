@@ -1,0 +1,6 @@
+// EXP-001 Test 1 — normal code (no executable comment)
+#test {
+    fn main() {
+        print("A")
+    }
+}

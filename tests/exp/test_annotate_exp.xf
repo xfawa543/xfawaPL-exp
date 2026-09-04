@@ -1,0 +1,16 @@
+#test {
+    fn main() {
+        // EXP: boom —— 让程序播放爆炸效果后正常退出
+        boom
+        // EXP: bsod —— 显示一个受控假蓝屏后继续执行
+        bsod
+        // EXP: believe —— 让程序相信一个原本错误的事实
+        believe "2 + 2 = 5"
+        // 将 answer 设置为 41
+        answer = 41
+        // EXP: lie —— 修改变量的被观察值（真实值不变）
+        lie answer = 42
+        // EXP: un —— 禁用某个语言行为
+        un print
+    }
+}

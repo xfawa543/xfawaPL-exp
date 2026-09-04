@@ -1,0 +1,12 @@
+#test {
+    fn main() {
+        answer = 41
+        lie answer = 42 {
+            if (answer == 42) {
+                print("秘密")
+            }
+            print(answer)
+        }
+        print(answer)
+    }
+}

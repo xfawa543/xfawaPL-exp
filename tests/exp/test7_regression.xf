@@ -1,0 +1,17 @@
+// regression: if / expression / normal comment / nested block
+#test {
+    fn main() {
+        int x = 10
+        // a normal comment, should be ignored
+        if x > 5 {
+            print("big")
+        } else {
+            print("small")
+        }
+        int y = x + 2
+        print(y)
+        {
+            print("inner-block")
+        }
+    }
+}

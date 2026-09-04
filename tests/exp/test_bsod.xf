@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        print("before")
+        bsod
+        print("after")
+    }
+}

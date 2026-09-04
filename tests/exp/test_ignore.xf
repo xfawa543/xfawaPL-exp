@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        print("first")
+        ignore.print("second")
+        print("third")
+    }
+}

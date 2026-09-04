@@ -1,0 +1,7 @@
+// EXP-001 Test 2 — a plain comment is seen but has no side effect
+#test {
+    fn main() {
+        // hello compiler
+        print("A")
+    }
+}

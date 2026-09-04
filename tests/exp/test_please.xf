@@ -1,0 +1,5 @@
+#test {
+    fn main() {
+        please.print("Hello")
+    }
+}

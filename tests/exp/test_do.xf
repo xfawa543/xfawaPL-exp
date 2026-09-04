@@ -1,0 +1,8 @@
+#test {
+    fn main() {
+        un print
+        print("blocked")
+        do.print("forced")
+        print("still barred")
+    }
+}

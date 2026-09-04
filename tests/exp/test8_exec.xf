@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        print("A")
+        // print("hello")
+        print("B")
+    }
+}
