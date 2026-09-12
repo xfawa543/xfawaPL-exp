@@ -1,0 +1,12 @@
+#test {
+    fn main() {
+        t = 2
+        print(t)
+        while (t > 0) {
+            come 9
+            t = t - 1
+            if t < 1 { boom }
+            print(t)
+        }
+    }
+}

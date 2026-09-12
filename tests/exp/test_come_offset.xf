@@ -1,0 +1,14 @@
+#test {
+    fn main() {
+        // a comment line
+
+        t = 3
+        print(t)
+        come 12
+        // comment between
+
+        t = t - 1
+        if t < 0 { boom }
+        print(t)
+    }
+}

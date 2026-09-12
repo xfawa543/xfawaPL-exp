@@ -1,0 +1,33 @@
+#test {
+    fn main() {
+        // o 字面量：o=10，oo=100，ooo=1000，n o=10*n
+        print(o)
+        print(oo)
+        print(ooo)
+        // o 之前有普通语句不影响
+        int dummy = 1
+        print(o)
+        // 普通表达式不受 o 影响
+        print(1 + 1)
+        print(10 + 20)
+        // 后缀 o 数值
+        print(1o)
+        print(2o)
+        print(15o)
+        print(1o + 1o)
+        // 区间
+        for i in [1...5] {
+            print(i)
+        }
+        // 混合输出
+        print(42)
+        print(o)
+        print(oo)
+        print("A")
+        print(o)
+        print("B")
+        // 标识符遮蔽 o 字面量
+        int o = 20
+        print(o)
+    }
+}

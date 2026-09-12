@@ -14,8 +14,11 @@
 #include <llvm/Object/ELFObjectFile.h>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
+#include <set>
 #include <vector>
 #include <string>
+#include <climits>
 
 namespace xfawa {
 
@@ -38,6 +41,30 @@ private:
     bool usesRandomBuiltin;
     bool hasBsod;
     bool hasEllipsisRandSeeded = false;   // only seed `rand()` once per program
+
+    // EXP `...`: each `...` picks one safe function and REALLY calls it with
+    // arguments generated from its actual signature. This block holds the
+    // candidate list (collected once, right after the function declarations
+    // are emitted) plus the per-trampoline runtime machinery.
+    enum { kRandomCallMaxDepth = 32 };
+    struct RandomCallCandidate {
+        std::string name;      // LLVM symbol name, for diagnostics
+        llvm::Function* callee;
+        bool nullPtrArg = false;  // builtins like time() expect a NULL pointer
+    };
+    std::vector<RandomCallCandidate> randomCallCandidates;
+    bool randomCallTableEmitted = false;
+    llvm::GlobalVariable* randomCallDepth = nullptr;
+    llvm::GlobalVariable* randomCallTable = nullptr;
+
+    void collectRandomCallCandidates(Program* program);
+    bool bodyIsDangerous(const Function* func) const;
+    llvm::Function* getRandFunction();
+    void emitRandomCallSeedOnce();
+    void emitRandomStringFill(llvm::GlobalVariable* buffer, int index);
+    llvm::Function* createRandomCallTrampoline(const RandomCallCandidate& cand, int index);
+    llvm::Value* emitRandomCallDispatch();
+
     llvm::BasicBlock* loopEndBB;
     OptimizationLevel optLevel;
     int generatedWindowCount;
@@ -51,9 +78,54 @@ private:
     bool unPrintDisabled = false;
     bool unBoomDisabled = false;
     bool unBsodDisabled = false;
+    bool unSleepDisabled = false;
 
     // EXP `believe`: normalized left-expression key -> believed result.
     std::unordered_map<std::string, int64_t> beliefMap;
+
+    // EXP `do`: statements already "hoisted" to run unconditionally (escape
+    // from enclosing conditional/loop branches). Pointers recorded here are
+    // skipped when their original (in-branch) position is generated later.
+    std::unordered_set<const Statement*> hoistedDo;
+
+    // Emit the inner statement of a `do`, bypassing any `un` disabling.
+    void emitDoInner(DoStatement* stmt);
+    // Recursively find `do` statements inside a condition/loop body and emit
+    // them unconditionally now, so they ignore the surrounding branch.
+    void hoistDoFromBranch(Statement* stmt);
+
+    // EXP `come`: a reverse goto. `come` records a landing position; when the
+    // statement on its target physical source line executes, control jumps back
+    // to the come's landing. Data collected per xfawa function:
+    struct ComeRecord {
+        int comeLine = 0;      // physical line of the come statement
+        int targetLine = 0;    // physical line that triggers the jump
+        ComeStatement* stmt = nullptr; // for the optional `if(cond)` condition
+    };
+    // Same-unit statement lines (never generated): try block, loop/button/
+    // nested-fn bodies are recorded as foreign and cannot be come targets.
+    struct ComeScan {
+        std::set<int> validLines;            // statement start lines in this unit
+        std::map<int, NodeType> lineNode;    // start line -> node type (terminator reject)
+        std::vector<ComeRecord> comes;       // same-unit comes
+        std::set<int> comeLines;             // come statement lines (not valid targets)
+        std::vector<std::string> errors;     // ill-placed come errors (e.g. inside loop)
+        int minLine = INT_MAX;
+        int maxLine = 0;
+    };
+
+    std::vector<ComeRecord> functionComes;   // per-function (current codegen(Function*))
+    std::unordered_map<int, llvm::BasicBlock*> comeLandingBlocks; // comeLine -> landing
+    std::unordered_map<int, int> comeTargetPick;      // targetLine -> comeLine (smallest wins)
+    std::unordered_map<int, bool> comeTargetIntercepted; // targetLine -> jump emitted
+    std::unordered_set<int> comePlacementDone;        // comeLine already wired up
+
+    struct FunctionSpan { std::string name; int start; int end; };
+    std::vector<FunctionSpan> functionLineSpans; // all functions, for cross-function errors
+
+    void scanFunctionBody(const Statement* stmt, ComeScan& scan, bool inForeignUnit) const;
+    void placeComeLanding(int comeLine);
+    void maybeEmitComeJump(Statement* stmt);
     
 public:
     LLVMCodegen(llvm::LLVMContext& ctx, llvm::Module* mod);
@@ -117,6 +189,9 @@ private:
     llvm::Value* codegen(BooleanLiteral* expr);
     llvm::Value* codegen(StringLiteral* expr);
     llvm::Value* codegen(VariableExpression* expr);
+    llvm::Value* codegen(OLiteralExpression* expr);
+    llvm::Value* codegen(ParadoxExpression* expr);
+    llvm::Value* codegen(GhostExpression* expr);
     llvm::Value* codegen(UnaryOp* expr);
     llvm::Value* codegen(BinaryOp* expr);
     llvm::Value* codegen(CallExpression* expr);
@@ -138,6 +213,12 @@ private:
     llvm::Value* codegen(PleaseStatement* stmt);
     llvm::Value* codegen(ShutupStatement* stmt);
     llvm::Value* codegen(EllipsisStatement* stmt);
+    llvm::Value* codegen(SleepStatement* stmt);
+    llvm::Value* codegen(WrathStatement* stmt);
+    llvm::Value* codegen(ParadoxStatement* stmt);
+    llvm::Value* codegen(TryExpectStatement* stmt);
+    llvm::Value* codegen(SorryStatement* stmt);
+    llvm::Value* codegen(ComeStatement* stmt);
     llvm::Value* codegen(BlockStatement* stmt);
     llvm::Value* codegen(IfStatement* stmt);
     llvm::Value* codegen(WhileStatement* stmt);

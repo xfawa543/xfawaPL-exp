@@ -1,0 +1,9 @@
+#test {
+    fn main() {
+        counter = 1
+        come if(counter < 4) 7
+        counter = counter + 1
+        print(counter)
+        print(counter)
+    }
+}

@@ -1,0 +1,16 @@
+#test {
+    fn main() {
+        print("start")
+        sleep(1)
+        print("after-1s")
+        sleep(0.5)
+        print("after-half")
+        for i in [1...3] {
+            sleep(0.2)
+            print(i)
+        }
+        un sleep
+        sleep(5)
+        print("un-skip-fast")
+    }
+}

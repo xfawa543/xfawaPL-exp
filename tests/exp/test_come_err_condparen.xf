@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        x = 1
+        come if(x < 4 7
+        print("hi")
+    }
+}

@@ -441,6 +441,58 @@ llvm::Value* LLVMCodegen::codegen(VariableExpression* expr) {
     return nullptr;
 }
 
+// EXP `o`-literal (o / oo / ooo / 1o / 15o / ...).
+// Value semantics:
+//   - a pure run of 'o' (o, oo, ooo) is 10, 100, 1000, ... (10^n where n = #of o's)
+//   - digits followed by 'o's (1o, 15o, 10o) is the digit prefix times 10^(#of o's)
+// The raw text is "<digits><o...>" (digits may be empty, meaning an implicit 1).
+llvm::Value* LLVMCodegen::codegen(OLiteralExpression* expr) {
+    const std::string& raw = expr->raw;
+    size_t oCount = 0;
+    while (oCount < raw.size() && raw[raw.size() - 1 - oCount] == 'o') {
+        oCount++;
+    }
+    int64_t prefix = 1;
+    if (oCount < raw.size()) {
+        // digits before the trailing o's
+        std::string digits = raw.substr(0, raw.size() - oCount);
+        try {
+            prefix = std::stoll(digits);
+        } catch (...) {
+            prefix = 0;
+        }
+    }
+    int64_t v = prefix;
+    for (size_t i = 0; i < oCount; i++) {
+        v *= 10;
+    }
+    return createConstInt(context, builder.getInt32Ty(), v);
+}
+
+// EXP `paradox`: a paradox value evaluates to integer 0 (deterministic). It is
+// detected specially by `print` to output the literal "PARADOX".
+llvm::Value* LLVMCodegen::codegen(ParadoxExpression* expr) {
+    return createConstInt(context, builder.getInt32Ty(), 0);
+}
+
+// EXP `paradox` stage 2 (`幽灵论`): a GHOST variable keeps its stored value --
+// evaluating it reads the exact same alloca a normal variable read would. The
+// lost causal origin changes how `print` displays it (an appended "#"), not
+// what the value is. Never rewritten into 0.
+llvm::Value* LLVMCodegen::codegen(GhostExpression* expr) {
+    auto it = locals.find(expr->name);
+    if (it != locals.end()) {
+        llvm::AllocaInst* alloca = it->second;
+        return builder.CreateLoad(alloca->getAllocatedType(), alloca, expr->name.c_str());
+    }
+    auto globalIt = windowInputGlobals.find(expr->name);
+    if (globalIt != windowInputGlobals.end()) {
+        return builder.CreateLoad(globalIt->second->getValueType(), globalIt->second, expr->name.c_str());
+    }
+    addError("Undefined variable: " + expr->name);
+    return nullptr;
+}
+
 llvm::Value* LLVMCodegen::codegen(UnaryOp* expr) {
     llvm::Value* operandVal = codegen(expr->expr.get());
     if (!operandVal) return nullptr;
@@ -467,6 +519,40 @@ llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
                     return createConstInt(context, llvm::Type::getInt64Ty(context), it->second);
                 }
             }
+        }
+    }
+
+    // EXP `o`-literal addition ("位数合并"): when two o-literals are added, the
+    // counts of 'o' merge (n1 + n2) instead of the values being added normally.
+    // e.g. `1o + 1o == 100` (prefix 1, o-count 1+1=2), not 20.
+    // This only fires for o-literal + o-literal; ordinary numbers are untouched.
+    if (expr->op == BinaryOpType::ADD) {
+        auto* oLeft = dynamic_cast<OLiteralExpression*>(expr->left.get());
+        auto* oRight = dynamic_cast<OLiteralExpression*>(expr->right.get());
+        if (oLeft && oRight) {
+            auto parse = [](const std::string& raw, int64_t& prefix, size_t& oCount) {
+                oCount = 0;
+                while (oCount < raw.size() && raw[raw.size() - 1 - oCount] == 'o') {
+                    oCount++;
+                }
+                prefix = 1;
+                if (oCount < raw.size()) {
+                    std::string digits = raw.substr(0, raw.size() - oCount);
+                    try {
+                        prefix = std::stoll(digits);
+                    } catch (...) {
+                        prefix = 0;
+                    }
+                }
+            };
+            int64_t p1; size_t c1; parse(oLeft->raw, p1, c1);
+            int64_t p2; size_t c2; parse(oRight->raw, p2, c2);
+            int64_t v = p1;
+            size_t merged = c1 + c2;
+            for (size_t i = 0; i < merged; i++) {
+                v *= 10;
+            }
+            return createConstInt(context, builder.getInt32Ty(), v);
         }
     }
 
@@ -634,9 +720,9 @@ llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
             case BinaryOpType::MUL:
                 return builder.CreateFMul(leftVal, rightVal, "multmp");
             case BinaryOpType::DIV:
-                return builder.CreateFDiv(leftVal, rightVal, "divtmp");
+                return builder.CreateFDiv(leftVal, rightVal, "fdivtmp");
             case BinaryOpType::MOD:
-                return builder.CreateFRem(leftVal, rightVal, "modtmp");
+                return builder.CreateFRem(leftVal, rightVal, "fmodtmp");
             case BinaryOpType::EQUAL:
                 return builder.CreateFCmpOEQ(leftVal, rightVal, "eqtmp");
             case BinaryOpType::NOT_EQUAL:
@@ -1654,6 +1740,29 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
     if (unPrintDisabled && !stmt->overridden) {
         return nullptr;
     }
+    // EXP `paradox`: a direct print of a paradox expression outputs "PARADOX".
+    if (dynamic_cast<ParadoxExpression*>(stmt->expr.get())) {
+        llvm::Function* printfFunc = module->getFunction("printf");
+        if (printfFunc) {
+            llvm::Value* formatPtr = builder.CreateGlobalStringPtr("PARADOX\n", "paradox_fmt");
+            builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {formatPtr}, "paradox_printf");
+        }
+        return nullptr;
+    }
+    // EXP `paradox` stage 2: a direct print of a GHOST variable keeps its value
+    // and appends "#" (the ghost marker). Only the trailing marker changes --
+    // the stored value itself is printed unchanged and is never 0.
+    bool ghostPrint = dynamic_cast<GhostExpression*>(stmt->expr.get()) != nullptr;
+    auto makePrintFormat = [&](const std::string& base) -> llvm::Value* {
+        if (!ghostPrint) {
+            return builder.CreateGlobalStringPtr(base, "format");
+        }
+        std::string s = base;
+        size_t nl = s.find('\n');
+        if (nl != std::string::npos) s.insert(nl, "#");
+        else s += '#';
+        return builder.CreateGlobalStringPtr(s, "format_ghost");
+    };
     VarType exprType = VarType::UNKNOWN;
     if (auto* strLit = dynamic_cast<StringLiteral*>(stmt->expr.get())) {
         exprType = VarType::STRING;
@@ -1674,6 +1783,16 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
             exprType = typeIt->second;
         } else {
             auto globalTypeIt = windowInputTypes.find(varExpr->name);
+            if (globalTypeIt != windowInputTypes.end()) {
+                exprType = globalTypeIt->second;
+            }
+        }
+    } else if (auto* ghostExpr = dynamic_cast<GhostExpression*>(stmt->expr.get())) {
+        auto typeIt = localTypes.find(ghostExpr->name);
+        if (typeIt != localTypes.end()) {
+            exprType = typeIt->second;
+        } else {
+            auto globalTypeIt = windowInputTypes.find(ghostExpr->name);
             if (globalTypeIt != windowInputTypes.end()) {
                 exprType = globalTypeIt->second;
             }
@@ -1723,7 +1842,15 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
         llvm::Value* textPtr = nullptr;
 
         if (arg->getType()->isPointerTy() && exprType == VarType::STRING) {
-            textPtr = builder.CreateBitCast(arg, builder.getInt8Ty()->getPointerTo(), "window_print_text_ptr");
+            if (ghostPrint) {
+                llvm::AllocaInst* buffer = builder.CreateAlloca(builder.getInt8Ty(), builder.getInt32(256), "ghost_str_buffer");
+                llvm::Value* bufferPtr = builder.CreateBitCast(buffer, builder.getInt8Ty()->getPointerTo(), "ghost_str_buffer_ptr");
+                builder.CreateCall(snprintfFunc, {bufferPtr, builder.getInt64(256),
+                    builder.CreateGlobalStringPtr("%s#", "format_ghost_str"), arg}, "snprintf_ghost_str");
+                textPtr = bufferPtr;
+            } else {
+                textPtr = builder.CreateBitCast(arg, builder.getInt8Ty()->getPointerTo(), "window_print_text_ptr");
+            }
         } else {
             llvm::AllocaInst* buffer = builder.CreateAlloca(builder.getInt8Ty(), builder.getInt32(256), "print_buffer");
             llvm::Value* bufferPtr = builder.CreateBitCast(buffer, builder.getInt8Ty()->getPointerTo(), "print_buffer_ptr");
@@ -1731,33 +1858,33 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
             llvm::Value* printArg = arg;
 
             if (arg->getType()->isFloatTy()) {
-                formatPtr = builder.CreateGlobalStringPtr("%f", "print_format_float");
+                formatPtr = makePrintFormat("%f");
                 printArg = builder.CreateFPExt(arg, builder.getDoubleTy(), "print_float_ext");
             } else if (arg->getType()->isIntegerTy(1)) {
-                formatPtr = builder.CreateGlobalStringPtr("%d", "print_format_bool");
+                formatPtr = makePrintFormat("%d");
                 printArg = builder.CreateZExtOrTrunc(arg, builder.getInt32Ty(), "print_bool_ext");
             } else if (arg->getType()->isIntegerTy(64)) {
-                formatPtr = builder.CreateGlobalStringPtr("%lld", "print_format_long");
+                formatPtr = makePrintFormat("%lld");
             } else if (arg->getType()->isPointerTy()) {
                 if (exprType == VarType::LONG || exprType == VarType::UNKNOWN) {
-                    formatPtr = builder.CreateGlobalStringPtr("%lld", "print_format_long");
+                    formatPtr = makePrintFormat("%lld");
                     printArg = builder.CreatePtrToInt(arg, builder.getInt64Ty(), "ptrtolong");
                 } else if (exprType == VarType::INT) {
-                    formatPtr = builder.CreateGlobalStringPtr("%d", "print_format_int");
+                    formatPtr = makePrintFormat("%d");
                     printArg = builder.CreatePtrToInt(arg, builder.getInt32Ty(), "ptrtoint");
                 } else if (exprType == VarType::BOOL) {
-                    formatPtr = builder.CreateGlobalStringPtr("%d", "print_format_bool");
+                    formatPtr = makePrintFormat("%d");
                     printArg = builder.CreatePtrToInt(arg, builder.getInt32Ty(), "ptrtobool");
                 } else if (exprType == VarType::FLOAT) {
-                    formatPtr = builder.CreateGlobalStringPtr("%f", "print_format_float");
+                    formatPtr = makePrintFormat("%f");
                     printArg = builder.CreatePtrToInt(arg, builder.getInt64Ty(), "ptrtofloat");
                     printArg = builder.CreateSIToFP(printArg, builder.getDoubleTy(), "inttofp");
                 } else {
-                    formatPtr = builder.CreateGlobalStringPtr("%s", "print_format_str");
+                    formatPtr = makePrintFormat("%s");
                     printArg = arg;
                 }
             } else {
-                formatPtr = builder.CreateGlobalStringPtr("%d", "print_format_int");
+                formatPtr = makePrintFormat("%d");
                 if (!arg->getType()->isIntegerTy(32)) {
                     printArg = builder.CreateSExtOrTrunc(arg, builder.getInt32Ty(), "print_int_cast");
                 }
@@ -1840,34 +1967,34 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
         llvm::Value* printArg = arg;
         
         if (arg->getType()->isFloatTy()) {
-            formatPtr = builder.CreateGlobalStringPtr("%f\n", "format");
+            formatPtr = makePrintFormat("%f\n");
             printArg = builder.CreateFPExt(arg, builder.getDoubleTy(), "float.ext");
         } else if (arg->getType()->isIntegerTy(1)) {
-            formatPtr = builder.CreateGlobalStringPtr("%d\n", "format");
+            formatPtr = makePrintFormat("%d\n");
             printArg = builder.CreateZExtOrTrunc(arg, builder.getInt32Ty(), "bool.ext");
         } else if (arg->getType()->isIntegerTy(64)) {
-            formatPtr = builder.CreateGlobalStringPtr("%lld\n", "format");
+            formatPtr = makePrintFormat("%lld\n");
         } else if (arg->getType()->isIntegerTy()) {
-            formatPtr = builder.CreateGlobalStringPtr("%d\n", "format");
+            formatPtr = makePrintFormat("%d\n");
         } else if (arg->getType()->isPointerTy()) {
             if (exprType == VarType::LONG || exprType == VarType::UNKNOWN) {
-                formatPtr = builder.CreateGlobalStringPtr("%lld\n", "format");
+                formatPtr = makePrintFormat("%lld\n");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt64Ty(), "ptrtolong");
             } else if (exprType == VarType::INT) {
-                formatPtr = builder.CreateGlobalStringPtr("%d\n", "format");
+                formatPtr = makePrintFormat("%d\n");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt32Ty(), "ptrtoint");
             } else if (exprType == VarType::BOOL) {
-                formatPtr = builder.CreateGlobalStringPtr("%d\n", "format");
+                formatPtr = makePrintFormat("%d\n");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt32Ty(), "ptrtobool");
             } else if (exprType == VarType::FLOAT) {
-                formatPtr = builder.CreateGlobalStringPtr("%f\n", "format");
+                formatPtr = makePrintFormat("%f\n");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt64Ty(), "ptrtofloat");
                 printArg = builder.CreateSIToFP(printArg, builder.getDoubleTy(), "inttofp");
             } else {
-                formatPtr = builder.CreateGlobalStringPtr("%s\n", "format");
+                formatPtr = makePrintFormat("%s\n");
             }
         } else {
-            formatPtr = builder.CreateGlobalStringPtr("%d\n", "format");
+            formatPtr = makePrintFormat("%d\n");
         }
         
         builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {formatPtr, printArg}, "printfcall");
@@ -2002,9 +2129,10 @@ llvm::Value* LLVMCodegen::codegen(LieStatement* stmt) {
 
 llvm::Value* LLVMCodegen::codegen(UnStatement* stmt) {
     switch (stmt->target) {
-        case TokenType::KEYWORD_PRINT: unPrintDisabled = true; break;
-        case TokenType::KEYWORD_BOOM:  unBoomDisabled  = true; break;
-        case TokenType::KEYWORD_BSOD:  unBsodDisabled  = true; break;
+case TokenType::KEYWORD_PRINT: unPrintDisabled = true; break;
+            case TokenType::KEYWORD_BOOM:  unBoomDisabled  = true; break;
+            case TokenType::KEYWORD_BSOD:  unBsodDisabled  = true; break;
+            case TokenType::KEYWORD_SLEEP: unSleepDisabled = true; break;
         default: break;
     }
     return nullptr;
@@ -2017,15 +2145,53 @@ llvm::Value* LLVMCodegen::codegen(IgnoreStatement* stmt) {
 
 // EXP `do`: force-execute the inner statement, regardless of any active `un`.
 llvm::Value* LLVMCodegen::codegen(DoStatement* stmt) {
+    // If this `do` was already hoisted to run unconditionally ahead of an
+    // enclosing conditional/loop, do nothing at its original position.
+    if (hoistedDo.count(stmt)) return nullptr;
+    emitDoInner(stmt);
+    return nullptr;
+}
+
+void LLVMCodegen::emitDoInner(DoStatement* stmt) {
     bool savedPrint = unPrintDisabled;
     bool savedBoom = unBoomDisabled;
     bool savedBsod = unBsodDisabled;
-    unPrintDisabled = unBoomDisabled = unBsodDisabled = false;
-    codegenOnce(stmt->inner.get());
+    bool savedSleep = unSleepDisabled;
+    unPrintDisabled = unBoomDisabled = unBsodDisabled = unSleepDisabled = false;
+    codegen(stmt->inner.get());
     unPrintDisabled = savedPrint;
     unBoomDisabled = savedBoom;
     unBsodDisabled = savedBsod;
-    return nullptr;
+    unSleepDisabled = savedSleep;
+}
+
+void LLVMCodegen::hoistDoFromBranch(Statement* stmt) {
+    if (!stmt) return;
+    if (auto* doSt = dynamic_cast<DoStatement*>(stmt)) {
+        if (!hoistedDo.count(doSt)) {
+            hoistedDo.insert(doSt);
+            emitDoInner(doSt);
+        }
+        return;
+    }
+    if (auto* blk = dynamic_cast<BlockStatement*>(stmt)) {
+        for (auto& s : blk->statements) hoistDoFromBranch(s.get());
+        return;
+    }
+    if (auto* ifs = dynamic_cast<IfStatement*>(stmt)) {
+        hoistDoFromBranch(ifs->thenBranch.get());
+        for (auto& e : ifs->elseIfBranches) hoistDoFromBranch(e.second.get());
+        if (ifs->elseBranch) hoistDoFromBranch(ifs->elseBranch.get());
+        return;
+    }
+    if (auto* wh = dynamic_cast<WhileStatement*>(stmt)) {
+        hoistDoFromBranch(wh->body.get());
+        return;
+    }
+    if (auto* loop = dynamic_cast<LoopStatement*>(stmt)) {
+        for (auto& s : loop->body) hoistDoFromBranch(s.get());
+        return;
+    }
 }
 
 // EXP `please`: print "thank you!" before executing the inner statement.
@@ -2044,74 +2210,625 @@ llvm::Value* LLVMCodegen::codegen(ShutupStatement* stmt) {
     return nullptr;
 }
 
-// EXP `...`: pick one of three harmless runtime actions at random.
-llvm::Value* LLVMCodegen::codegen(EllipsisStatement* stmt) {
-    // Seed rand() once, otherwise every `...` in the same second produces the same number.
-    if (!hasEllipsisRandSeeded) {
-        llvm::Function* timeFunc = module->getFunction("time");
-        if (!timeFunc) {
-            timeFunc = llvm::Function::Create(
-                llvm::FunctionType::get(builder.getInt64Ty(), {builder.getPtrTy()}, false),
-                llvm::Function::ExternalLinkage, "time", module);
-        }
-        llvm::Function* srandFunc = module->getFunction("srand");
-        if (!srandFunc) {
-            srandFunc = llvm::Function::Create(
-                llvm::FunctionType::get(builder.getVoidTy(), {builder.getInt32Ty()}, false),
-                llvm::Function::ExternalLinkage, "srand", module);
-        }
-        llvm::Value* now = builder.CreateCall(timeFunc, {llvm::Constant::getNullValue(builder.getPtrTy())});
-        builder.CreateCall(srandFunc, {builder.CreateTrunc(now, builder.getInt32Ty())});
-        hasEllipsisRandSeeded = true;
-    }
-
-    llvm::Function* randFunc = module->getFunction("rand");
-    if (!randFunc) {
-        randFunc = llvm::Function::Create(
+// Reliable `rand()` handle (declared or created).
+llvm::Function* LLVMCodegen::getRandFunction() {
+    llvm::Function* f = module->getFunction("rand");
+    if (!f) {
+        f = llvm::Function::Create(
             llvm::FunctionType::get(builder.getInt32Ty(), {}, false),
             llvm::Function::ExternalLinkage, "rand", module);
     }
+    return f;
+}
 
-    llvm::Value* r = builder.CreateCall(randFunc, {}, "rnd");
-    llvm::Value* choice = builder.CreateSRem(r, builder.getInt32(3), "choice");
+// EXP `...`: randomly pick one of the safe functions collected earlier and
+// REALLY call it, with arguments generated from its actual signature. The
+// selection itself uses rand() (seeded once when the first `...` runs).
+llvm::Value* LLVMCodegen::codegen(EllipsisStatement* stmt) {
+    usesRandomBuiltin = true;
+    return emitRandomCallDispatch();
+}
 
-    llvm::Function* printfFunc = module->getFunction("printf");
-    const char* texts[3] = {
-        "……袜子里的东西掉了。\n",
-        "……你听到了不该听到的脚步声。\n",
-        "……什么也没发生。\n",
-    };
+// EXP `sleep`: pause for `expr` seconds. int/float both work; the duration is
+// converted to milliseconds and passed to Win32 Sleep().
+llvm::Value* LLVMCodegen::codegen(SleepStatement* stmt) {
+    if (unSleepDisabled && !stmt->overridden) return nullptr;
 
-    llvm::Function* func = builder.GetInsertBlock()->getParent();
-    llvm::BasicBlock* mid1BB  = llvm::BasicBlock::Create(context, "ellipsis.mid1", func);
-    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context, "ellipsis.merge", func);
-    llvm::BasicBlock* case0BB = llvm::BasicBlock::Create(context, "ellipsis.case0", func);
-    llvm::BasicBlock* case1BB = llvm::BasicBlock::Create(context, "ellipsis.case1", func);
-    llvm::BasicBlock* case2BB = llvm::BasicBlock::Create(context, "ellipsis.case2", func);
+    llvm::Function* sleepFunc = module->getFunction("Sleep");
+    if (!sleepFunc) {
+        llvm::FunctionType* ft = llvm::FunctionType::get(builder.getVoidTy(), {builder.getInt32Ty()}, false);
+        sleepFunc = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "Sleep", module);
+    }
 
-    // entry: if (choice == 0) → case0, else → mid1
-    llvm::Value* cond0 = builder.CreateICmpEQ(choice, builder.getInt32(0), "c0");
-    builder.CreateCondBr(cond0, case0BB, mid1BB);
+    llvm::Value* secs = codegen(stmt->expr.get());
+    if (!secs) return nullptr;
 
-    // mid1: if (choice == 1) → case1, else → case2
-    builder.SetInsertPoint(mid1BB);
-    llvm::Value* cond1 = builder.CreateICmpEQ(choice, builder.getInt32(1), "c1");
-    builder.CreateCondBr(cond1, case1BB, case2BB);
+    llvm::Type* i64Ty = llvm::Type::getInt64Ty(context);
+    llvm::Value* ms;
+    if (secs->getType()->isFloatingPointTy()) {
+        llvm::Constant* k1000 = secs->getType()->isFloatTy()
+            ? llvm::ConstantFP::get(builder.getFloatTy(), 1000.0f)
+            : llvm::ConstantFP::get(secs->getType(), 1000.0);
+        llvm::Value* scaled = builder.CreateFMul(secs, k1000, "");
+        ms = builder.CreateFPToSI(scaled, i64Ty, "");
+    } else {
+        llvm::Value* secs64 = builder.CreateSExtOrTrunc(secs, i64Ty, "");
+        ms = builder.CreateMul(secs64, builder.getInt64(1000), "");
+    }
 
-    builder.SetInsertPoint(case0BB);
-    if (printfFunc) builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {builder.CreateGlobalStringPtr(texts[0], "ellipsis_t0")});
-    builder.CreateBr(mergeBB);
+    // A negative duration would wrap around into a ~49-day Sleep as a DWORD:
+    // clamp to (at least) zero so it behaves as a no-op instead.
+    llvm::Value* zero = builder.getInt64(0);
+    llvm::Value* isNeg = builder.CreateICmpSLT(ms, zero, "");
+    ms = builder.CreateSelect(isNeg, zero, ms, "");
 
-    builder.SetInsertPoint(case1BB);
-    if (printfFunc) builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {builder.CreateGlobalStringPtr(texts[1], "ellipsis_t1")});
-    builder.CreateBr(mergeBB);
-
-    builder.SetInsertPoint(case2BB);
-    if (printfFunc) builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {builder.CreateGlobalStringPtr(texts[2], "ellipsis_t2")});
-    builder.CreateBr(mergeBB);
-
-    builder.SetInsertPoint(mergeBB);
+    llvm::Value* ms32 = builder.CreateTrunc(ms, builder.getInt32Ty(), "");
+    builder.CreateCall(sleepFunc, {ms32});
     return nullptr;
+}
+
+// One-shot runtime seed for rand(). The seed mixes second-resolution time with
+// the millisecond tick counter so reruns within the same second still differ.
+void LLVMCodegen::emitRandomCallSeedOnce() {
+    if (hasEllipsisRandSeeded) return;
+    llvm::Function* timeFunc = module->getFunction("time");
+    if (!timeFunc) {
+        timeFunc = llvm::Function::Create(
+            llvm::FunctionType::get(builder.getInt64Ty(), {builder.getPtrTy()}, false),
+            llvm::Function::ExternalLinkage, "time", module);
+    }
+    llvm::Function* tickFunc = module->getFunction("GetTickCount");
+    if (!tickFunc) {
+        tickFunc = llvm::Function::Create(
+            llvm::FunctionType::get(builder.getInt32Ty(), {}, false),
+            llvm::Function::ExternalLinkage, "GetTickCount", module);
+    }
+    llvm::Function* srandFunc = module->getFunction("srand");
+    if (!srandFunc) {
+        srandFunc = llvm::Function::Create(
+            llvm::FunctionType::get(builder.getVoidTy(), {builder.getInt32Ty()}, false),
+            llvm::Function::ExternalLinkage, "srand", module);
+    }
+    llvm::Value* now   = builder.CreateCall(timeFunc, {llvm::Constant::getNullValue(builder.getPtrTy())});
+    llvm::Value* ticks = builder.CreateCall(tickFunc, {});
+    llvm::Value* seed  = builder.CreateXor(builder.CreateTrunc(now, builder.getInt32Ty()), ticks);
+    builder.CreateCall(srandFunc, {seed});
+    hasEllipsisRandSeeded = true;
+}
+
+// Fill a per-candidate [64 x i8] buffer with random printable ASCII and a '\0'
+// terminator, so STRING parameters get a real, safe, in-bounds string.
+void LLVMCodegen::emitRandomStringFill(llvm::GlobalVariable* buffer, int index) {
+    llvm::Function* owner = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock* preBB = builder.GetInsertBlock();
+    llvm::BasicBlock* loopBB = llvm::BasicBlock::Create(context, "dots.strloop", owner);
+    llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(context, "dots.strexit", owner);
+
+    builder.CreateBr(loopBB);
+
+    builder.SetInsertPoint(loopBB);
+    llvm::PHINode* idx = builder.CreatePHI(builder.getInt32Ty(), 2, "dots.stridx");
+    idx->addIncoming(builder.getInt32(0), preBB);
+    llvm::Value* rv = builder.CreateCall(getRandFunction(), {}, "dots.strr");
+    llvm::Value* m = builder.CreateSRem(rv, builder.getInt32(94), "dots.strm");
+    llvm::Value* ch = builder.CreateAdd(m, builder.getInt32(33), "dots.strc");
+    llvm::Value* slot = builder.CreateInBoundsGEP(builder.getInt8Ty(), buffer, {builder.getInt32(0), idx}, "dots.strslot");
+    builder.CreateStore(builder.CreateTrunc(ch, builder.getInt8Ty(), "dots.strb"), slot);
+    llvm::Value* next = builder.CreateAdd(idx, builder.getInt32(1), "dots.strnext");
+    llvm::Value* cont = builder.CreateICmpSLT(next, builder.getInt32(31), "dots.strcont");
+    idx->addIncoming(next, loopBB);
+    builder.CreateCondBr(cont, loopBB, exitBB);
+
+    builder.SetInsertPoint(exitBB);
+    llvm::Value* endSlot = builder.CreateInBoundsGEP(builder.getInt8Ty(), buffer, {builder.getInt32(0), builder.getInt32(31)}, "dots.str0");
+    builder.CreateStore(builder.getInt8(0), endSlot);
+}
+
+// void() trampoline for one candidate:
+//   entry: depth >= MAX? -> done (this is the recursion guard, so a function
+//          choosing itself through `...` can never overflow the stack)
+//   body:  depth++, build one argument per real parameter type, REAL call,
+//          depth--, done.
+llvm::Function* LLVMCodegen::createRandomCallTrampoline(const RandomCallCandidate& cand, int index) {
+    std::string name = "__xfa_dots_" + std::to_string(index);
+    llvm::FunctionType* ft = llvm::FunctionType::get(builder.getVoidTy(), {}, false);
+    llvm::Function* tramp = llvm::Function::Create(ft, llvm::Function::InternalLinkage, 0, name, module);
+
+    llvm::BasicBlock* entryBB = llvm::BasicBlock::Create(context, "dots.entry", tramp);
+    llvm::BasicBlock* bodyBB  = llvm::BasicBlock::Create(context, "dots.body", tramp);
+    llvm::BasicBlock* doneBB  = llvm::BasicBlock::Create(context, "dots.done", tramp);
+
+    builder.SetInsertPoint(entryBB);
+    llvm::Value* d0 = builder.CreateLoad(builder.getInt32Ty(), randomCallDepth, "dots.d");
+    llvm::Value* over = builder.CreateICmpSGE(d0, builder.getInt32(kRandomCallMaxDepth), "dots.over");
+    builder.CreateCondBr(over, doneBB, bodyBB);
+
+    builder.SetInsertPoint(bodyBB);
+    builder.CreateStore(builder.CreateAdd(d0, builder.getInt32(1), "dots.d1"), randomCallDepth);
+
+    llvm::ArrayRef<llvm::Type*> paramTys = cand.callee->getFunctionType()->params();
+    std::vector<llvm::Value*> args;
+    llvm::GlobalVariable* strBuf = nullptr;
+
+    for (unsigned i = 0; i < paramTys.size(); ++i) {
+        llvm::Type* ty = paramTys[i];
+        llvm::Value* argVal = nullptr;
+        if (cand.nullPtrArg) {
+            argVal = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty));
+        } else if (ty == builder.getInt1Ty()) {
+            llvm::Value* rv = builder.CreateCall(getRandFunction(), {}, "dots.r");
+            argVal = builder.CreateICmpNE(builder.CreateSRem(rv, builder.getInt32(2), "dots.rb"), builder.getInt32(0), "dots.bool");
+        } else if (ty == builder.getInt32Ty()) {
+            llvm::Value* rv = builder.CreateCall(getRandFunction(), {}, "dots.r");
+            argVal = builder.CreateSub(builder.CreateSRem(rv, builder.getInt32(2001), "dots.im"), builder.getInt32(1000), "dots.i");
+        } else if (ty == builder.getInt64Ty()) {
+            llvm::Value* rv = builder.CreateCall(getRandFunction(), {}, "dots.r");
+            llvm::Value* wide = builder.CreateSExt(rv, builder.getInt64Ty(), "dots.w");
+            argVal = builder.CreateSub(builder.CreateSRem(wide, builder.getInt64(2000001), "dots.lm"), builder.getInt64(1000000), "dots.l");
+        } else if (ty == builder.getFloatTy()) {
+            llvm::Value* rv = builder.CreateCall(getRandFunction(), {}, "dots.r");
+            llvm::Value* m = builder.CreateSRem(rv, builder.getInt32(1001), "dots.fm");
+            llvm::Value* f = builder.CreateUIToFP(m, builder.getFloatTy(), "dots.fuf");
+            argVal = builder.CreateFSub(builder.CreateFDiv(f, llvm::ConstantFP::get(builder.getFloatTy(), 100.0f), "dots.fdiv"), llvm::ConstantFP::get(builder.getFloatTy(), 5.0f), "dots.f");
+        } else if (ty->isPointerTy()) {
+            if (!strBuf) {
+                llvm::ArrayType* at = llvm::ArrayType::get(builder.getInt8Ty(), 64);
+                strBuf = new llvm::GlobalVariable(*module, at, false,
+                    llvm::GlobalValue::InternalLinkage,
+                    llvm::ConstantAggregateZero::get(at), "__xfa_dots_str_" + std::to_string(index));
+            }
+            emitRandomStringFill(strBuf, index);
+            argVal = builder.CreateInBoundsGEP(builder.getInt8Ty(), strBuf, {builder.getInt32(0), builder.getInt32(0)}, "dots.str");
+        } else {
+            // Unsupported param type: candidates were filtered so this cannot
+            // happen; if it ever does, bail out without calling.
+            builder.CreateBr(doneBB);
+            llvm::BasicBlock* deadBB = llvm::BasicBlock::Create(context, "dots.dead", tramp);
+            builder.SetInsertPoint(deadBB);
+            builder.CreateRetVoid();
+            return tramp;
+        }
+        args.push_back(argVal);
+    }
+
+    builder.CreateCall(cand.callee->getFunctionType(), cand.callee, args);
+    llvm::Value* d2 = builder.CreateLoad(builder.getInt32Ty(), randomCallDepth, "dots.d2");
+    builder.CreateStore(builder.CreateSub(d2, builder.getInt32(1), "dots.dec"), randomCallDepth);
+    builder.CreateBr(doneBB);
+
+    builder.SetInsertPoint(doneBB);
+    builder.CreateRetVoid();
+    return tramp;
+}
+
+// The `...` runtime dispatch: rand() % N -> slot in the trampoline table -> call.
+// The table + trampolines are created lazily on the first `...` and shared by all.
+llvm::Value* LLVMCodegen::emitRandomCallDispatch() {
+    emitRandomCallSeedOnce();
+    if (randomCallCandidates.empty()) return nullptr;
+
+    if (!randomCallTableEmitted) {
+        randomCallTableEmitted = true;
+        randomCallDepth = new llvm::GlobalVariable(*module, builder.getInt32Ty(), false,
+            llvm::GlobalValue::InternalLinkage, builder.getInt32(0), "__xfa_dots_depth");
+
+        llvm::BasicBlock* savedBB = builder.GetInsertBlock();
+        std::vector<llvm::Constant*> ptrs;
+        for (unsigned i = 0; i < randomCallCandidates.size(); ++i) {
+            ptrs.push_back(createRandomCallTrampoline(randomCallCandidates[i], static_cast<int>(i)));
+        }
+        llvm::ArrayType* at = llvm::ArrayType::get(builder.getPtrTy(), ptrs.size());
+        randomCallTable = new llvm::GlobalVariable(*module, at, false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(at, ptrs), "__xfa_dots_table");
+        builder.SetInsertPoint(savedBB);
+    }
+
+    if (!randomCallTable) return nullptr;
+
+    llvm::Value* rv = builder.CreateCall(getRandFunction(), {}, "dots.r");
+    llvm::Value* idx = builder.CreateSRem(rv, builder.getInt32(static_cast<int>(randomCallCandidates.size())), "dots.idx");
+    llvm::Value* idxWide = builder.CreateZExt(idx, builder.getInt64Ty(), "dots.idxw");
+    llvm::Value* slot = builder.CreateInBoundsGEP(
+        llvm::ArrayType::get(builder.getPtrTy(), randomCallCandidates.size()),
+        randomCallTable, {builder.getInt64(0), idxWide}, "dots.slot");
+    llvm::Value* fnptr = builder.CreateLoad(builder.getPtrTy(), slot, "dots.fn");
+    llvm::FunctionType* voidTy = llvm::FunctionType::get(builder.getVoidTy(), {}, false);
+    builder.CreateCall(voidTy, fnptr, {});
+    return nullptr;
+}
+
+// Build the list of functions `...` may invoke. Only SAFE ones qualify:
+//   - never main();
+//   - never a body that hangs (input()) or terminates/disrupts (boom/bsod);
+//   - only scalar primitive parameters (int/long/float/bool/string) — no
+//     arrays, no unknown types, where every type can be generated safely;
+//   - plus a curated set of genuinely harmless builtins (rand/clock/time).
+void LLVMCodegen::collectRandomCallCandidates(Program* program) {
+    randomCallCandidates.clear();
+    if (!program) return;
+
+    for (auto& mod : program->modules) {
+        for (auto& func : mod->functions) {
+            if (func->name == "main") continue;
+            if (bodyIsDangerous(func.get())) continue;
+
+            std::string funcName;
+            if (!func->ns.empty())             funcName = func->ns + ":" + func->name;
+            else if (!func->blockName.empty()) funcName = func->blockName + ":" + func->name;
+            else                               funcName = func->name;
+
+            llvm::Function* callee = module->getFunction(funcName);
+            if (!callee) continue;
+
+            // Param types are inferred from call sites, which resolve a call by
+            // bare name first and only then fall back to the qualified symbol;
+            // try the qualified key first, then the bare name — exactly like
+            // call emission does, so candidates with parameters stay eligible.
+            const std::vector<VarType>* argTypes = nullptr;
+            auto qit = callArgTypes.find(funcName);
+            if (qit != callArgTypes.end()) {
+                argTypes = &qit->second;
+            } else {
+                auto bit = callArgTypes.find(func->name);
+                if (bit != callArgTypes.end()) argTypes = &bit->second;
+            }
+
+            bool safe = true;
+            if (argTypes) {
+                for (VarType t : *argTypes) {
+                    if (t != VarType::INT && t != VarType::LONG && t != VarType::FLOAT &&
+                        t != VarType::BOOL && t != VarType::STRING) { safe = false; break; }
+                }
+                if (argTypes->size() != func->params.size()) safe = false;
+            } else if (callee->getFunctionType()->getNumParams() != 0) {
+                safe = false;
+            }
+            if (!safe) continue;
+
+            RandomCallCandidate cand;
+            cand.name = funcName;
+            cand.callee = callee;
+            randomCallCandidates.push_back(cand);
+        }
+    }
+
+    // Curated harmless builtins. Everything else — input, rnd, printf, malloc,
+    // file/process/window APIs, xr_* — stays out on purpose.
+    auto addBuiltinCandidate = [this](const std::string& bname, bool nullArg) {
+        llvm::Function* f = module->getFunction(bname);
+        if (!f) return;
+        RandomCallCandidate cand;
+        cand.name = bname;
+        cand.callee = f;
+        cand.nullPtrArg = nullArg;
+        randomCallCandidates.push_back(cand);
+    };
+    addBuiltinCandidate("rand", false);
+    addBuiltinCandidate("clock", false);
+    addBuiltinCandidate("time", true);
+}
+
+// True when calling `func` could hang or disrupt the process, so `...` must
+// never pick it. Walker covers the statement/expression nest found in bodies.
+bool LLVMCodegen::bodyIsDangerous(const Function* func) const {
+    struct Walker {
+        static bool stmt(const Statement* s) {
+            if (!s) return false;
+            switch (s->getNodeType()) {
+                case NodeType::EXPRESSION_STATEMENT: {
+                    const auto* es = static_cast<const ExpressionStatement*>(s);
+                    return expr(es->expr.get());
+                }
+                case NodeType::ASSIGNMENT_STATEMENT: {
+                    const auto* a = static_cast<const AssignmentStatement*>(s);
+                    return expr(a->value.get());
+                }
+                case NodeType::PRINT_STATEMENT: {
+                    const auto* p = static_cast<const PrintStatement*>(s);
+                    return expr(p->expr.get());
+                }
+                case NodeType::RETURN_STATEMENT: {
+                    const auto* r = static_cast<const ReturnStatement*>(s);
+                    return r->value && expr(r->value.get());
+                }
+                case NodeType::BLOCK_STATEMENT: {
+                    const auto* b = static_cast<const BlockStatement*>(s);
+                    for (const auto& sub : b->statements)
+                        if (stmt(sub.get())) return true;
+                    return false;
+                }
+                case NodeType::IF_STATEMENT: {
+                    const auto* i = static_cast<const IfStatement*>(s);
+                    if (expr(i->condition.get())) return true;
+                    if (stmt(i->thenBranch.get())) return true;
+                    for (const auto& e : i->elseIfBranches)
+                        if (expr(e.first.get()) || stmt(e.second.get())) return true;
+                    return stmt(i->elseBranch.get());
+                }
+                case NodeType::WHILE_STATEMENT: {
+                    const auto* w = static_cast<const WhileStatement*>(s);
+                    return expr(w->condition.get()) || stmt(w->body.get());
+                }
+                case NodeType::LOOP_STATEMENT: {
+                    const auto* l = static_cast<const LoopStatement*>(s);
+                    for (const auto& sub : l->body)
+                        if (stmt(sub.get())) return true;
+                    return false;
+                }
+                case NodeType::LIE_STATEMENT: {
+                    const auto* lie = static_cast<const LieStatement*>(s);
+                    return stmt(lie->body.get());
+                }
+                case NodeType::DO_STATEMENT: {
+                    const auto* d = static_cast<const DoStatement*>(s);
+                    return stmt(d->inner.get());
+                }
+                case NodeType::IGNORE_STATEMENT: {
+                    const auto* ig = static_cast<const IgnoreStatement*>(s);
+                    return stmt(ig->inner.get());
+                }
+                case NodeType::PLEASE_STATEMENT: {
+                    const auto* p = static_cast<const PleaseStatement*>(s);
+                    return stmt(p->inner.get());
+                }
+                case NodeType::TRY_EXPECT_STATEMENT: {
+                    const auto* t = static_cast<const TryExpectStatement*>(s);
+                    return stmt(t->tryBlock.get()) || stmt(t->expectBlock.get());
+                }
+                case NodeType::BOOM_STATEMENT:
+                case NodeType::BSOD_STATEMENT:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        static bool expr(const Expression* e) {
+            if (!e) return false;
+            switch (e->getNodeType()) {
+                case NodeType::CALL_EXPRESSION: {
+                    const auto* c = static_cast<const CallExpression*>(e);
+                    if (c->name == "input") return true;
+                    if (c->ns == "window" && (c->name == "destroy" || c->name == "close")) return true;
+                    if (c->ns == "system" || c->name == "system") return true;
+                    for (const auto& a : c->args)
+                        if (expr(a.get())) return true;
+                    return false;
+                }
+                case NodeType::BINARY_OP: {
+                    const auto* b = static_cast<const BinaryOp*>(e);
+                    return expr(b->left.get()) || expr(b->right.get());
+                }
+                case NodeType::UNARY_OP: {
+                    const auto* u = static_cast<const UnaryOp*>(e);
+                    return expr(u->expr.get());
+                }
+                case NodeType::ARRAY_INDEX_EXPRESSION: {
+                    const auto* ai = static_cast<const ArrayIndexExpression*>(e);
+                    return expr(ai->array.get()) || expr(ai->index.get());
+                }
+                case NodeType::ARRAY_RANGE_EXPRESSION: {
+                    const auto* ar = static_cast<const ArrayRangeExpression*>(e);
+                    if (ar->array && expr(ar->array.get())) return true;
+                    return expr(ar->start.get()) || expr(ar->end.get());
+                }
+                case NodeType::ARRAY_LITERAL: {
+                    const auto* al = static_cast<const ArrayLiteral*>(e);
+                    for (const auto& el : al->elements)
+                        if (expr(el.get())) return true;
+                    return false;
+                }
+                default:
+                    return false;
+            }
+        }
+    };
+    return Walker::stmt(func->body.get());
+}
+
+// EXP `wrath` / `paradox`: these are normally rewritten into plain assignments
+// (and paradox reads) by an AST pass before codegen runs. If one ever reaches
+// codegen un-rewritten, treat it as a no-op rather than failing.
+llvm::Value* LLVMCodegen::codegen(WrathStatement* stmt) {
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(ParadoxStatement* stmt) {
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(TryExpectStatement* stmt) {
+    // `try` is a compile-time-only error check zone: its block NEVER produces
+    // runtime code. The SemanticAnalyzer already decided the outcome:
+    //   - false (a catchable error was intercepted)
+    //       -> emit ONLY the expect block; the try block generates nothing.
+    //   - true  (the try checked out clean) -> emit NOTHING at all; neither the
+    //       try block nor the expect block executes.
+    if (!stmt->trySucceeded) {
+        for (auto& s : stmt->expectBlock->statements) {
+            codegen(s.get());
+            if (builder.GetInsertBlock() && builder.GetInsertBlock()->getTerminator()) break;
+        }
+    }
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(SorryStatement* stmt) {
+    // sorry only affects the compiler's rage meter; it emits no runtime code.
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// EXP `come`: reverse goto.
+//
+// A `come N` statement declares: "when the statement on physical source line N
+// executes, jump back to my position and keep going from there". Line N must be
+// an executable statement of the SAME xfawa function; everything else is a
+// compile error (never a silently-broken jump).
+//
+// Implementation:
+//   * Before the function body is generated we scan it (scanFunctionBody) to
+//     find every come and the set of statement start lines.
+//   * A landing basic block is pre-created per come so both forward and
+//     backward targets work regardless of source order.
+//   * While generating, the come statement itself is "placed": we branch the
+//     current block to its landing and keep inserting the following statements
+//     INTO the landing, so the landing really is the "come position".
+//   * After each generated statement (codegen(Statement*) -> maybeEmitComeJump)
+//     we test stmt->location.line against the target map. On a match we emit
+//     `br landing` (or the i1-ised `condition` as `br cond, landing, cont`),
+//     then continue inserting into a fresh continuation block.
+//   * When several comes share a target line, the one with the smallest source
+//     line wins deterministically.
+// ---------------------------------------------------------------------------
+
+void LLVMCodegen::scanFunctionBody(const Statement* stmt, ComeScan& scan, bool inForeignUnit) const {
+    if (!stmt) return;
+
+    int line = stmt->location.line;
+    if (!inForeignUnit) {
+        scan.validLines.insert(line);
+        scan.lineNode[line] = stmt->getNodeType();
+        if (line < scan.minLine) scan.minLine = line;
+        if (line > scan.maxLine) scan.maxLine = line;
+    }
+
+    switch (stmt->getNodeType()) {
+        case NodeType::COME_STATEMENT: {
+            const auto* comeStmt = static_cast<const ComeStatement*>(stmt);
+            scan.comeLines.insert(line);
+            if (inForeignUnit) {
+                scan.errors.push_back(
+                    "come cannot be used inside a loop{} / button / window / nested-function body "
+                    "(line " + std::to_string(line) + "), because those run in a separate code unit");
+            } else {
+                scan.comes.push_back({line, comeStmt->targetLine, const_cast<ComeStatement*>(comeStmt)});
+            }
+            break;
+        }
+        case NodeType::BLOCK_STATEMENT: {
+            const auto* block = static_cast<const BlockStatement*>(stmt);
+            for (const auto& s : block->statements) scanFunctionBody(s.get(), scan, inForeignUnit);
+            break;
+        }
+        case NodeType::IF_STATEMENT: {
+            const auto* ifStmt = static_cast<const IfStatement*>(stmt);
+            if (ifStmt->thenBranch) scanFunctionBody(ifStmt->thenBranch.get(), scan, inForeignUnit);
+            for (const auto& elseIf : ifStmt->elseIfBranches)
+                scanFunctionBody(elseIf.second.get(), scan, inForeignUnit);
+            if (ifStmt->elseBranch) scanFunctionBody(ifStmt->elseBranch.get(), scan, inForeignUnit);
+            break;
+        }
+        case NodeType::WHILE_STATEMENT: {
+            const auto* whileStmt = static_cast<const WhileStatement*>(stmt);
+            if (whileStmt->body) scanFunctionBody(whileStmt->body.get(), scan, inForeignUnit);
+            break;
+        }
+        case NodeType::FOR_IN_STATEMENT: {
+            const auto* forStmt = static_cast<const ForInStatement*>(stmt);
+            if (forStmt->body) scanFunctionBody(forStmt->body.get(), scan, inForeignUnit);
+            break;
+        }
+        case NodeType::LIE_STATEMENT: {
+            const auto* lieStmt = static_cast<const LieStatement*>(stmt);
+            if (lieStmt->body) scanFunctionBody(lieStmt->body.get(), scan, inForeignUnit);
+            break;
+        }
+        case NodeType::TRY_EXPECT_STATEMENT: {
+            const auto* te = static_cast<const TryExpectStatement*>(stmt);
+            // The try block never generates code: only descend to report any
+            // come trapped in it. The expect block only runs when the try failed.
+            if (te->tryBlock) scanFunctionBody(te->tryBlock.get(), scan, /*inForeignUnit=*/true);
+            if (!te->trySucceeded && te->expectBlock) scanFunctionBody(te->expectBlock.get(), scan, inForeignUnit);
+            break;
+        }
+        case NodeType::LOOP_STATEMENT: {
+            const auto* loop = static_cast<const LoopStatement*>(stmt);
+            for (const auto& s : loop->body) scanFunctionBody(s.get(), scan, /*inForeignUnit=*/true);
+            break;
+        }
+        case NodeType::BUTTON_STATEMENT: {
+            const auto* button = static_cast<const ButtonStatement*>(stmt);
+            for (const auto& s : button->body) scanFunctionBody(s.get(), scan, /*inForeignUnit=*/true);
+            break;
+        }
+        case NodeType::WINDOW_STATEMENT: {
+            const auto* window = static_cast<const WindowStatement*>(stmt);
+            for (const auto& b : window->buttons) scanFunctionBody(b.get(), scan, /*inForeignUnit=*/true);
+            for (const auto& loop : window->loops) scanFunctionBody(loop.get(), scan, /*inForeignUnit=*/true);
+            break;
+        }
+        case NodeType::FUNCTION_DECLARATION: {
+            const auto* decl = static_cast<const FunctionDeclarationStatement*>(stmt);
+            if (decl->func && decl->func->body) scanFunctionBody(decl->func->body.get(), scan, /*inForeignUnit=*/true);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+void LLVMCodegen::placeComeLanding(int comeLine) {
+    auto it = comeLandingBlocks.find(comeLine);
+    if (it == comeLandingBlocks.end()) return;
+    if (comePlacementDone.count(comeLine)) return; // e.g. a repeated come
+    comePlacementDone.insert(comeLine);
+
+    llvm::BasicBlock* landing = it->second;
+    if (builder.GetInsertBlock() && !builder.GetInsertBlock()->getTerminator()) {
+        builder.CreateBr(landing);
+    }
+    builder.SetInsertPoint(landing);
+}
+
+llvm::Value* LLVMCodegen::codegen(ComeStatement* stmt) {
+    placeComeLanding(stmt->location.line);
+    return nullptr;
+}
+
+void LLVMCodegen::maybeEmitComeJump(Statement* stmt) {
+    if (comeTargetPick.empty()) return;
+
+    llvm::BasicBlock* cur = builder.GetInsertBlock();
+    if (!cur || cur->getTerminator()) return; // nothing to append after
+
+    int line = stmt->location.line;
+    auto pickIt = comeTargetPick.find(line);
+    if (pickIt == comeTargetPick.end()) return;
+    int comeLine = pickIt->second;
+
+    auto landingIt = comeLandingBlocks.find(comeLine);
+    if (landingIt == comeLandingBlocks.end()) return;
+    llvm::BasicBlock* landing = landingIt->second;
+    if (landing->getParent() != cur->getParent()) return; // cross-function guard
+
+    const ComeRecord* rec = nullptr;
+    for (const auto& c : functionComes) {
+        if (c.comeLine == comeLine) { rec = &c; break; }
+    }
+
+    // The condition (if any) is evaluated HERE, at the target line.
+    bool hasCond = rec && rec->stmt && rec->stmt->condition;
+    llvm::Value* cond = nullptr;
+    if (hasCond) {
+        cond = codegen(rec->stmt->condition.get());
+        if (!cond) return;
+    }
+
+    comeTargetIntercepted[line] = true;
+
+    llvm::BasicBlock* cont = llvm::BasicBlock::Create(context, "come.next", cur->getParent());
+    if (!hasCond) {
+        builder.CreateBr(landing);
+    } else {
+        if (!cond->getType()->isIntegerTy(1)) {
+            llvm::IntegerType* intType = llvm::cast<llvm::IntegerType>(cond->getType());
+            llvm::Value* zero = createConstInt(context, intType, 0);
+            cond = builder.CreateICmpNE(cond, zero, "comecond");
+        }
+        builder.CreateCondBr(cond, landing, cont);
+    }
+    builder.SetInsertPoint(cont);
 }
 
 llvm::Value* LLVMCodegen::codegen(BlockStatement* stmt) {
@@ -2127,7 +2844,13 @@ llvm::Value* LLVMCodegen::codegen(BlockStatement* stmt) {
 
 llvm::Value* LLVMCodegen::codegen(IfStatement* stmt) {
     llvm::Function* func = builder.GetInsertBlock()->getParent();
-    
+
+    // Hoist any `do.*` found in the branches so they run unconditionally,
+    // ignoring the surrounding condition.
+    hoistDoFromBranch(stmt->thenBranch.get());
+    for (auto& e : stmt->elseIfBranches) hoistDoFromBranch(e.second.get());
+    if (stmt->elseBranch) hoistDoFromBranch(stmt->elseBranch.get());
+
     llvm::Value* CondVal = codegen(stmt->condition.get());
     if (!CondVal) return nullptr;
     
@@ -2217,7 +2940,10 @@ llvm::Value* LLVMCodegen::codegen(IfStatement* stmt) {
 
 llvm::Value* LLVMCodegen::codegen(WhileStatement* stmt) {
     llvm::Function* func = builder.GetInsertBlock()->getParent();
-    
+
+    // `do.*` inside the loop body is hoisted once, ignoring the loop condition.
+    hoistDoFromBranch(stmt->body.get());
+
     llvm::BasicBlock* HeaderBB = llvm::BasicBlock::Create(context, "whileheader", func);
     llvm::BasicBlock* BodyBB = llvm::BasicBlock::Create(context, "whilebody");
     llvm::BasicBlock* ExitBB = llvm::BasicBlock::Create(context, "whileexit", func);
@@ -2281,6 +3007,9 @@ llvm::Value* LLVMCodegen::codegen(WhileStatement* stmt) {
 }
 
 bool LLVMCodegen::codegen(LoopStatement* stmt) {
+    // `do.*` inside the loop body is hoisted to run unconditionally once.
+    for (auto& s : stmt->body) hoistDoFromBranch(s.get());
+
     // Generate the loop body as a separate callback function, then register it.
     // The runtime calls this callback every frame via WM_TIMER.
     static int loopCounter = 0;
@@ -2456,6 +3185,8 @@ VarType LLVMCodegen::getExpressionType(Expression* expr) {
         if (typeIt != localTypes.end()) {
             return typeIt->second;
         }
+    } else if (dynamic_cast<OLiteralExpression*>(expr)) {
+        return VarType::INT;
     } else if (auto* callExpr = dynamic_cast<CallExpression*>(expr)) {
         return VarType::UNKNOWN;
     } else if (auto* binOp = dynamic_cast<BinaryOp*>(expr)) {
@@ -2504,6 +3235,11 @@ VarType LLVMCodegen::inferParamTypeFromBody(Statement* stmt, const std::string& 
         return inferParamTypeFromBody(whileStmt->body.get(), paramName);
     } else if (auto* forInStmt = dynamic_cast<ForInStatement*>(stmt)) {
         return inferParamTypeFromBody(forInStmt->body.get(), paramName);
+    } else if (auto* te = dynamic_cast<TryExpectStatement*>(stmt)) {
+        // `try` emits no runtime code; only the expect block can influence
+        // generated code, and only when a catchable error was intercepted.
+        if (!te->trySucceeded && te->expectBlock)
+            return inferParamTypeFromBody(te->expectBlock.get(), paramName);
     }
     
     return VarType::UNKNOWN;
@@ -2616,6 +3352,10 @@ void LLVMCodegen::collectCallArgTypes(Statement* stmt) {
     } else if (auto* forInStmt = dynamic_cast<ForInStatement*>(stmt)) {
         collectCallArgTypes(forInStmt->iterable.get());
         collectCallArgTypes(forInStmt->body.get());
+    } else if (auto* te = dynamic_cast<TryExpectStatement*>(stmt)) {
+        // `try` emits no runtime code; only an intercepted expect block runs.
+        if (!te->trySucceeded && te->expectBlock)
+            collectCallArgTypes(te->expectBlock.get());
     }
 }
 
@@ -2677,7 +3417,7 @@ void LLVMCodegen::collectCallArgTypes(Program* program) {
 
 bool LLVMCodegen::codegenProgram(Program* program) {
     collectCallArgTypes(program);
-    
+
     for (auto& imp : program->imports) {
         if (!codegen(imp.get())) {
             return false;
@@ -2727,6 +3467,33 @@ bool LLVMCodegen::codegenProgram(Program* program) {
             if (isMain) {
                 hasMainFunction = true;
             }
+        }
+    }
+
+    // EXP `...`: every user function now has a real (declared) LLVM symbol to
+    // point at; collect the safe ones the random-call dispatch may pick.
+    collectRandomCallCandidates(program);
+
+    // EXP `come`: record the physical line span of every xfawa function so a
+    // come target pointing into another function can be reported precisely.
+    functionLineSpans.clear();
+    for (const auto& mod : program->modules) {
+        for (const auto& func : mod->functions) {
+            FunctionSpan sp;
+            if (func->name == "main") {
+                sp.name = "main";
+            } else if (!func->ns.empty()) {
+                sp.name = func->ns + ":" + func->name;
+            } else if (!func->blockName.empty()) {
+                sp.name = func->blockName + ":" + func->name;
+            } else {
+                sp.name = func->name;
+            }
+            ComeScan scan;
+            if (func->body) scanFunctionBody(func->body.get(), scan, false);
+            sp.start = scan.minLine;
+            sp.end = scan.maxLine;
+            functionLineSpans.push_back(sp);
         }
     }
 
@@ -2864,7 +3631,111 @@ bool LLVMCodegen::codegen(Function* func) {
         }
         
         if (func->body) {
+            // EXP `come`: scan this function for `come` statements, validate the
+            // target lines, and pre-create a landing block for every come so both
+            // forward and backward targets work no matter the source order.
+            ComeScan scan;
+            scanFunctionBody(func->body.get(), scan, false);
+            if (!scan.errors.empty()) {
+                for (const auto& e : scan.errors) addError(e);
+                return false;
+            }
+            functionComes = scan.comes;
+            comeLandingBlocks.clear();
+            comeTargetPick.clear();
+            comeTargetIntercepted.clear();
+            comePlacementDone.clear();
+
+            bool comeError = false;
+            for (const auto& cc : functionComes) {
+                if (scan.validLines.count(cc.targetLine) == 0) {
+                    bool inOtherFunction = false;
+                    for (const auto& sp : functionLineSpans) {
+                        if (sp.name == funcName) continue;
+                        if (cc.targetLine >= sp.start && cc.targetLine <= sp.end) {
+                            inOtherFunction = true;
+                            break;
+                        }
+                    }
+                    if (inOtherFunction) {
+                        addError("come: target line " + std::to_string(cc.targetLine) +
+                                 " lies inside another function (cross-function come is not allowed)");
+                    } else {
+                        addError("come: target line " + std::to_string(cc.targetLine) +
+                                 " contains no statement in this function (blank or comment lines cannot be jumped to)");
+                    }
+                    comeError = true;
+                    continue;
+                }
+                auto nodeIt = scan.lineNode.find(cc.targetLine);
+                if (nodeIt != scan.lineNode.end()) {
+                    NodeType nt = nodeIt->second;
+                    if (nt == NodeType::RETURN_STATEMENT || nt == NodeType::BREAK_STATEMENT || nt == NodeType::BOOM_STATEMENT) {
+                        addError("come: target line " + std::to_string(cc.targetLine) +
+                                 " is a return/break/boom statement and cannot be jumped to");
+                        comeError = true;
+                        continue;
+                    }
+                }
+                if (scan.comeLines.count(cc.targetLine) != 0) {
+                    addError("come: target line " + std::to_string(cc.targetLine) +
+                             " is itself a come statement (cannot jump to a come)");
+                    comeError = true;
+                    continue;
+                }
+            }
+            if (comeError) return false;
+
+            for (const auto& cc : functionComes) {
+                if (comeLandingBlocks.count(cc.comeLine)) continue;
+                comeLandingBlocks[cc.comeLine] = llvm::BasicBlock::Create(context, "come.landing", llvmFunc);
+            }
+            for (const auto& cc : functionComes) {
+                auto it = comeTargetPick.find(cc.targetLine);
+                if (it == comeTargetPick.end()) {
+                    comeTargetPick[cc.targetLine] = cc.comeLine;
+                } else if (cc.comeLine < it->second) {
+                    it->second = cc.comeLine;
+                }
+            }
+
             codegen(func->body.get());
+
+            // EXP `come`: seal any landing block that was never wired up (the
+            // come lives inside never-executed code) with a plain `ret 0` so
+            // the module still verifies cleanly instead of crashing LLVM.
+            for (auto& kv : comeLandingBlocks) {
+                llvm::BasicBlock* landing = kv.second;
+                if (landing->getTerminator()) continue;
+                llvm::BasicBlock* savedInsert = builder.GetInsertBlock();
+                builder.SetInsertPoint(landing);
+                builder.CreateRet(createConstInt(context, llvm::Type::getInt64Ty(context), 0));
+                if (savedInsert && savedInsert->getParent()) builder.SetInsertPoint(savedInsert);
+            }
+
+            // EXP `come`: a target that never produced a jump is a compile error
+            // (blank line, or code that is never generated, e.g. `while(0)`).
+            bool neverExecError = false;
+            for (const auto& cc : functionComes) {
+                auto it = comeTargetIntercepted.find(cc.targetLine);
+                if (it == comeTargetIntercepted.end() || !it->second) {
+                    addError("come: target line " + std::to_string(cc.targetLine) +
+                             " is never executed, so no come jump could be created");
+                    neverExecError = true;
+                }
+            }
+
+            functionComes.clear();
+            comeLandingBlocks.clear();
+            comeTargetPick.clear();
+            comeTargetIntercepted.clear();
+            comePlacementDone.clear();
+
+            if (neverExecError) {
+                // Errors added after the body was generated are not inspected by
+                // codegenProgram unless we fail the function now, so abort here.
+                return false;
+            }
         }
 
         if (builder.GetInsertBlock() && !builder.GetInsertBlock()->getTerminator()) {
@@ -2895,6 +3766,11 @@ bool LLVMCodegen::codegen(Statement* stmt) {
     for (int i = 0; i < repeat; ++i) {
         result = codegenOnce(stmt);
     }
+    // EXP `come`: after every generated statement, check whether its physical
+    // line is a come target; if so, emit the jump back to the come landing.
+    // Note: statement generators return nullptr on success, so `result` cannot
+    // gate this hook; only the block-term/line checks inside decide.
+    maybeEmitComeJump(stmt);
     return result;
 }
 
@@ -2914,6 +3790,12 @@ bool LLVMCodegen::codegenOnce(Statement* stmt) {
     if (dynamic_cast<PleaseStatement*>(stmt)) return codegen(dynamic_cast<PleaseStatement*>(stmt)) != nullptr;
     if (dynamic_cast<ShutupStatement*>(stmt)) return codegen(dynamic_cast<ShutupStatement*>(stmt)) != nullptr;
     if (dynamic_cast<EllipsisStatement*>(stmt)) return codegen(dynamic_cast<EllipsisStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<SleepStatement*>(stmt)) return codegen(dynamic_cast<SleepStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<ComeStatement*>(stmt)) { codegen(dynamic_cast<ComeStatement*>(stmt)); return true; }
+    if (dynamic_cast<WrathStatement*>(stmt)) return codegen(dynamic_cast<WrathStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<ParadoxStatement*>(stmt)) return codegen(dynamic_cast<ParadoxStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<TryExpectStatement*>(stmt)) return codegen(dynamic_cast<TryExpectStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<SorryStatement*>(stmt)) return codegen(dynamic_cast<SorryStatement*>(stmt)) != nullptr;
     if (dynamic_cast<BlockStatement*>(stmt)) return codegen(dynamic_cast<BlockStatement*>(stmt)) != nullptr;
     if (dynamic_cast<IfStatement*>(stmt)) return codegen(dynamic_cast<IfStatement*>(stmt)) != nullptr;
     if (dynamic_cast<WhileStatement*>(stmt)) return codegen(dynamic_cast<WhileStatement*>(stmt)) != nullptr;
@@ -3822,6 +4704,9 @@ llvm::Value* LLVMCodegen::codegen(Expression* expr) {
     if (auto* e = dynamic_cast<BooleanLiteral*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<StringLiteral*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<VariableExpression*>(expr)) return codegen(e);
+    if (auto* e = dynamic_cast<OLiteralExpression*>(expr)) return codegen(e);
+    if (auto* e = dynamic_cast<ParadoxExpression*>(expr)) return codegen(e);
+    if (auto* e = dynamic_cast<GhostExpression*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<UnaryOp*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<BinaryOp*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<CallExpression*>(expr)) return codegen(e);

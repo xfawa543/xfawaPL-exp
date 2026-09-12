@@ -1,0 +1,11 @@
+#test {
+    fn main() {
+        x = 1
+        come 7
+        while (0) {
+            print("never")
+            x = x + 1
+        }
+        print(x)
+    }
+}

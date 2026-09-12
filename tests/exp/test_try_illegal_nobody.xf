@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        try notFound() expect {
+            print("x")
+        }
+    }
+}

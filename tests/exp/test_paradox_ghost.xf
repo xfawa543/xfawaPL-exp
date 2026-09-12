@@ -1,0 +1,31 @@
+#test {
+    fn main() {
+        // 方案 B：ghost → ghost，传播的是因果状态而不是特殊数值
+        a = 1
+        b = a + 1
+        c = b + 1
+        paradox a
+        d = c + 1      // 纯表达式读取幽灵 → 诞生为 GHOST
+        e = d + 1
+        print(c)       // 3#
+        print(d)       // 4# （不是 0/1，值照常计算）
+        print(e)       // 5#
+
+        // 函数边界：ghost 不自动穿过未知函数边界
+        x = 1
+        y = x + 1
+        paradox x
+        z = inc(y)     // RHS 含函数调用 → 边界 → NORMAL
+        print(y)       // 2#
+        print(z)       // 3
+
+        // 无关链完全正常
+        p = 10
+        q = p + 1
+        print(q)       // 11
+    }
+
+    fn inc(v) {
+        return v + 1
+    }
+}

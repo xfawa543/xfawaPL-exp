@@ -5,11 +5,14 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <regex>
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
 #include <unordered_map>
+#include <unordered_set>
+#include <functional>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -17,11 +20,13 @@
 #include <io.h>
 #include <fcntl.h>
 #include <direct.h>
+#include <process.h>
 #define mkdir(path) _mkdir(path)
 #else
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include "xfawa_types.h"
@@ -51,7 +56,7 @@ namespace xfawa {
     int g_debug_global = 0;
 }
 
-const char* COMPILER_VERSION = "1.0.0-a.18";
+const char* COMPILER_VERSION = "1.0.0-a.19";
 const char* MODS_KERNEL_VERSION = "mods-a-1.0.3";
 
 static xfawa::LogLanguage g_log_language = xfawa::LogLanguage::EN;
@@ -123,6 +128,8 @@ void printUsage(const char* programName) {
         printf("%s", utf8(u8"  -n, --no-config        \u4e0d\u4f7f\u7528\u914d\u7f6e\u6587\u4ef6\n"));
         printf("%s", utf8(u8"  -v, --version          \u663e\u793a\u7f16\u8bd1\u5668\u7248\u672c\n"));
         printf("%s", utf8(u8"  -h, --help             \u663e\u793a\u5e2e\u52a9\u4fe1\u606f\n"));
+        printf("%s", utf8(u8"  rage                   \u67e5\u770b xfawac \u6301\u4e45\u5316\u7684\u7ea2\u6e29\u503c\uff08\u4f8b\uff1arage: 3/5\uff09\n"));
+        printf("%s", utf8(u8"  rage reset             \u5c06\u7ea2\u6e29\u503c\u91cd\u7f6e\u4e3a 0\n"));
     } else {
         printf("Usage: %s [options] <input_file>\n", programName);
         printf("Options:\n");
@@ -142,6 +149,8 @@ void printUsage(const char* programName) {
         printf("  -n, --no-config        Don't use config file\n");
         printf("  -v, --version          Show compiler version\n");
         printf("  -h, --help             Show this help message\n");
+        printf("  rage                   Show the persistent rage meter (e.g. rage: 3/5)\n");
+        printf("  rage reset             Reset the persistent rage meter to 0\n");
     }
     printf("\n");
 }
@@ -559,6 +568,299 @@ static void applyLieTransform(xfawa::Program* program) {
     }
 }
 
+// ---- EXP `wrath` / `paradox`: retroactive history + causal paradox ---------
+// These are implemented as a source-level AST rewrite (like `lie`), so they
+// reuse the existing variable/print/if semantics and never touch the LLVM
+// variable system.
+
+// Deep-copy an expression tree (needed to re-emit a dependent assignment's RHS).
+static std::unique_ptr<xfawa::Expression> cloneExpr(const xfawa::Expression* e) {
+    if (!e) return nullptr;
+    if (auto* n = dynamic_cast<const xfawa::NumberLiteral*>(e))
+        return std::make_unique<xfawa::NumberLiteral>(n->value, n->location);
+    if (auto* n = dynamic_cast<const xfawa::FloatLiteral*>(e))
+        return std::make_unique<xfawa::FloatLiteral>(n->value, n->location);
+    if (auto* n = dynamic_cast<const xfawa::BooleanLiteral*>(e))
+        return std::make_unique<xfawa::BooleanLiteral>(n->value, n->location);
+    if (auto* n = dynamic_cast<const xfawa::StringLiteral*>(e))
+        return std::make_unique<xfawa::StringLiteral>(n->value, n->location);
+    if (auto* n = dynamic_cast<const xfawa::VariableExpression*>(e))
+        return std::make_unique<xfawa::VariableExpression>(n->name, n->location);
+    if (auto* n = dynamic_cast<const xfawa::OLiteralExpression*>(e))
+        return std::make_unique<xfawa::OLiteralExpression>(n->raw, n->location);
+    if (auto* n = dynamic_cast<const xfawa::ParadoxExpression*>(e))
+        return std::make_unique<xfawa::ParadoxExpression>(n->location);
+    if (auto* n = dynamic_cast<const xfawa::GhostExpression*>(e))
+        return std::make_unique<xfawa::GhostExpression>(n->name, n->location);
+    if (auto* n = dynamic_cast<const xfawa::UnaryOp*>(e))
+        return std::make_unique<xfawa::UnaryOp>(n->op, cloneExpr(n->expr.get()), n->location);
+    if (auto* n = dynamic_cast<const xfawa::BinaryOp*>(e))
+        return std::make_unique<xfawa::BinaryOp>(n->op, cloneExpr(n->left.get()), cloneExpr(n->right.get()), n->location);
+    if (auto* n = dynamic_cast<const xfawa::CallExpression*>(e)) {
+        std::vector<std::unique_ptr<xfawa::Expression>> args;
+        for (const auto& a : n->args) args.push_back(cloneExpr(a.get()));
+        if (!n->ns.empty())
+            return std::make_unique<xfawa::CallExpression>(n->name, n->ns, std::move(args), n->location);
+        return std::make_unique<xfawa::CallExpression>(n->name, std::move(args), n->location);
+    }
+    if (auto* n = dynamic_cast<const xfawa::ArrayLiteral*>(e)) {
+        if (n->isRange)
+            return std::make_unique<xfawa::ArrayLiteral>(cloneExpr(n->rangeStart.get()), cloneExpr(n->rangeEnd.get()), n->location);
+        std::vector<std::unique_ptr<xfawa::Expression>> elems;
+        for (const auto& el : n->elements) elems.push_back(cloneExpr(el.get()));
+        return std::make_unique<xfawa::ArrayLiteral>(std::move(elems), n->location);
+    }
+    if (auto* n = dynamic_cast<const xfawa::ArrayIndexExpression*>(e))
+        return std::make_unique<xfawa::ArrayIndexExpression>(cloneExpr(n->array.get()), cloneExpr(n->index.get()), n->location);
+    if (auto* n = dynamic_cast<const xfawa::ArrayRangeExpression*>(e)) {
+        if (n->isSlice && n->array)
+            return std::make_unique<xfawa::ArrayRangeExpression>(cloneExpr(n->array.get()), cloneExpr(n->start.get()), cloneExpr(n->end.get()), n->location);
+        return std::make_unique<xfawa::ArrayRangeExpression>(n->accessType, cloneExpr(n->start.get()), cloneExpr(n->end.get()), n->location);
+    }
+    return nullptr;
+}
+
+// Collect the set of variable names referenced anywhere in an expression tree.
+static void collectVarRefs(const xfawa::Expression* e, std::unordered_set<std::string>& out) {
+    if (!e) return;
+    if (auto* v = dynamic_cast<const xfawa::VariableExpression*>(e)) { out.insert(v->name); return; }
+    if (auto* v = dynamic_cast<const xfawa::GhostExpression*>(e)) { out.insert(v->name); return; }
+    if (auto* v = dynamic_cast<const xfawa::UnaryOp*>(e)) { collectVarRefs(v->expr.get(), out); return; }
+    if (auto* v = dynamic_cast<const xfawa::BinaryOp*>(e)) { collectVarRefs(v->left.get(), out); collectVarRefs(v->right.get(), out); return; }
+    if (auto* v = dynamic_cast<const xfawa::CallExpression*>(e)) { for (const auto& a : v->args) collectVarRefs(a.get(), out); return; }
+    if (auto* v = dynamic_cast<const xfawa::ArrayLiteral*>(e)) {
+        if (v->isRange) { if (v->rangeStart) collectVarRefs(v->rangeStart.get(), out); if (v->rangeEnd) collectVarRefs(v->rangeEnd.get(), out); }
+        else for (const auto& el : v->elements) collectVarRefs(el.get(), out);
+        return;
+    }
+    if (auto* v = dynamic_cast<const xfawa::ArrayIndexExpression*>(e)) { collectVarRefs(v->array.get(), out); collectVarRefs(v->index.get(), out); return; }
+    if (auto* v = dynamic_cast<const xfawa::ArrayRangeExpression*>(e)) {
+        if (v->array) collectVarRefs(v->array.get(), out);
+        if (v->start) collectVarRefs(v->start.get(), out);
+        if (v->end) collectVarRefs(v->end.get(), out);
+        return;
+    }
+}
+
+// Report a reachable diagnostic (best-effort: no source location, so use line 0).
+static void wrathParadoxError(xfawa::ErrorSystem& es, const std::string& msg) {
+    es.addSyntaxError(0, 0, msg);
+}
+
+// True when the expression contains a function call anywhere in its tree.
+// Used to stop ghost propagation at unknown function boundaries: the insides of
+// `f(...)` are closed to the compiler, so a ghost argument must not leak its
+// causal status through the call's return value.
+static bool exprHasCall(const xfawa::Expression* e) {
+    if (!e) return false;
+    if (auto* c = dynamic_cast<const xfawa::CallExpression*>(e)) {
+        for (const auto& a : c->args) if (exprHasCall(a.get())) return true;
+        return true;
+    }
+    if (auto* u = dynamic_cast<const xfawa::UnaryOp*>(e)) return exprHasCall(u->expr.get());
+    if (auto* b = dynamic_cast<const xfawa::BinaryOp*>(e)) return exprHasCall(b->left.get()) || exprHasCall(b->right.get());
+    if (auto* al = dynamic_cast<const xfawa::ArrayLiteral*>(e)) {
+        if (al->isRange) {
+            if (al->rangeStart && exprHasCall(al->rangeStart.get())) return true;
+            return al->rangeEnd && exprHasCall(al->rangeEnd.get());
+        }
+        for (const auto& el : al->elements) if (exprHasCall(el.get())) return true;
+        return false;
+    }
+    if (auto* ai = dynamic_cast<const xfawa::ArrayIndexExpression*>(e)) return exprHasCall(ai->array.get()) || exprHasCall(ai->index.get());
+    if (auto* ar = dynamic_cast<const xfawa::ArrayRangeExpression*>(e)) {
+        if (ar->array && exprHasCall(ar->array.get())) return true;
+        if (ar->start && exprHasCall(ar->start.get())) return true;
+        return ar->end && exprHasCall(ar->end.get());
+    }
+    return false;
+}
+
+// Rewrite `wrath` / `paradox` statements inside a statement list.
+//
+// Wrath (`wrath x = R`):
+//   - replace with a plain assignment `x = R`
+//   - re-emit (in source order) a plain assignment for every later-or-equal
+//     variable that transitively depends on `x`, so its stored value refreshes.
+//   Already-emitted side effects (prints, etc.) are not touched.
+//
+// Paradox (`paradox x`) — two contiguous stages:
+//   1. `重合论` (recoincidence): the past changes, so x and the whole
+//      downstream causal closure are re-validated at their birth points. In
+//      straight-line code a destroyed causal root can never re-birth, so every
+//      member of the closure fails revalidation. No code is ever re-executed.
+//   2. `幽灵论` (ghost): the failed re-birth cannot make the already-existing
+//      stored value disappear either, so each member keeps its value but loses
+//      its causal origin → becomes a GHOST. Schema B propagation is used: a
+//      later *pure* assignment that reads a ghost variable is itself born as a
+//      ghost (the causal status flows on, never a special numeric value). An
+//      explicit re-assignment gives the variable a new causal origin (NORMAL).
+//      Function calls are boundaries: ghost status never crosses a call.
+//   Repeated `paradox` on already-ghost variables is idempotent.
+//
+// Both handle only straight-line code inside a block; control-flow bodies are
+// recursed into with a fresh, empty history (documented limitation).
+static void wrathParadoxBlock(std::vector<std::unique_ptr<xfawa::Statement>>& stmts,
+                              xfawa::ErrorSystem& rep) {
+    // name -> RHS expression currently defining that variable (points into the AST)
+    std::unordered_map<std::string, const xfawa::Expression*> defining;
+    // name -> set of variables it depends on (from its current defining RHS)
+    std::unordered_map<std::string, std::unordered_set<std::string>> deps;
+    // assignment order, for topological re-emission
+    std::unordered_map<std::string, int> order;
+    int counter = 0;
+    // variables currently in GHOST state (value kept, causal origin lost).
+    // Everything not in this set is NORMAL; DESTROYED no longer exists as a
+    // reachable transform state (PureParadox reads were replaced by ghosts).
+    std::unordered_set<std::string> ghost;
+
+    for (size_t i = 0; i < stmts.size(); i++) {
+        auto& up = stmts[i];
+        xfawa::Statement* s = up.get();
+
+        // Recurse into nested compound statements with a fresh history.
+        if (auto* b = dynamic_cast<xfawa::BlockStatement*>(s)) { wrathParadoxBlock(b->statements, rep); continue; }
+        if (auto* iff = dynamic_cast<xfawa::IfStatement*>(s)) {
+            if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(iff->thenBranch.get())) wrathParadoxBlock(bb->statements, rep);
+            if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(iff->elseBranch.get())) wrathParadoxBlock(bb->statements, rep);
+            for (auto& ei : iff->elseIfBranches) if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(ei.second.get())) wrathParadoxBlock(bb->statements, rep);
+            continue;
+        }
+        if (auto* wh = dynamic_cast<xfawa::WhileStatement*>(s)) {
+if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(wh->body.get())) wrathParadoxBlock(bb->statements, rep);
+            continue;
+        }
+        if (auto* fi = dynamic_cast<xfawa::ForInStatement*>(s)) {
+            continue;
+        }
+
+        if (auto* w = dynamic_cast<xfawa::WrathStatement*>(s)) {
+            std::string name = w->name;
+            auto value = std::move(w->value);  // owned RHS
+
+            // Build the downstream set: name + all transitive dependents.
+            std::unordered_set<std::string> downstream;
+            std::vector<std::string> stack{name};
+            while (!stack.empty()) {
+                std::string cur = stack.back(); stack.pop_back();
+                if (downstream.count(cur)) continue;
+                downstream.insert(cur);
+                for (const auto& kv : deps) {
+                    if (kv.second.count(cur)) stack.push_back(kv.first);
+                }
+            }
+
+            // Replace the wrath statement with a plain assignment.
+            auto assign = std::make_unique<xfawa::AssignmentStatement>(name, std::move(value), w->location);
+            assign->isReassignment = true;
+            if (ghost.count(name)) { ghost.erase(name); }  // fresh causal origin
+            up = std::move(assign);
+            defining[name] = nullptr; // will be reset below
+            // (re)record x's own defining expression AFTER the assignment node is built
+            {
+                auto* a = static_cast<xfawa::AssignmentStatement*>(up.get());
+                defining[name] = a->value.get();
+                std::unordered_set<std::string> r; collectVarRefs(a->value.get(), r);
+                deps[name] = r;
+                order[name] = counter++;
+            }
+
+            // Re-emit dependents in dependency (source) order.
+            std::vector<std::string> dependents;
+            for (const auto& kv : order) {
+                // kv.first is a var, skip name itself and anything not downstream
+                if (kv.first != name && downstream.count(kv.first)) dependents.push_back(kv.first);
+            }
+            std::sort(dependents.begin(), dependents.end(), [&](const std::string& a, const std::string& b) {
+                return order[a] < order[b];
+            });
+
+            std::vector<std::unique_ptr<xfawa::Statement>> inserted;
+            for (const auto& d : dependents) {
+                auto it = defining.find(d);
+                if (it == defining.end() || it->second == nullptr) continue;
+                auto reval = std::make_unique<xfawa::AssignmentStatement>(d, cloneExpr(it->second), w->location);
+                reval->isReassignment = true;
+                defining[d] = reval->value.get();
+                order[d] = counter++;
+                inserted.push_back(std::move(reval));
+            }
+            // insert right after index i
+            stmts.insert(stmts.begin() + i + 1, std::make_move_iterator(inserted.begin()),
+                         std::make_move_iterator(inserted.end()));
+            i += inserted.size();
+            continue;
+        }
+
+        if (auto* p = dynamic_cast<xfawa::ParadoxStatement*>(s)) {
+            std::string name = p->name;
+            if (defining.find(name) == defining.end()) {
+                wrathParadoxError(rep, "paradox on unknown variable '" + name + "'");
+                up = nullptr; // drop
+                continue;
+            }
+            // downstream = name + transitive dependents (revalidated at birth
+            // order; in straight-line code every one of them fails re-birth).
+            std::unordered_set<std::string> downstream;
+            std::vector<std::string> stack{name};
+            while (!stack.empty()) {
+                std::string cur = stack.back(); stack.pop_back();
+                if (downstream.count(cur)) continue;
+                downstream.insert(cur);
+                for (const auto& kv : deps) if (kv.second.count(cur)) stack.push_back(kv.first);
+            }
+            for (const auto& dd : downstream) ghost.insert(dd);  // idempotent
+            up = nullptr; // drop the paradox statement
+            continue;
+        }
+
+        // Ordinary assignment: (re)birth of a variable.
+        if (auto* a = dynamic_cast<xfawa::AssignmentStatement*>(s)) {
+            std::unordered_set<std::string> r; collectVarRefs(a->value.get(), r);
+            bool refsGhost = false;
+            if (!exprHasCall(a->value.get())) {  // calls are ghost boundaries
+                for (const auto& v : r) {
+                    if (ghost.count(v)) { refsGhost = true; break; }
+                }
+            }
+            // Schema B: a pure read of a ghost gives birth to a ghost.
+            if (refsGhost) ghost.insert(a->name);
+            else ghost.erase(a->name);  // new causal origin → NORMAL
+            defining[a->name] = a->value.get();
+            deps[a->name] = r;
+            order[a->name] = counter++;
+            continue;
+        }
+
+        // Any other statement (print / return / etc.): reads of ghost variables
+        // keep their real values untouched. Only a *direct* print of a ghost
+        // variable is marked -- the value stays, "#" is appended.
+        if (auto* pr = dynamic_cast<xfawa::PrintStatement*>(s)) {
+            if (auto* v = dynamic_cast<xfawa::VariableExpression*>(pr->expr.get())) {
+                if (ghost.count(v->name)) {
+                    pr->expr = std::make_unique<xfawa::GhostExpression>(v->name, v->location);
+                }
+            }
+            continue;
+        }
+        if (auto* r = dynamic_cast<xfawa::ReturnStatement*>(s)) { continue; }
+        if (auto* e = dynamic_cast<xfawa::ExpressionStatement*>(s)) { continue; }
+    }
+
+    // Remove any statements that were dropped (paradox / unknown-name errors).
+    stmts.erase(std::remove_if(stmts.begin(), stmts.end(),
+                               [](const std::unique_ptr<xfawa::Statement>& p) { return p == nullptr; }),
+                stmts.end());
+}
+
+static void applyWrathParadoxTransform(xfawa::Program* program, xfawa::ErrorSystem& rep) {
+    for (auto& mod : program->modules) {
+        for (auto& fn : mod->functions) {
+            if (fn->body) wrathParadoxBlock(fn->body->statements, rep);
+        }
+    }
+}
+
 // Map each `repeat: N` directive to the first statement whose source line is
 // strictly greater than the directive's line.
 static void buildRepeatMap(
@@ -722,6 +1024,7 @@ static std::string expAnnotationDescription(xfawa::NodeType t) {
         case xfawa::NodeType::PLEASE_STATEMENT:     return "// EXP: please —— 先输出 thank you! 再执行";
         case xfawa::NodeType::SHUTUP_STATEMENT:     return "// EXP: shutup —— 立即压制后续所有 warning（荒诞恐吓）";
         case xfawa::NodeType::ELLIPSIS_STATEMENT:   return "// EXP: ... —— 随机执行一个允许调用的安全动作";
+        case xfawa::NodeType::SLEEP_STATEMENT:      return "// EXP: sleep —— 让程序暂停指定的秒数";
         default: return "";
     }
 }
@@ -808,6 +1111,161 @@ static void annotateProgram(xfawa::Program* program, const std::string& source, 
     }
 }
 
+// ---- EXP: persistent "rage" state ------------------------------------------
+// rage is xfawac's own accumulated anger meter. It is NOT a per-compilation
+// variable: it lives as a plain integer NEXT TO THE COMPILER ITSELF and is
+// reloaded on every launch, so it survives any number of independent xfawac
+// process invocations. Only an explicit `xfawac rage reset` clears it. Every
+// copy of xfawac.exe keeps its own rage in its own directory.
+
+#ifdef _WIN32
+static std::string wideToUtf8(const wchar_t* w) {
+    if (!w || !*w) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return "";
+    std::string s(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+static std::wstring utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring ws(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &ws[0], n);
+    return ws;
+}
+#else
+#ifndef PATH_MAX
+#include <limits.h>
+#endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+#endif
+
+// Directory that contains the running xfawac executable itself.
+//   Windows: GetModuleFileNameW(NULL)
+//   Linux:   /proc/self/exe
+//   macOS:   _NSGetExecutablePath
+static std::string compilerDir() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return "";
+    std::string full = wideToUtf8(buf);
+    size_t pos = full.find_last_of("/\\");
+    if (pos == std::string::npos) return "";
+    return full.substr(0, pos);
+#elif defined(__APPLE__)
+    char buf[PATH_MAX];
+    uint32_t sz = static_cast<uint32_t>(sizeof(buf));
+    if (_NSGetExecutablePath(buf, &sz) == 0) {
+        std::string p(buf);
+        size_t pos = p.find_last_of('/');
+        if (pos != std::string::npos) return p.substr(0, pos);
+    }
+    return "";
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        std::string p(buf);
+        size_t pos = p.find_last_of('/');
+        if (pos != std::string::npos) return p.substr(0, pos);
+    }
+    return "";
+#endif
+}
+
+// State directory: the compiler's own directory. The rage file sits right next
+// to xfawac.exe (e.g. build/Release/rage), never in the user's project or the
+// current working directory.
+static std::string rageStateDir() {
+    std::string dir = compilerDir();
+    return dir.empty() ? "." : dir;
+}
+
+static std::string rageStateFilePath() {
+#ifdef _WIN32
+    return rageStateDir() + "\\rage";
+#else
+    return rageStateDir() + "/rage";
+#endif
+}
+
+// Recovery policy: a missing, unreadable, malformed or out-of-range state file
+// is never fatal — the compiler simply falls back to 0.
+static int loadRageState() {
+    std::ifstream f(rageStateFilePath(), std::ios::binary);
+    if (!f.is_open()) return 0;
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t a = content.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return 0;
+    size_t b = content.find_last_not_of(" \t\r\n");
+    content = content.substr(a, b - a + 1);
+    int v = 0;
+    try {
+        size_t used = 0;
+        v = std::stoi(content, &used);
+        if (used != content.size()) return 0; // trailing garbage
+    } catch (...) {
+        return 0; // corrupt -> safe default
+    }
+    if (v < 0 || v > 5) return 0; // out of range -> safe default
+    return v;
+}
+
+// Atomic-ish save: write a pid-unique temp file, flush, close, then replace the
+// real state file (MoveFileExW on Windows, rename on POSIX). The transient
+// state file is never truncated in place, so an interrupted write cannot leave
+// a half-written "rage".
+static bool saveRageState(int value) {
+    int v = value < 0 ? 0 : (value > 5 ? 5 : value);
+    std::string dir = rageStateDir();
+    if (!ensureDirectoryExists(dir)) return false;
+    std::string finalPath = rageStateFilePath();
+#ifdef _WIN32
+    std::string tmpPath = dir + "\\rage.tmp." + std::to_string(static_cast<long long>(_getpid()));
+#else
+    std::string tmpPath = dir + "/rage.tmp." + std::to_string(static_cast<long long>(getpid()));
+#endif
+    {
+        std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!f.is_open()) return false;
+        f << v;
+        f.flush();
+        f.close();
+    }
+#ifdef _WIN32
+    std::wstring tmpW = utf8ToWide(tmpPath);
+    std::wstring finW = utf8ToWide(finalPath);
+    if (tmpW.empty() || finW.empty()) return false;
+    return MoveFileExW(tmpW.c_str(), finW.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(tmpPath.c_str(), finalPath.c_str()) == 0;
+#endif
+}
+
+// RAII: after semantic analysis has run, persist rage if it changed. Installed
+// only once the analyzer exists; all earlier exit paths cannot have changed
+// rage (try-catch bumps happen only during analysis).
+struct RagePersist {
+    int initial;
+    const xfawa::SemanticAnalyzer* analyzer;
+    RagePersist(int i, const xfawa::SemanticAnalyzer* a) : initial(i), analyzer(a) {}
+    ~RagePersist() {
+        if (analyzer) {
+            int cur = analyzer->getRage();
+            if (cur != initial) {
+                saveRageState(cur);
+            }
+        }
+    }
+};
+
 int main(int argc, char** argv) {
     xfawa::ErrorReporter::initialize();
 
@@ -861,6 +1319,21 @@ int main(int argc, char** argv) {
             return 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printUsage(argv[0]);
+            xfawa::ErrorReporter::cleanup();
+            return 0;
+        } else if (strcmp(argv[i], "rage") == 0) {
+            // EXP subcommands for the persistent rage meter.
+            bool reset = false;
+            if (i + 1 < argc && strcmp(argv[i + 1], "reset") == 0) {
+                reset = true;
+                i++;
+            }
+            if (reset) {
+                saveRageState(0);
+                printf("rage reset: 0/5\n");
+            } else {
+                printf("rage: %d/5\n", loadRageState());
+            }
             xfawa::ErrorReporter::cleanup();
             return 0;
         } else if (argv[i][0] != '-') {
@@ -1066,6 +1539,9 @@ int main(int argc, char** argv) {
     // ---- EXP `lie`: rewrite variable reads to their falsified value -------
     applyLieTransform(program.get());
     
+    // ---- EXP `wrath` / `paradox`: retroactive history + causal paradox -----
+    applyWrathParadoxTransform(program.get(), xfawa::ErrorReporter::get());
+    
     if (g_debug) {
         std::cout << "[debug] AST:" << std::endl;
         std::cout << program->toString() << std::endl;
@@ -1140,7 +1616,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    xfawa::SemanticAnalyzer semanticAnalyzer;
+    // ---- EXP: rage starts from the persistStore; try-catch raises it, sorry
+    // lowers it; the RAII guard writes the final value back on every exit path
+    // that ran analysis (earlier exits cannot have changed it).
+    int initialRage = loadRageState();
+    xfawa::SemanticAnalyzer semanticAnalyzer(initialRage);
+    RagePersist ragePersist(initialRage, &semanticAnalyzer);
     if (!semanticAnalyzer.analyze(program.get())) {
         for (const auto& error : semanticAnalyzer.getErrors()) {
             xfawa::ErrorReporter::get().addSyntaxError(0, 0, error);

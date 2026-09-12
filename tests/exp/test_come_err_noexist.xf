@@ -1,0 +1,6 @@
+#test {
+    fn main() {
+        come 99
+        print("hi")
+    }
+}

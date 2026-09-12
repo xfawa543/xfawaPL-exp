@@ -40,7 +40,14 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::keywords = {
     {"ignore", TokenType::KEYWORD_IGNORE},
     {"do", TokenType::KEYWORD_DO},
     {"please", TokenType::KEYWORD_PLEASE},
-    {"shutup", TokenType::KEYWORD_SHUTUP}
+    {"shutup", TokenType::KEYWORD_SHUTUP},
+    {"wrath", TokenType::KEYWORD_WRATH},
+    {"paradox", TokenType::KEYWORD_PARADOX},
+    {"try", TokenType::KEYWORD_TRY},
+    {"expect", TokenType::KEYWORD_EXPECT},
+    {"sorry", TokenType::KEYWORD_SORRY},
+    {"sleep", TokenType::KEYWORD_SLEEP},
+    {"come", TokenType::KEYWORD_COME}
 };
 
 const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
@@ -83,6 +90,7 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::STRING_LITERAL: return "string";
         case TokenType::FLOAT_LITERAL: return "float";
         case TokenType::COLOR_LITERAL: return "color";
+        case TokenType::O_LITERAL: return "o-literal";
         case TokenType::KEYWORD_FN: return "fn";
         case TokenType::KEYWORD_IF: return "if";
         case TokenType::KEYWORD_ELSE: return "else";
@@ -114,6 +122,13 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_DO: return "do";
         case TokenType::KEYWORD_PLEASE: return "please";
         case TokenType::KEYWORD_SHUTUP: return "shutup";
+        case TokenType::KEYWORD_WRATH: return "wrath";
+        case TokenType::KEYWORD_PARADOX: return "paradox";
+        case TokenType::KEYWORD_TRY: return "try";
+        case TokenType::KEYWORD_EXPECT: return "expect";
+        case TokenType::KEYWORD_SORRY: return "sorry";
+        case TokenType::KEYWORD_SLEEP: return "sleep";
+        case TokenType::KEYWORD_COME: return "come";
         case TokenType::PUNCTUATOR_LPAREN: return "(";
         case TokenType::PUNCTUATOR_RPAREN: return ")";
         case TokenType::PUNCTUATOR_LBRACE: return "{";
@@ -227,6 +242,12 @@ void Lexer::addError(const std::string& message) {
 void Lexer::lexIdentifier() {
     int start_column = column;
     std::string text;
+    
+    // A pure run of 'o' (o, oo, ooo, ...) stays an IDENTIFIER at the lexer level.
+    // The parser decides whether it is an o-literal or a variable reference: an
+    // undeclared identifier made only of 'o' characters becomes an o-literal,
+    // while a declared variable named `o` keeps referring to that variable.
+    // This keeps `int o = 20` working and lets the o-literal coexist with it.
     while (!isAtEnd() && (isAlphaNumeric(peek()) || peek() == '_')) {
         text += advance();
     }
@@ -258,6 +279,16 @@ void Lexer::lexNumber() {
         while (!isAtEnd() && std::isdigit(peek())) {
             text += advance();
         }
+    }
+    
+    // EXP o-literal: digits followed by one or more 'o' characters, e.g. `1o`,
+    // `15o`, `10o`. These form a single O_LITERAL token (digit prefix + o run).
+    if (!isFloat && !isAtEnd() && peek() == 'o') {
+        while (!isAtEnd() && peek() == 'o') {
+            text += advance();
+        }
+        addToken(TokenType::O_LITERAL, text);
+        return;
     }
     
     if (isFloat) {

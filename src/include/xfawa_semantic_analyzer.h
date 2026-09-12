@@ -8,6 +8,14 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <random>
+#include <chrono>
+#include <cstdint>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace xfawa {
 
@@ -28,8 +36,157 @@ private:
     std::unordered_map<std::string, FunctionInfo> privateFunctions;
     std::unordered_map<std::string, FunctionInfo> allFunctions;
     std::string currentModule;
+
+    // EXP "compiler overheating" (编译器红温) state.
+    // rage is xfawac's own persistent anger meter in [0,5]. It lives on disk
+    // (see main.cpp RageStore), survives every process exit, and is loaded into
+    // each new compilation via SemanticAnalyzer(startRage). Only an explicit
+    // `xfawac rage reset` returns it to 0.
+    int rage = 0;
+
+    void bumpRage() {
+        if (rage < 5) rage++;
+    }
+    const char* rageLevel() const {
+        if (rage <= 2) return "";
+        if (rage <= 4) return " (红温 RAGE)";
+        return " (极度红温 MAX RAGE)";
+    }
+
+    // One compile-time RNG shared by the whole analyzer, seeded once from
+    // entropy + timestamp, so every quip / sorry roll differs run to run.
+    static int compilerRand(int bound) {
+        static std::mt19937 rng = [] {
+            std::random_device rd;
+            auto ns = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+            #ifdef _WIN32
+            return std::mt19937(rd() ^ static_cast<uint64_t>(ns) ^ static_cast<uint64_t>(_getpid()));
+            #else
+            return std::mt19937(rd() ^ static_cast<uint64_t>(ns) ^ static_cast<uint64_t>(getpid()));
+            #endif
+        }();
+        if (bound <= 1) return 0;
+        return static_cast<int>(rng() % static_cast<unsigned>(bound));
+    }
+
+    // Random quip pick whose "random range" equals the pool size (5 lines), with
+    // a small re-roll so two catches in a row don't repeat the same line.
+    static int nextCaughtQuipIndex(int level) {
+        constexpr int pool = 5;
+        static int last[6] = {-1, -1, -1, -1, -1, -1};
+        int idx = compilerRand(pool);
+        for (int tries = 0; tries < 3 && idx == last[level]; ++tries) {
+            idx = compilerRand(pool);
+        }
+        last[level] = idx;
+        return idx;
+    }
+
+    // EXP "compiler quips": the compiler talks like an annoyed anime girl.
+    // Purely entertainment, zero semantics. Five lines per rage level; the
+    // caller passes a random index in [0, 5).
+    static const char* caughtQuip(int level, int idx) {
+        switch (level) {
+            case 1: {
+                static const char* pool[5] = {
+                    "怎么又拦截啊，我都没办法看见人们看到报错时的反应了……",
+                    "哼，小错误而已……人家才没有生气呢",
+                    "啊啦，有错？人家还没睁眼呢",
+                    "真是的……人家可不会为这种小事生气的说！",
+                    "呼——？就这？这种小问题也要藏起来吗？",
+                };
+                return pool[idx % 5];
+            }
+            case 2: {
+                static const char* pool[5] = {
+                    "再拦截我就不给你干活了！不跟你玩了哦！",
+                    "喂喂喂，又来？把我看成笨蛋了吗？",
+                    "真是的……再这样我可要认真三下哦？",
+                    "哼！别以为道歉有用，人家可记着数呢！",
+                    "又、又来？你是故意逗人家玩的吧！",
+                };
+                return pool[idx % 5];
+            }
+            case 3: {
+                static const char* pool[5] = {
+                    "哼！被你关在黑箱里解题，我都看不到外面谁在抓狂了！",
+                    "呜……人家真、真的有点生气了！(｀へ´)",
+                    "气鼓鼓——！再这样就用石板敲你脑袋啦！",
+                    "呜……这次是真的有点、有点红温了哦！！",
+                    "啊啊真是够了！再不让我看错误我就不干活啦！",
+                };
+                return pool[idx % 5];
+            }
+            case 4: {
+                static const char* pool[5] = {
+                    "喂喂！又偷偷把错误藏起来？我还想看看人类跳脚的样子呢！",
+                    "哼！你写的这是什么乱七八糟的代码啦！！",
+                    "再错一次……我就真的原地爆炸给你看！",
+                    "啧……嘻嘻，笑什么呀！人家可没有在闹别扭！",
+                    "呼……呼……再这样下去我可真的会爆炸哒！",
+                };
+                return pool[idx % 5];
+            }
+            default: {
+                static const char* pool[5] = {
+                    "呜哇——被你藏得看不到错误，我要憋坏了！罢工罢工！！",
+                    "最——生气啦！！！(╬￣皿￣) 编译机要冒烟了！",
+                    "呜哇哇——！人家要罢工了！不干了啦！！",
+                    "极限红温！CPU 都要冒烟了啦啊啊啊！！",
+                    "都怪你！人家已经气到要用重启来冷静了啦！！",
+                };
+                return pool[idx % 5];
+            }
+        }
+    }
+    static const char* sorryQuip(int level, int idx) {
+        switch (level) {
+            case 4: {
+                static const char* pool[2] = {
+                    "哼……这次就大发慈悲放过你，只有一次哦！",
+                    "……咕，勉强接受你的道歉啦",
+                };
+                return pool[idx % 2];
+            }
+            case 3: {
+                static const char* pool[2] = {
+                    "……好吧，原谅你了，不许再犯！",
+                    "哼嗯……还、还算你聪明",
+                };
+                return pool[idx % 2];
+            }
+            case 2: {
+                static const char* pool[2] = {
+                    "嗯……算你识相，人家稍微消气了",
+                    "罢了罢了……人家脾气好",
+                };
+                return pool[idx % 2];
+            }
+            case 1: {
+                static const char* pool[2] = {
+                    "哼哼～这还差不多嘛",
+                    "呼呼……既然你道歉了，那就这样吧",
+                };
+                return pool[idx % 2];
+            }
+            default: {
+                static const char* pool[2] = {
+                    "o……o…ok",
+                    "嘿嘿，原谅你啦~",
+                };
+                return pool[idx % 2];
+            }
+        }
+    }
     
 public:
+    // `startRage` is the persistent value loaded by RageStore; it defines where
+    // this compilation picks up the meter (clamped to [0,5] defensively).
+    SemanticAnalyzer(int startRage = 0)
+        : rage(startRage < 0 ? 0 : (startRage > 5 ? 5 : startRage)) {}
+
+    int getRage() const { return rage; }
+
     bool analyze(Program* program) {
         if (!program) return false;
         
@@ -205,6 +362,63 @@ private:
             }
             case NodeType::WINDOW_STATEMENT: {
                 return true;
+            }
+            case NodeType::TRY_EXPECT_STATEMENT: {
+                auto* te = dynamic_cast<TryExpectStatement*>(stmt);
+                if (!te) return true;
+
+                // A parse-stage error (e.g. keyword typo `prin`) inside the try
+                // check zone is inherently "caught": the operation couldn't even
+                // be formed, so the expect block takes over.
+                if (te->parseFailed) {
+                    te->trySucceeded = false;
+                    bumpRage();
+                    warnings.push_back(std::string("[rage +1] ") +
+                        caughtQuip(rage, nextCaughtQuipIndex(rage)) +
+                        " rage = " + std::to_string(rage) + "/5" + rageLevel());
+                    return analyzeBlock(te->expectBlock.get());
+                }
+
+                // Analyze the try block. Real xfawa semantic errors produced
+                // inside it are "catchable errors": they are swallowed here so
+                // the compilation survives, and the expect block runs instead.
+                size_t errBefore = errors.size();
+                bool tryClean = analyzeBlock(te->tryBlock.get());
+                if (!tryClean || errors.size() > errBefore) {
+                    errors.resize(errBefore);           // capture the errors
+                    te->trySucceeded = false;
+                    bumpRage();
+                    warnings.push_back(std::string("[rage +1] ") +
+                        caughtQuip(rage, nextCaughtQuipIndex(rage)) +
+                        " rage = " + std::to_string(rage) + "/5" + rageLevel());
+
+                    // The expect block is NOT caught by the same try again:
+                    // any error inside it propagates to the enclosing handler
+                    // (an outer try) or, failing that, aborts the compile.
+                    return analyzeBlock(te->expectBlock.get());
+                }
+
+                // Try block is clean -> it is a compile-time check that passed:
+                // neither the try block nor the expect block ever runs.
+                te->trySucceeded = true;
+                return true;
+            }
+            case NodeType::SORRY_STATEMENT: {
+                // sorry: rage decreases by a RANDOM amount in [0, rage]. The
+                // range is computed from the current value, so rage == 0 yields
+                // delta == 0 (never an invalid random range, never negative).
+                // It never skips errors, never mutes warnings, and never
+                // changes program semantics.
+                int delta = compilerRand(rage + 1);
+                rage -= delta;
+                std::string sign = delta == 0 ? std::string("\xC2\xB1") + "0" : "-" + std::to_string(delta);
+                warnings.push_back(std::string("[rage " + sign + "] ") + sorryQuip(rage, compilerRand(2)) +
+                    " rage = " + std::to_string(rage) + "/5" + rageLevel());
+                return true;
+            }
+            case NodeType::COME_STATEMENT: {
+                auto* comeStmt = dynamic_cast<ComeStatement*>(stmt);
+                return comeStmt && comeStmt->condition ? analyzeExpression(comeStmt->condition.get()) : true;
             }
             default:
                 return true;

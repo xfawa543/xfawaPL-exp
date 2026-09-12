@@ -1,0 +1,36 @@
+#test {
+    fn main() {
+        ...
+        print("end")
+    }
+    fn deep1() { ... }
+    fn deep2() { ... }
+    fn deep3() { ... }
+    fn deep4() { ... }
+    fn deep5() { ... }
+    fn deep6() { ... }
+    fn deep7() { ... }
+    fn deep8() { ... }
+    fn deep9() { ... }
+    fn deep10() { ... }
+    fn deep11() { ... }
+    fn deep12() { ... }
+    fn deep13() { ... }
+    fn deep14() { ... }
+    fn deep15() { ... }
+    fn deep16() { ... }
+    fn deep17() { ... }
+    fn deep18() { ... }
+    fn deep19() { ... }
+    fn deep20() { ... }
+    fn deep21() { ... }
+    fn deep22() { ... }
+    fn deep23() { ... }
+    fn deep24() { ... }
+    fn deep25() { ... }
+    fn deep26() { ... }
+    fn deep27() { ... }
+    fn deep28() { ... }
+    fn deep29() { ... }
+    fn deep30() { ... }
+}

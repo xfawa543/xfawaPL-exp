@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        come 4
+
+        print("hi")
+    }
+}

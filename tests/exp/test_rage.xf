@@ -1,0 +1,79 @@
+#test {
+    fn main() {
+        // 捕获一次 → rage +1，然后是 sorry → rage 随机下降
+        try {
+            notFound()
+        } expect {
+            print("caught")
+        }
+        sorry
+        print("done")
+        // 连捕 5 次 → 红温封顶 5
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        // 连续 10 次 sorry → 随机下降（delta∈[0,rage]，多次才可能归零）
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        print("end")
+        // 新一次捕获 → 从 0 重新升温
+        try {
+            notFound()
+        } expect {
+            print("fresh")
+        }
+        // 2 捕 2 sorry → 随机下降（不一定回到 0）
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        sorry
+        sorry
+        print("ok")
+        // 台词随机：5 次不同错误 → 每级从 5 句池子里随机抽取（含新增傲娇句）
+        try {
+            notFound1()
+        } expect {
+            print("r1")
+        }
+        try {
+            notFound2()
+        } expect {
+            print("r2")
+        }
+        try {
+            notFound3()
+        } expect {
+            print("r3")
+        }
+        try {
+            notFound4()
+        } expect {
+            print("r4")
+        }
+        try {
+            notFound5()
+        } expect {
+            print("r5")
+        }
+        sorry
+        sorry
+        sorry
+        sorry
+        // 语义为空的捕获：输出不受影响
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        print("same output")
+    }
+}

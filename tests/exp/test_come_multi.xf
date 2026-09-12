@@ -1,0 +1,10 @@
+#test {
+    fn main() {
+        t = 1
+        print(t)
+        come if(t < 3) 8
+        come if(t < 2) 8
+        t = t + 1
+        print(t)
+    }
+}

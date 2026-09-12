@@ -1,0 +1,69 @@
+#test {
+    fn main() {
+        // 检查通过：try 与 expect 都不执行
+        try {
+            print("should-not-run")
+        } expect {
+            print("caught")
+        }
+        print("after")
+        // 语义错误被捕获
+        try {
+            notFound()
+        } expect {
+            print("caught")
+        }
+        // 解析期拼写错误被拦截
+        try {
+            prin
+        } expect {
+            print("caught prin")
+        }
+        // 多语句：用户示例 prin / print / notfound()
+        try {
+            prin
+            print
+            notfound()
+        } expect {
+            print("caught multi")
+        }
+        // try 内合法语句不执行（纯检查区）
+        try {
+            print(5)
+            notFound()
+        } expect {
+            print("caught")
+        }
+        print("after")
+        // 嵌套：外层检查通过 → 整区不执行
+        try {
+            try { notFound() } expect { print("inner") }
+            print("outer zone")
+        } expect {
+            print("outer caught")
+        }
+        print("outer continues")
+        // 嵌套传播：内层 expect 错误被外层捕获
+        try {
+            try { notFound() } expect { notFoundInner() }
+        } expect {
+            print("outer caught")
+        }
+        // 程序员指定的真实操作
+        try {
+            readFile("test.txt")
+        } expect {
+            print("caught real file error")
+        }
+        // 非 print 语句大杂烩：try 拦截不特判 print
+        try {
+            intr x = 5
+            rttern 42
+            whle (true) { }
+            runtimeErr()
+        } expect {
+            print("caught generic")
+        }
+        print("after")
+    }
+}

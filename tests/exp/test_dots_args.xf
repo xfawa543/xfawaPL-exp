@@ -1,0 +1,11 @@
+#test {
+    fn main() {
+        show(5)
+        ...
+        print("done")
+    }
+
+    fn show(x) {
+        print(x)
+    }
+}

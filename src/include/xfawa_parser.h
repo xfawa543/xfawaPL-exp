@@ -18,6 +18,10 @@ private:
     std::vector<std::string> warnings;
     std::unordered_set<std::string> declaredVariables;
     bool suppressWarnings = false;
+    // EXP `try...expect`: while parsing the single-operation try body, the
+    // ask-to-repair (keyword typo) prompt is suppressed — the programmer asked
+    // to handle the operation's errors themselves inside expect.
+    bool inTryBody = false;
     
 public:
     explicit Parser(const std::vector<Token>& toks);
@@ -66,6 +70,13 @@ private:
     std::unique_ptr<Statement> parsePleaseStatement();
     std::unique_ptr<Statement> parseShutupStatement();
     std::unique_ptr<Statement> parseEllipsisStatement();
+    std::unique_ptr<SleepStatement> parseSleepStatement();
+    std::unique_ptr<Statement> parseComeStatement();
+    std::unique_ptr<Statement> parseWrathStatement();
+    std::unique_ptr<Statement> parseParadoxStatement();
+    std::unique_ptr<Statement> parseTryExpectStatement();
+    void recoverTryBlockError();
+    std::unique_ptr<Statement> parseSorryStatement();
     std::unique_ptr<ReturnStatement> parseReturnStatement();
     std::unique_ptr<BlockStatement> parseBlockStatement();
     std::unique_ptr<WhileStatement> parseWhileStatement();

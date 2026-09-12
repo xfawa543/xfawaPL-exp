@@ -60,6 +60,9 @@ static const std::vector<std::pair<std::string, TokenType>>& autoFixCandidates()
         {"loop",   TokenType::KEYWORD_LOOP},
         {"boom",   TokenType::KEYWORD_BOOM},
         {"bsod",   TokenType::KEYWORD_BSOD},
+        {"try",    TokenType::KEYWORD_TRY},
+        {"expect", TokenType::KEYWORD_EXPECT},
+        {"sorry",  TokenType::KEYWORD_SORRY},
     };
     return map;
 }
@@ -959,8 +962,20 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         return parsePleaseStatement();
     } else if (peek().is(TokenType::KEYWORD_SHUTUP)) {
         return parseShutupStatement();
+    } else if (peek().is(TokenType::KEYWORD_WRATH)) {
+        return parseWrathStatement();
+    } else if (peek().is(TokenType::KEYWORD_PARADOX)) {
+        return parseParadoxStatement();
+    } else if (peek().is(TokenType::KEYWORD_TRY)) {
+        return parseTryExpectStatement();
+    } else if (peek().is(TokenType::KEYWORD_SORRY)) {
+        return parseSorryStatement();
     } else if (peek().is(TokenType::PUNCTUATOR_DOT_DOT_DOT)) {
         return parseEllipsisStatement();
+    } else if (peek().is(TokenType::KEYWORD_SLEEP)) {
+        return parseSleepStatement();
+    } else if (peek().is(TokenType::KEYWORD_COME)) {
+        return parseComeStatement();
     } else if (peek().is(TokenType::PUNCTUATOR_EXCLAIM)) {
         return parseOverriddenStatement();
     } else if (peek().is(TokenType::KEYWORD_RETURN)) {
@@ -1004,6 +1019,13 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         {
             std::string fix = nearestKeywordName(peek().text);
             if (!fix.empty()) {
+                // Inside `try`, the programmer chose to handle the operation's
+                // errors themselves via `expect`, so the repair prompt is
+                // skipped and the typo becomes a catchable parse error (recorded
+                // by parseTryExpectStatement's error recovery, swallowed).
+                if (inTryBody) {
+                    return nullptr;
+                }
                 std::cout << "Unknown statement: " << peek().text << std::endl;
                 std::cout << "Did you mean: " << fix << "?" << std::endl;
                 std::cout << "Apply this fix? [y/N] " << std::flush;
@@ -1028,9 +1050,10 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         if (peek(1).is(TokenType::PUNCTUATOR_LPAREN) ||
             peek(1).is(TokenType::PUNCTUATOR_COLON) ||
             peek(1).is(TokenType::PUNCTUATOR_DOT)) {
+            SourceLocation loc = peek().location;
             auto expr = parseExpression();
             if (!expr) return nullptr;
-            return std::make_unique<ExpressionStatement>(std::move(expr), peek().location);
+            return std::make_unique<ExpressionStatement>(std::move(expr), loc);
         }
         // Note: Xraphics object definitions (name = x3d.box(...)) are only allowed
         // inside class blocks (parseClassDeclarationStatement), not in regular statements.
@@ -1219,14 +1242,15 @@ std::unique_ptr<UnStatement> Parser::parseUnStatement() {
         return nullptr;
     }
     
-    // First version supports disabling `print`, `boom`, `bsod`.
+    // First version supports disabling `print`, `boom`, `bsod`, `sleep`.
     TokenType target = peek().type;
     if (target == TokenType::KEYWORD_PRINT ||
         target == TokenType::KEYWORD_BOOM ||
-        target == TokenType::KEYWORD_BSOD) {
+        target == TokenType::KEYWORD_BSOD ||
+        target == TokenType::KEYWORD_SLEEP) {
         advance();
     } else {
-        addError("'un' can only disable a statement keyword (print / boom / bsod) in this version");
+        addError("'un' can only disable a statement keyword (print / boom / bsod / sleep) in this version");
         return nullptr;
     }
     
@@ -1241,6 +1265,13 @@ std::unique_ptr<Statement> Parser::parseOverriddenStatement() {
     
     if (peek().is(TokenType::KEYWORD_PRINT)) {
         auto stmt = parsePrintStatement();
+        if (stmt) {
+            stmt->overridden = true;
+        }
+        return stmt;
+    }
+    if (peek().is(TokenType::KEYWORD_SLEEP)) {
+        auto stmt = parseSleepStatement();
         if (stmt) {
             stmt->overridden = true;
         }
@@ -1301,6 +1332,184 @@ std::unique_ptr<Statement> Parser::parseEllipsisStatement() {
     SourceLocation loc = peek().location;
     if (!consume(TokenType::PUNCTUATOR_DOT_DOT_DOT)) return nullptr;
     return std::make_unique<EllipsisStatement>(loc);
+}
+
+std::unique_ptr<SleepStatement> Parser::parseSleepStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_SLEEP)) return nullptr;
+
+    if (!consume(TokenType::PUNCTUATOR_LPAREN)) {
+        addError("Expected '(' after 'sleep'");
+        return nullptr;
+    }
+
+    auto expr = parseExpression();
+    if (!expr) return nullptr;
+
+    if (!consume(TokenType::PUNCTUATOR_RPAREN)) {
+        addError("Expected ')' after sleep duration");
+        return nullptr;
+    }
+
+    return std::make_unique<SleepStatement>(std::move(expr), loc);
+}
+
+// EXP `come`: `come <line>` or `come if(<cond>) <line>`.
+std::unique_ptr<Statement> Parser::parseComeStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_COME)) return nullptr;
+
+    std::unique_ptr<Expression> cond;
+    if (peek().is(TokenType::KEYWORD_IF)) {
+        advance();
+        if (!consume(TokenType::PUNCTUATOR_LPAREN)) {
+            addError("Expected '(' after 'come if'");
+            return nullptr;
+        }
+        cond = parseExpression();
+        if (!cond) return nullptr;
+        if (!consume(TokenType::PUNCTUATOR_RPAREN)) {
+            addError("Expected ')' after come condition");
+            return nullptr;
+        }
+    }
+
+    if (!peek().isOneOf(TokenType::NUMBER_LITERAL, TokenType::LONG_LITERAL)) {
+        addError("Expected a line number after 'come'");
+        return nullptr;
+    }
+
+    std::string text = peek().text;
+    if (!text.empty() && (text.back() == 'L' || text.back() == 'l')) {
+        text.pop_back();
+    }
+    int targetLine = 0;
+    try {
+        targetLine = static_cast<int>(std::stoll(text));
+    } catch (...) {
+        targetLine = 0;
+    }
+    advance();
+
+    if (targetLine < 1) {
+        addError("come: invalid target line number " + std::to_string(targetLine) + " (line numbers start at 1)");
+        return nullptr;
+    }
+
+    return std::make_unique<ComeStatement>(targetLine, std::move(cond), loc);
+}
+
+std::unique_ptr<Statement> Parser::parseWrathStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_WRATH)) return nullptr;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after 'wrath'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after variable name in 'wrath'");
+        return nullptr;
+    }
+
+    auto expr = parseExpression();
+    if (!expr) return nullptr;
+
+    return std::make_unique<WrathStatement>(name, std::move(expr), loc);
+}
+
+std::unique_ptr<Statement> Parser::parseParadoxStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_PARADOX)) return nullptr;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after 'paradox'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    return std::make_unique<ParadoxStatement>(name, loc);
+}
+
+std::unique_ptr<Statement> Parser::parseTryExpectStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_TRY)) return nullptr;
+
+    if (!peek().is(TokenType::PUNCTUATOR_LBRACE)) {
+        addError("Expected '{' block after 'try'");
+        return nullptr;
+    }
+    advance(); // consume '{'
+
+    // `try` 块是编译期错误检查区：可包含任意数量的语句（运行时都不执行）。
+    // 在 try 内发生的解析阶段错误（如关键字拼写错误 `prin`）通过错误恢复
+    // 记录下来并吞掉 parser 错误，交给语义分析阶段判定是否被 try 拦截。
+    auto tryBlock = std::make_unique<BlockStatement>(loc);
+    bool parseFailed = false;
+    inTryBody = true;
+    while (!isAtEnd() && !peek().is(TokenType::PUNCTUATOR_RBRACE)) {
+        size_t errBefore = errors.size();
+        auto stmt = parseStatement();
+        if (stmt) {
+            tryBlock->statements.push_back(std::move(stmt));
+        } else {
+            // A parse-stage error occurred inside the try check zone: record it
+            // as a catchable error and swallow the parser-side diagnostics.
+            parseFailed = true;
+            errors.resize(errBefore);
+            recoverTryBlockError();
+        }
+    }
+    inTryBody = false;
+
+    if (!consume(TokenType::PUNCTUATOR_RBRACE)) {
+        addError("Expected '}' to close 'try' block");
+        return nullptr;
+    }
+
+    if (!consume(TokenType::KEYWORD_EXPECT)) {
+        addError("Expected 'expect' after the 'try' block");
+        return nullptr;
+    }
+
+    auto expectBlock = parseBlockStatement();
+    if (!expectBlock) {
+        addError("Expected '{' block after 'expect'");
+        return nullptr;
+    }
+
+    auto te = std::make_unique<TryExpectStatement>(std::move(tryBlock), std::move(expectBlock), loc);
+    te->parseFailed = parseFailed;
+    return te;
+}
+
+// Error recovery inside the try check zone: skip forward past the offending
+// tokens, balancing nested braces so a `}` that closes an inner block
+// (if/while/function body, even a malformed one) is never mistaken for the
+// try block's own closing brace. Stops at the try block's closing '}' (depth 0)
+// or end-of-input; the loop in parseTryExpectStatement consumes that '}'.
+void Parser::recoverTryBlockError() {
+    int depth = 0;
+    while (!isAtEnd()) {
+        if (peek().is(TokenType::PUNCTUATOR_RBRACE)) {
+            if (depth == 0) return;
+            --depth;
+            advance();
+            continue;
+        }
+        if (peek().is(TokenType::PUNCTUATOR_LBRACE)) {
+            ++depth;
+        }
+        advance();
+    }
+}
+
+std::unique_ptr<Statement> Parser::parseSorryStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_SORRY)) return nullptr;
+    return std::make_unique<SorryStatement>(loc);
 }
 
 std::unique_ptr<ReturnStatement> Parser::parseReturnStatement() {
@@ -1611,6 +1820,10 @@ std::unique_ptr<Expression> Parser::parseUnary() {
 }
 
 std::unique_ptr<Expression> Parser::parsePrimary() {
+    if (consume(TokenType::O_LITERAL)) {
+        return std::make_unique<OLiteralExpression>(peek(-1).text, peek(-1).location);
+    }
+    
     if (consume(TokenType::NUMBER_LITERAL)) {
         int64_t value = std::stoll(peek(-1).text);
         return std::make_unique<NumberLiteral>(value, peek(-1).location);
@@ -1672,6 +1885,16 @@ std::unique_ptr<Expression> Parser::parsePrimary() {
     if (consume(TokenType::IDENTIFIER)) {
         std::string name = peek(-1).text;
         SourceLocation loc = peek(-1).location;
+
+        // EXP o-literal: a purely 'o'-sequence identifier (o, oo, ooo, ...) that
+        // is NOT declared as a variable is interpreted as an o-literal. A
+        // declared variable named e.g. `o` takes priority and stays a variable.
+        {
+            bool allO = !name.empty() && name.find_first_not_of('o') == std::string::npos;
+            if (allO && !isVariableDeclared(name)) {
+                return std::make_unique<OLiteralExpression>(name, loc);
+            }
+        }
 
         std::string blockName;
 

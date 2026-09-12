@@ -1,0 +1,14 @@
+#test {
+    fn main() {
+        print("a")
+        un sleep
+        sleep(5)
+        print("b-no-sleep")
+        !sleep(1)
+        print("c-after-override")
+        do.sleep(0.3)
+        print("d-after-do")
+        sleep(2)
+        print("e-still-un")
+    }
+}

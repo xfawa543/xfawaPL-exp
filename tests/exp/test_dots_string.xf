@@ -1,0 +1,11 @@
+#test {
+    fn main() {
+        stamp("abc")
+        ...
+        print("done")
+    }
+
+    fn stamp(word) {
+        print(word + "!")
+    }
+}

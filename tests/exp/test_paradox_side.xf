@@ -1,0 +1,17 @@
+#test {
+    fn tick() {
+        print("TICK")
+        return 1
+    }
+
+    fn main() {
+        // Test 7：print("Hello") 只出现一次 —— paradox 不是重跑整个程序
+        print("Hello")
+
+        // Test 6：impure RHS 的副作用只执行一次 —— 不重放、不重复验证
+        a = 1
+        b = a + tick()
+        paradox a      // 只做局部因果重新验证，绝不重复调用 tick()
+        print(b)       // TICK 只出现一次；b 是下游 GHOST → 2#
+    }
+}

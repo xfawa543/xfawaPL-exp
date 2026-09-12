@@ -1,0 +1,10 @@
+#test {
+    fn main() {
+        come 7
+        print("hi")
+    }
+    fn helper() {
+        x = 1
+        y = 2
+    }
+}

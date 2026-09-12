@@ -1,0 +1,9 @@
+#test {
+    fn main() {
+        try {
+            notFound()
+        } expect {
+            notFound2()
+        }
+    }
+}

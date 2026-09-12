@@ -1,0 +1,70 @@
+#test {
+    fn main() {
+        // paradox1 核心祖父悖论：下游因果链重新验证失败，值保留并成为 GHOST
+        a = 1
+        b = a + 1
+        c = b + 1
+        print(c)      // 3
+        paradox a
+        print(c)      // 3#
+
+        // paradox2 没有 dependent：被 paradox 的变量自身成为 GHOST
+        a = 123
+        paradox a
+        print(a)      // 123#
+
+        // paradox3 无关变量完全不受影响（严格依赖闭包）
+        a = 1
+        b = a + 1
+        x = 100
+        y = x + 1
+        paradox a
+        print(b)      // 2#
+        print(y)      // 101
+
+        // paradox4 多级依赖：全部保留原值、全部 GHOST
+        a = 1
+        b = a + 1
+        c = b + 1
+        d = c + 1
+        e = d + 1
+        paradox a
+        print(b)      // 2#
+        print(c)      // 3#
+        print(d)      // 4#
+        print(e)      // 5#
+
+        // paradox5 重复 paradox：幂等，不产生额外副作用
+        a = 1
+        b = a + 1
+        paradox a
+        paradox b
+        print(a)      // 1#
+        print(b)      // 2#
+
+        // paradox6 与 wrath 叠加
+        x = 1
+        y = x + 10
+        wrath x = 5
+        print(y)      // 15
+        paradox x
+        print(y)      // 15#
+
+        // paradox7 显式重新赋值 → 新的因果来源 → 恢复 NORMAL
+        a = 1
+        b = a + 1
+        paradox a
+        b = 100
+        print(b)      // 100
+
+        // paradox8 幽灵值仍然可读（if 条件使用保留值 2）
+        a = 1
+        b = a + 1
+        paradox a
+        if b > 0 {
+            print("positive")      // positive
+        } else {
+            print("non-positive")
+        }
+    }
+}

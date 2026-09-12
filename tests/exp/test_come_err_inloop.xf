@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        loop {
+            come 3
+        }
+    }
+}

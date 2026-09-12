@@ -1,5 +1,6 @@
 #test {
     fn main() {
+        // lie 基础：块内观测值被修改，块外真实值不变
         answer = 41
         lie answer = 42 {
             if (answer == 42) {
@@ -8,5 +9,15 @@
             print(answer)
         }
         print(answer)
+        // lie 嵌套：内层再次 lie
+        x = 10
+        lie x = 99 {
+            print(x)
+            lie x = 88 {
+                print(x)
+            }
+            print(x)
+        }
+        print(x)
     }
 }

@@ -34,6 +34,15 @@ std::string nodeTypeToString(NodeType type) {
         case NodeType::ARRAY_RANGE_EXPRESSION: return "array_range_expression";
         case NodeType::ARRAY_LITERAL: return "array_literal";
         case NodeType::ARRAY_INDEX_EXPRESSION: return "array_index_expression";
+        case NodeType::O_LITERAL_EXPRESSION: return "o_literal_expression";
+        case NodeType::PARADOX_EXPRESSION: return "paradox_expression";
+        case NodeType::GHOST_EXPRESSION: return "ghost_expression";
+        case NodeType::WRATH_STATEMENT: return "wrath_statement";
+        case NodeType::PARADOX_STATEMENT: return "paradox_statement";
+        case NodeType::TRY_EXPECT_STATEMENT: return "try_expect_statement";
+        case NodeType::SORRY_STATEMENT: return "sorry_statement";
+        case NodeType::SLEEP_STATEMENT: return "sleep_statement";
+        case NodeType::COME_STATEMENT: return "come_statement";
         case NodeType::STATEMENT: return "statement";
         case NodeType::PRINT_STATEMENT: return "print_statement";
         case NodeType::EXPRESSION_STATEMENT: return "expression_statement";

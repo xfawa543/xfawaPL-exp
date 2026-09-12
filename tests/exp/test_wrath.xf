@@ -1,0 +1,37 @@
+#test {
+    fn main() {
+        // wrath1: 基础——修改可观测值
+        x = 1
+        y = x + 10
+        wrath x = 5
+        print(y)
+        // wrath2: 链式依赖全部重算
+        x = 1
+        y = x + 10
+        z = y * 2
+        wrath x = 5
+        print(x)
+        print(y)
+        print(z)
+        // wrath3: 无 wrath 时正常
+        x = 5
+        print(x)
+        // wrath4: RHS 含表达式
+        x = 1
+        y = 10
+        wrath x = y + 5
+        print(x)
+        // wrath5: 真实值不变（副作用）
+        x = 1
+        print(x)
+        wrath x = 5
+        print(x)
+        // wrath6: 无关变量不受影响
+        x = 1
+        y = x + 1
+        z = 100
+        wrath x = 5
+        print(y)
+        print(z)
+    }
+}

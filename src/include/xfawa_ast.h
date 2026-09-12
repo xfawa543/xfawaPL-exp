@@ -57,6 +57,25 @@ public:
     }
 };
 
+// EXP: o-literal (experimental). e.g. o, oo, ooo, 1o, 15o
+// raw stores the original text (digit prefix + o run, digits may be empty for
+// a pure o sequence). The numerical value is computed in codegen:
+//   - pure 'o' run: 10^n
+//   - digits + 'o' run: digits * 10^n
+// In addition, o-literal + o-literal merges the o counts instead of adding
+// normally (e.g. `1o + 1o == 100`).
+class OLiteralExpression : public Expression {
+public:
+    std::string raw;  // the original text, e.g. "oo" or "15o"
+
+    OLiteralExpression(const std::string& rawText, const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::O_LITERAL_EXPRESSION, loc), raw(rawText) {}
+
+    std::string toString() const override {
+        return raw;
+    }
+};
+
 class VariableExpression : public Expression {
 public:
     std::string name;
@@ -67,6 +86,33 @@ public:
     std::string toString() const override {
         return name;
     }
+};
+
+// EXP `paradox`: a value that has been destroyed by its own causal chain.
+// Produced by the paradox rewrite pass when a variable's causal root is broken.
+// Deterministic semantics: evaluating it yields integer 0, but a *direct* print
+// of a paradox expression prints "PARADOX".
+class ParadoxExpression : public Expression {
+public:
+    ParadoxExpression(const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::PARADOX_EXPRESSION, loc) {}
+
+    std::string toString() const override { return "PARADOX"; }
+};
+
+// EXP `paradox` stage 2 (`幽灵论`): a variable whose causal origin has been
+// destroyed ("the past changed") but whose stored value survives the failed
+// re-birth. Evaluating it yields the variable's current value (never 0); a
+// *direct* print of a ghost expression appends "#" to the shown value. It is
+// produced by the paradox rewrite pass for reads of variables in the ghost set.
+class GhostExpression : public Expression {
+public:
+    std::string name;
+
+    GhostExpression(const std::string& n, const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::GHOST_EXPRESSION, loc), name(n) {}
+
+    std::string toString() const override { return "GHOST"; }
 };
 
 class BinaryOp : public Expression {
@@ -421,6 +467,76 @@ public:
     std::string toString() const override { return "..."; }
 };
 
+// EXP `sleep`: pause for a number of seconds, e.g. `sleep(2);`.
+class SleepStatement : public Statement {
+public:
+    std::unique_ptr<Expression> expr; // duration in seconds
+    // EXP `un`: when true, this single sleep bypasses an active `un sleep`.
+    bool overridden = false;
+
+    SleepStatement(std::unique_ptr<Expression> e, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::SLEEP_STATEMENT, loc), expr(std::move(e)) {}
+
+    std::string toString() const override {
+        return "sleep(" + (expr ? expr->toString() : "") + ")";
+    }
+};
+
+// EXP `come`: reverse goto. `come 20` declares that whenever the statement on
+// physical source line 20 executes, control jumps back to the come statement's
+// own position (the statement right after `come` re-runs). `come if(cond) 20`
+// evaluates `cond` AT line 20: true -> jump back, false -> continue normally.
+// The come and its target must be in the same function; invalid or
+// uncrosable targets are reported as compile errors by the LLVM backend.
+class ComeStatement : public Statement {
+public:
+    int targetLine;                            // physical source line to react to
+    std::unique_ptr<Expression> condition;     // optional `if(cond)`; evaluated at the target line
+
+    ComeStatement(int target, std::unique_ptr<Expression> cond, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::COME_STATEMENT, loc), targetLine(target), condition(std::move(cond)) {}
+
+    std::string toString() const override {
+        if (condition) {
+            return "come if(" + condition->toString() + ") " + std::to_string(targetLine);
+        }
+        return "come " + std::to_string(targetLine);
+    }
+};
+
+// EXP `wrath`: retroactively rewrite the history of a variable. `wrath x = v`
+// assigns `v` to `x`, then re-evaluates every later variable that (transitively)
+// depended on `x`, so future reads of those dependents see the new value. Already
+// emitted side effects (prints) are NOT rewritten — only stored state.
+class WrathStatement : public Statement {
+public:
+    std::string name;
+    std::unique_ptr<Expression> value;
+
+    WrathStatement(const std::string& n, std::unique_ptr<Expression> v,
+                   const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::WRATH_STATEMENT, loc), name(n), value(std::move(v)) {}
+
+    std::string toString() const override {
+        return "wrath " + name + " = " + (value ? value->toString() : "");
+    }
+};
+
+// EXP `paradox`: break a variable's own causal chain (grandfather paradox).
+// `paradox x` marks `x` and every variable that depended on it as PARADOX,
+// because the reason they exist has been destroyed after they were computed.
+class ParadoxStatement : public Statement {
+public:
+    std::string name;
+
+    ParadoxStatement(const std::string& n, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::PARADOX_STATEMENT, loc), name(n) {}
+
+    std::string toString() const override {
+        return "paradox " + name;
+    }
+};
+
 class BlockStatement : public Statement {
 public:
     std::vector<std::unique_ptr<Statement>> statements;
@@ -441,6 +557,51 @@ public:
         }
         result += "}";
         return result;
+    }
+};
+
+// EXP `try...expect`: a compile-time-only error CHECK zone. The try block never
+// produces runtime code; it only lets the compiler check a batch of statements
+// for catchable errors (parse-stage typos or semantic errors) and, when one is
+// intercepted, the expect block runs instead.
+//   - The Parser may set `parseFailed` when a parse-stage error (e.g. a keyword
+//     typo like `prin`) is found inside the try block and could not be
+//     represented as a normal statement.
+//   - The SemanticAnalyzer sets `trySucceeded`:
+//       false -> a catchable error was intercepted, emit expectBlock only;
+//       true  -> the try checked out clean, emit NOTHING (try never executes).
+class TryExpectStatement : public Statement {
+public:
+    std::unique_ptr<BlockStatement> tryBlock;
+    std::unique_ptr<BlockStatement> expectBlock;
+    // true  -> the try block is clean; neither block runs.
+    // false -> a catchable error was intercepted; the expect block runs.
+    bool trySucceeded = true;
+    // Set by the Parser when a parse-stage error occurred inside the try block.
+    bool parseFailed = false;
+
+    TryExpectStatement(std::unique_ptr<BlockStatement> t,
+                       std::unique_ptr<BlockStatement> e,
+                       const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::TRY_EXPECT_STATEMENT, loc),
+          tryBlock(std::move(t)), expectBlock(std::move(e)) {}
+
+    std::string toString() const override {
+        return "try " + (tryBlock ? tryBlock->toString() : "{}") +
+               " expect " + (expectBlock ? expectBlock->toString() : "{}");
+    }
+};
+
+// EXP `sorry`: tell the compiler you're sorry -> rage -= 1 (min 0).
+// It never skips errors, never silences warnings, and never changes program
+// semantics; it only affects the compiler's (entertainment-only) rage meter.
+class SorryStatement : public Statement {
+public:
+    SorryStatement(const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::SORRY_STATEMENT, loc) {}
+
+    std::string toString() const override {
+        return "sorry";
     }
 };
 

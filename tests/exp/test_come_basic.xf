@@ -1,0 +1,10 @@
+#test {
+    fn main() {
+        t = 3
+        print(t)
+        come 8
+        t = t - 1
+        if t < 0 { boom }
+        print(t)
+    }
+}
