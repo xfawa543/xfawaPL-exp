@@ -45,7 +45,8 @@ lie answer = 42 {
 | `un` | 禁用某个语言行为 |
 | `ignore` | 忽略该语句，不执行 |
 | `do` | 强制执行该语句，不受 un 影响 |
-| `please` | 先输出 thank you! 再执行 |
+| `please.stmt` | 先打印 thank you! 再执行内部语句（不改 rage，也不算红温合规字） |
+| 裸 `please` | 无运行时行为；仅红温（rage>=3）时 rage -1 并满足"每五行一次 please" |
 | `shutup` | 立即压制后续所有 warning |
 | `...` | 随机执行一个允许调用的安全动作 |
 

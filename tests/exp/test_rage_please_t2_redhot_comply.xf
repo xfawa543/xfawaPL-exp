@@ -1,0 +1,17 @@
+#test {
+    fn main() {
+        // Test 2（应编译成功）: 红温（rage = 4 结尾）+ 严格每五行一个 please。
+        // 只有裸 please 才算合规字（please.sleep 之类的不算）。
+        // 第一个 please 在 rage=0 时无效，净效果 → 4。
+        please
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        please
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        please
+        print("ok")
+    }
+}

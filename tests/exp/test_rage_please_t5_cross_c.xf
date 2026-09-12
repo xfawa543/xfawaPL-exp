@@ -1,0 +1,11 @@
+#test {
+    fn main() {
+        // Test 5c（跨文件第 3 步，应编译成功）：上一份文件遗留 rage = 4，本文件
+        // 用 3 个裸 please 降温：4→3→2（第 3 个在 2 时已无效，停在 2）。
+        // 编译后 `rage` CLI 应显示 2/5。
+        please
+        please
+        please
+        print("cooled")
+    }
+}

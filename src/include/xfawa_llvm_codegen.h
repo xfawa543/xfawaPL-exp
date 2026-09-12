@@ -211,6 +211,7 @@ private:
     llvm::Value* codegen(IgnoreStatement* stmt);
     llvm::Value* codegen(DoStatement* stmt);
     llvm::Value* codegen(PleaseStatement* stmt);
+    llvm::Value* codegen(PleaseNoticeStatement* stmt);
     llvm::Value* codegen(ShutupStatement* stmt);
     llvm::Value* codegen(EllipsisStatement* stmt);
     llvm::Value* codegen(SleepStatement* stmt);

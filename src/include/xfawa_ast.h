@@ -451,6 +451,18 @@ public:
     std::string toString() const override { return "please." + (inner ? inner->toString() : ""); }
 };
 
+// EXP `please` (bare keyword): a SEPARATE keyword from `please.stmt`. It has no
+// runtime effect at all (no "thank you!" print). It only matters while the
+// compiler is red-hot (rage >= 3): it is the statement that satisfies the
+// "every 5 code lines must contain a please" rule and cools the compiler by a
+// fixed 1. Outside red-hot it does nothing (see rage.md).
+class PleaseNoticeStatement : public Statement {
+public:
+    PleaseNoticeStatement(const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::PLEASE_NOTICE_STATEMENT, loc) {}
+    std::string toString() const override { return "please"; }
+};
+
 // EXP "shutup": threatens the compiler into suppressing warnings.
 class ShutupStatement : public Statement {
 public:
@@ -592,9 +604,10 @@ public:
     }
 };
 
-// EXP `sorry`: tell the compiler you're sorry -> rage -= 1 (min 0).
-// It never skips errors, never silences warnings, and never changes program
-// semantics; it only affects the compiler's (entertainment-only) rage meter.
+// EXP `sorry`: tell the compiler you're sorry -> rage decreases by a RANDOM
+// amount in [0, rage] (min 0). It never skips errors, never silences warnings,
+// and never changes program semantics; it only affects the compiler's
+// (entertainment-only) rage meter.
 class SorryStatement : public Statement {
 public:
     SorryStatement(const SourceLocation& loc = SourceLocation())

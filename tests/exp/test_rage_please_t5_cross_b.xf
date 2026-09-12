@@ -1,0 +1,12 @@
+#test {
+    fn main() {
+        // Test 5b（跨文件第 2 步，应编译失败）：上一份文件把持久化 rage 升到 4，
+        // 本文件一进来就红温、"每五行 please"规则对其生效，且没有任何 please
+        // → 强制错误。这同时证明跨文件之间 rage 没有清零/重置。
+        print("still-red-hot")
+        print("b2")
+        print("b3")
+        print("b4")
+        print("b5")
+    }
+}

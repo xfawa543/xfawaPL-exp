@@ -1,0 +1,8 @@
+#test {
+    fn main() {
+        // Test 1: 普通 try/expect，未红温（rage = 1 < 3），不强制 please。
+        try { notFound() } expect { print("caught") }
+        print("done")
+        print("more")
+    }
+}

@@ -1021,7 +1021,8 @@ static std::string expAnnotationDescription(xfawa::NodeType t) {
         case xfawa::NodeType::UN_STATEMENT:         return "// EXP: un —— 禁用某个语言行为";
         case xfawa::NodeType::IGNORE_STATEMENT:     return "// EXP: ignore —— 忽略该语句，不执行";
         case xfawa::NodeType::DO_STATEMENT:         return "// EXP: do —— 强制执行该语句，不受 un 影响";
-        case xfawa::NodeType::PLEASE_STATEMENT:     return "// EXP: please —— 先输出 thank you! 再执行";
+        case xfawa::NodeType::PLEASE_STATEMENT:     return "// EXP: please —— 先输出 thank you! 再执行内部语句（不改变 rage，也不算红温时的五行请字）";
+        case xfawa::NodeType::PLEASE_NOTICE_STATEMENT: return "// EXP: please —— 裸请字：仅红温（rage>=3）时有效；满足每五行一次 please 并固定 rage -1，其余情况什么也不做";
         case xfawa::NodeType::SHUTUP_STATEMENT:     return "// EXP: shutup —— 立即压制后续所有 warning（荒诞恐吓）";
         case xfawa::NodeType::ELLIPSIS_STATEMENT:   return "// EXP: ... —— 随机执行一个允许调用的安全动作";
         case xfawa::NodeType::SLEEP_STATEMENT:      return "// EXP: sleep —— 让程序暂停指定的秒数";

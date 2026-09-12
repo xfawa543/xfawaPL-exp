@@ -1,0 +1,14 @@
+#test {
+    fn main() {
+        // Test 3: 裸 please 只在红温（rage>=3）时固定 rage -= 1。
+        // 4 捕 → 4；3 please → 4→3→2，第 3 个在 2 时已无效。
+        // 编译后 `rage` CLI 应显示 2/5。
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        please
+        please
+        please
+    }
+}

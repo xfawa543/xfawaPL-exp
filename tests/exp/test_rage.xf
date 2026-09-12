@@ -75,5 +75,10 @@
         try { notFound() } expect { }
         try { notFound() } expect { }
         print("same output")
+        // 结尾 3 个裸 please 把 rage 从 5 确定性地降到 2：既演示 please 固定 -1，
+        // 又避免进入红温"每五行 please"强制检查（本测试聚焦 rage 增减与输出一致）。
+        please
+        please
+        please
     }
 }

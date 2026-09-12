@@ -1,0 +1,16 @@
+#test {
+    fn main() {
+        // Test 5a（跨文件第 1 步，应编译成功）: 6 捕 3 please → rage = 4。
+        // 第一个 please 在 rage=0 时无效；间隔 keep any 5-line window covered。
+        // 编译后 `rage` CLI 应显示 4/5。
+        please
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        please
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        please
+    }
+}

@@ -41,6 +41,8 @@ std::string nodeTypeToString(NodeType type) {
         case NodeType::PARADOX_STATEMENT: return "paradox_statement";
         case NodeType::TRY_EXPECT_STATEMENT: return "try_expect_statement";
         case NodeType::SORRY_STATEMENT: return "sorry_statement";
+        case NodeType::PLEASE_STATEMENT: return "please_statement";
+        case NodeType::PLEASE_NOTICE_STATEMENT: return "please_notice_statement";
         case NodeType::SLEEP_STATEMENT: return "sleep_statement";
         case NodeType::COME_STATEMENT: return "come_statement";
         case NodeType::STATEMENT: return "statement";

@@ -68,6 +68,7 @@ private:
     std::unique_ptr<Statement> parseIgnoreStatement();
     std::unique_ptr<Statement> parseDoStatement();
     std::unique_ptr<Statement> parsePleaseStatement();
+    std::unique_ptr<Statement> parsePleaseNoticeStatement();
     std::unique_ptr<Statement> parseShutupStatement();
     std::unique_ptr<Statement> parseEllipsisStatement();
     std::unique_ptr<SleepStatement> parseSleepStatement();

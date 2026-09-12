@@ -97,17 +97,21 @@ sorry
 
 每次 `try...expect` 成功拦截一个可捕获错误时（`try` 块有真实编译错误，`expect` 块被执行），`rage += 1`。一次编译中每次成功捕获都是一次递增事件（最终值永远钳制在 5）。因此 try...expect 是 rage 上升的主要来源，sorry 是其随机下降的调剂——二者共同构成 rage 的动态变化。
 
-## 红温不影响程序语义
+红温（`rage >= 3`）状态下，编译器会对编译结果施加**强制规则**，详见 [try_expect.md](try_expect.md)。
 
-`rage` 状态**绝不**影响生成的程序：
+## 红温对编译结果的影响
 
-- 不阻止编译/链接
-- 不强迫用户修改代码
-- 不随机修改程序行为
+`rage` 状态**绝不**改变运行层面：
+
 - 不修改用户源代码
 - 不修改编译器永久配置
+- 不随机修改程序行为
+- 不阻止链接
+- 生成的程序在运行时的行为与 rage 无关（编译期状态不注入任何运行时行为）
 
-它只改变编译器在编译过程中打印的警告信息（语气和标记），以及这些警告在编译输出中附加的"红温"标签。**注意**：既然是持久状态，录视频前如需从零演示，先执行 `xfawac rage reset`。
+红温状态下对编译结果的强制规则见 [try_expect.md](try_expect.md)。除此之外，红温只改变编译器打印的警告语气与"红温"标签。
+
+**注意**：既然是持久状态，录视频前如需从零演示，先执行 `xfawac rage reset`。
 
 ## 实现位置
 
@@ -116,10 +120,12 @@ sorry
 - **CLI**：`main.cpp` 参数循环中的 `rage` / `rage reset` 分支。
 - **rage 递增**：`TRY_EXPECT_STATEMENT` 语义分析中的捕获逻辑（`bumpRage()`）。
 - **rage 随机递减**：`SORRY_STATEMENT` 语义分析（`compilerRand(rage + 1)`）。
+- **红温强制规则**：见 [try_expect.md](try_expect.md) 的实现位置。
 - **quip 随机抽取**：`SemanticAnalyzer::compilerRand`（`std::random_device` 播种的一次性 `std::mt19937`）+ `nextCaughtQuipIndex`（5 句池子且避免连续重复）。
 - **消息输出**：将 rage 变化信息加入 `SemanticAnalyzer::warnings`，由 `main.cpp` 转发至 `ErrorReporter`，在编译成功时打印。
 
 ## 测试
 
-- `tests/exp/test_rage.xf` — 一份完整覆盖：catch + sorry 增减、多次 catch 钳制到 5、多次 sorry 随机下降、降温后重新升温、消息文案随机抽取、rage 达到 5 时程序输出与 rage=0 时一致。
-- 跨进程持久化 / 上限 5 / sorry 随机区间 / sleep 0 时 sorry / `rage reset` 请以命令行实测为准（本仓库测试不依赖持久化值，始终先 `rage reset` 再断言运行输出）。
+- `tests/exp/test_rage.xf` — 一份完整覆盖：catch + sorry 增减、多次 catch 钳制到 5、多次 sorry 随机下降、降温后重新升温、消息文案随机抽取、rage 达到 5 时程序输出与 rage=0 时一致（文件在结尾把 rage 降到红温线以下，避免触发红温强制规则）。
+- 跨进程持久化 / 上限 5 / sorry 随机区间的 CLI 实测：本仓库测试不依赖持久化值，测试脚本始终先 `rage reset` 再断言运行输出。
+- 红温强制规则与"每五行合规字"的专项测试见 [try_expect.md](try_expect.md)。

@@ -1,0 +1,12 @@
+#test {
+    fn main() {
+        // Test 7（应编译成功）: try...expect 成功捕获不直接触发"每五行 please"；
+        // 普通 try/expect 在未红温（rage = 2 < 3）时不做任何 please 要求。
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        print("a")
+        print("b")
+        print("c")
+        print("d")
+    }
+}

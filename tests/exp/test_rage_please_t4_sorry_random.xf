@@ -1,0 +1,22 @@
+#test {
+    fn main() {
+        // Test 4: sorry 随机下降 delta∈[0,rage]，永不为负。
+        // 5 捕 → 5；5 sorry 随机降到 [0,5]；5 个裸 please 只能在红温时生效，
+        // 降到 2 后再请也没用 → 编译后 `rage` 应在 [0,2]（每步都非负、确定不炸）。
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        sorry
+        sorry
+        sorry
+        sorry
+        sorry
+        please
+        please
+        please
+        please
+        please
+    }
+}

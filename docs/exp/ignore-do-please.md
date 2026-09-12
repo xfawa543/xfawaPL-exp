@@ -59,9 +59,9 @@ if a == 0 {
 
 虽然 `a == 0` 为假，程序依然输出 `我free了！`。
 
-## please.stmt
+### please.stmt
 
-先打印 `thank you!`，然后执行内部的语句。
+先打印 `thank you!`，然后执行内部的语句（`please` 后面可以接任意语句，不光 `print`）。
 
 ```xf
 please.print("Hello")
@@ -74,10 +74,12 @@ thank you!
 Hello
 ```
 
+`please.` 是纯语句修饰符，只影响这条语句的运行行为。
+
 ## 注意事项
 
 - 这三个修饰符只对**紧跟后面的一条语句**生效，不能覆盖整段。
-- 目前只支持 `print`——它内部语法未来可以在任意语句上使用。
+- `please.` 后可以跟任意语句（`print`、`sleep`、`sorry`……）。
 - `ignore` 和 `do` 如果同一个语法：[ignore.do.xxx] 是不可以的（你只需要选一个）并且 lie 等写出来会刺激编译系统但不破坏到运行结果
 
 ## 测试

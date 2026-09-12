@@ -13,7 +13,7 @@
 | `!print(...)` | 单次绕过 `un print` 的禁用， 只作用于这一条语句 | `un print; !print("x")` 会打印 x |
 | `ignore.stmt` | 整条语句不生成代码，不会被运行 | `ignore.print("hi")` 什么都不做 |
 | `do.stmt` | 强制执行这条语句，哪怕当前有 `un` 也有效 | `do.print("hi")` 在 un 状态下也会打印 |
-| `please.stmt` | 先打印 `thank you!`，再执行这条语句 | `please.print("hello")` |
+| `please.stmt` | 先打印 `thank you!`，再执行这条语句（不改 rage，也不算红温时的合规请字） | `please.print("hello")` |
 | `shutup` | 输出 "o……o…ok"，然后静默所有后续 warning（error 仍然显示） | `shutup` |
 | `...` | 随机执行 3 个无害演示语句之一，每次随机 | `...` |
 | `// repeat: N` | 紧随其后的第一条语句被复制执行 N 次 | `// repeat: 3` 后的 `print("x")` 打 x 三遍 |
@@ -54,7 +54,7 @@ xfawac.exe my.xf --annotate
 | `un` | 禁用某个语言行为 |
 | `ignore` | 忽略该语句，不执行 |
 | `do` | 强制执行该语句，不受 un 影响 |
-| `please` | 先输出 thank you! 再执行 |
+| `please` | 裸请字：无运行时行为；仅红温（rage>=3）时 rage -1 并满足"每五行一次 please"规则 | `please` |
 | `shutup` | 立即压制后续所有 warning |
 | `...` | 随机执行一个允许调用的安全动作 |
 

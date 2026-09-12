@@ -16,7 +16,8 @@
 | `!print(...)` | 单次绕过 `un print` 的禁用 | [un.md](un.md)（含在 un 的文档里） |
 | `ignore.stmt` | 完全忽略这条语句 | [ignore-do-please.md](ignore-do-please.md) |
 | `do.stmt` | 强制执行（不受 un 影响） | [ignore-do-please.md](ignore-do-please.md) |
-| `please.stmt` | 先打印 thank you! 再执行 | [ignore-do-please.md](ignore-do-please.md) |
+| `please.stmt` | 先打印 thank you! 再执行（不改 rage） | [ignore-do-please.md](ignore-do-please.md) |
+| 裸 `please` | 无运行时行为；仅红温时 rage -1 并满足"每五行一次 please"规则 | [try_expect.md](try_expect.md) |
 | `shutup` | 从此刻开始关闭所有 warning（error 不变） | [shutup.md](shutup.md) |
 | `...` | 随机挑一个安全的函数并真正调用它（参数按真实类型随机生成） | [ellipsis.md](ellipsis.md) |
 | `sleep(秒数)` | 程序暂停指定的秒数（支持小数） | [sleep.md](sleep.md) |
@@ -29,7 +30,7 @@
 | `paradox x` | 改变过去：下游因果链重新验证失败，受影响变量保留原值并成为 GHOST（重合论→幽灵论） | [paradox.md](paradox.md) |
 | `try { } expect { }` | 编译器错误拦截：编译期捕获语义错误，执行 expect 块 | [try_expect.md](try_expect.md) |
 | `sorry` | 向编译器道歉，使 rage 随机下降 delta∈[0,rage]（最低 0） | [rage.md](rage.md) |
-| 编译器红温机制 | rage 持久化状态（0–5）+ sorry + 红温表现（纯编译期娱乐）；`xfawac rage` / `rage reset` | [rage.md](rage.md) |
+| 编译器红温机制 | rage 持久化状态（0–5）+ 成功捕获升温 + sorry 随机降温；红温时的"每五行"强制规则见 try_expect.md；`xfawac rage` / `rage reset` | [rage.md](rage.md) |
 
 ## 使用注意
 

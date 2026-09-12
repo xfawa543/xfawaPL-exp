@@ -1,0 +1,11 @@
+#test {
+    fn main() {
+        // Test 2（应编译失败）: 红温（rage = 3）后启用"每五行 please"规则，
+        // 本文件没有任何 please，连续超过 5 行代码 → 强制错误。
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        try { notFound() } expect { }
+        print("a")
+        print("b")
+    }
+}

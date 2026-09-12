@@ -44,6 +44,14 @@ private:
     // `xfawac rage reset` returns it to 0.
     int rage = 0;
 
+    // EXP "每五行 please": once the compiler is red-hot (`rage >= 3`, see
+    // rageLevel()), every 5 consecutive code lines of a function must contain
+    // a `please` statement. Counting uses the physical source line numbers of
+    // statement start lines (the same line-number system the parser records),
+    // NOT AST nodes, tokens or loop iterations.
+    static constexpr int RAGE_THERMAL_THRESHOLD = 3;
+    static constexpr int PLEASE_LINE_WINDOW = 5;
+
     void bumpRage() {
         if (rage < 5) rage++;
     }
@@ -179,6 +187,18 @@ private:
         }
     }
     
+// EXP "please": the compiler cools down by a fixed 1 when asked politely.
+    // Short quip pool so the `[rage -1]` warning stays in the established style.
+    static const char* pleaseQuip(int level) {
+        switch (level) {
+            case 4:
+            case 5:
+                return "呜哇——被这么礼貌地对待，人家差点就要消气了……";
+            default:
+                return "谢、谢谢夸奖！人家心情好一点了";
+        }
+    }
+
 public:
     // `startRage` is the persistent value loaded by RageStore; it defines where
     // this compilation picks up the meter (clamped to [0,5] defensively).
@@ -290,6 +310,14 @@ private:
         if (func->body) {
             if (!analyzeBlock(func->body.get())) {
                 return false;
+            }
+            // EXP "每五行 please": while red-hot (rage >= 3), enforce the rule
+            // on this function. Evaluated with the rage value AFTER the whole
+            // function was analyzed (any please/sorry inside already applied),
+            // so a function that cooled itself back below the threshold is not
+            // red-hot anymore and the rule does not apply.
+            if (rage >= RAGE_THERMAL_THRESHOLD) {
+                checkRedHotPlease(func->body.get());
             }
         }
         
@@ -416,6 +444,31 @@ private:
                     " rage = " + std::to_string(rage) + "/5" + rageLevel());
                 return true;
             }
+            case NodeType::PLEASE_STATEMENT: {
+                // please.STMT (the statement modifier): its only meaning is
+                // runtime behavior — print "thank you!" then run the inner
+                // statement (handled by the LLVM backend). It does NOT touch
+                // the compiler's rage meter and it does NOT satisfy the
+                // red-hot "every 5 lines a please" rule (only the bare
+                // `please` keyword does, see PLEASE_NOTICE_STATEMENT).
+                auto* pleaseStmt = dynamic_cast<PleaseStatement*>(stmt);
+                return pleaseStmt && pleaseStmt->inner ? analyzeStatement(pleaseStmt->inner.get()) : true;
+            }
+            case NodeType::PLEASE_NOTICE_STATEMENT: {
+                // Bare `please`: a SEPARATE keyword from please.stmt. It only
+                // works while red-hot (rage >= 3): it is the compliance
+                // statement of the every-5-lines rule and cools the compiler
+                // by a fixed 1 (rage >= 3 when it fires, so it never goes
+                // below 0). Outside red-hot it is inert — just a warning.
+                if (rage >= RAGE_THERMAL_THRESHOLD) {
+                    rage--;
+                    warnings.push_back(std::string("[rage -1] ") + pleaseQuip(rage) +
+                        " rage = " + std::to_string(rage) + "/5" + rageLevel());
+                } else {
+                    warnings.push_back("[please] \xe7\x8e\xb0\xe5\x9c\xa8\xe6\xb2\xa1\xe7\xba\xa2\xe6\xb8\xa9\xef\xbc\x8cplease \xe4\xb8\x80\xe7\x82\xb9\xe7\x94\xa8\xe9\x83\xbd\xe6\xb2\xa1\xe6\x9c\x89\xe5\x93\xa6");
+                }
+                return true;
+            }
             case NodeType::COME_STATEMENT: {
                 auto* comeStmt = dynamic_cast<ComeStatement*>(stmt);
                 return comeStmt && comeStmt->condition ? analyzeExpression(comeStmt->condition.get()) : true;
@@ -425,6 +478,105 @@ private:
         }
     }
     
+    // EXP "每五行 please": while the compiler is red-hot (rage >= 3), every 5
+    // consecutive code lines of a function must contain a `please`. A "code
+    // line" is the physical start line of a statement (the parser's own
+    // line-number system); blank lines, comments and the brace-only lines of
+    // the same construct are not counted (only distinct, increasing statement
+    // start lines advance the counter). A `please` resets the 5-line window.
+    // A window that hits a 5th code line without any please is a HARD error:
+    // the compilation is rejected. Nested function bodies are skipped here —
+    // each one gets its own check when analyzeFunction() runs on it.
+    void checkRedHotPlease(BlockStatement* body) {
+        int lastPlease = body->location.line - 1;  // window starts at the body
+        int lastSeen   = body->location.line - 1;  // skip same-line nodes
+        for (const auto& stmt : body->statements) {
+            checkRedHotPleaseStatement(stmt.get(), lastPlease, lastSeen);
+        }
+    }
+
+    void checkRedHotPleaseStatement(Statement* stmt, int& lastPlease, int& lastSeen) {
+        if (!stmt) return;
+        if (stmt->getNodeType() == NodeType::PLEASE_NOTICE_STATEMENT) {
+            // Only the bare `please` resets the 5-line window in mid-block.
+            // please.STMT is just a normal code line (a statement like any
+            // other); it wraps an inner statement on the same physical line,
+            // so it can advance lastSeen at most once.
+            lastPlease = stmt->location.line;
+            lastSeen   = stmt->location.line;
+            return;  // a bare please occupies one code line
+        }
+        int line = stmt->location.line;
+        if (line > lastSeen) {
+            lastSeen = line;
+            if (line - lastPlease >= PLEASE_LINE_WINDOW) {
+                errors.push_back("red-hot (rage " + std::to_string(rage) + "/5): a `please` "
+                    "is required within every 5 code lines - missing at line " +
+                    std::to_string(line));
+            }
+        }
+        switch (stmt->getNodeType()) {
+            case NodeType::BLOCK_STATEMENT: {
+                auto* block = dynamic_cast<BlockStatement*>(stmt);
+                for (const auto& s : block->statements) {
+                    checkRedHotPleaseStatement(s.get(), lastPlease, lastSeen);
+                }
+                break;
+            }
+            case NodeType::IF_STATEMENT: {
+                auto* ifStmt = dynamic_cast<IfStatement*>(stmt);
+                checkRedHotPleaseStatement(ifStmt->thenBranch.get(), lastPlease, lastSeen);
+                for (const auto& elseIf : ifStmt->elseIfBranches) {
+                    checkRedHotPleaseStatement(elseIf.second.get(), lastPlease, lastSeen);
+                }
+                if (ifStmt->elseBranch) {
+                    checkRedHotPleaseStatement(ifStmt->elseBranch.get(), lastPlease, lastSeen);
+                }
+                break;
+            }
+            case NodeType::WHILE_STATEMENT: {
+                auto* whileStmt = dynamic_cast<WhileStatement*>(stmt);
+                checkRedHotPleaseStatement(whileStmt->body.get(), lastPlease, lastSeen);
+                break;
+            }
+            case NodeType::FOR_IN_STATEMENT: {
+                auto* forStmt = dynamic_cast<ForInStatement*>(stmt);
+                checkRedHotPleaseStatement(forStmt->body.get(), lastPlease, lastSeen);
+                break;
+            }
+            case NodeType::LIE_STATEMENT: {
+                auto* lieStmt = dynamic_cast<LieStatement*>(stmt);
+                checkRedHotPleaseStatement(lieStmt->body.get(), lastPlease, lastSeen);
+                break;
+            }
+            case NodeType::LOOP_STATEMENT: {
+                auto* loop = dynamic_cast<LoopStatement*>(stmt);
+                for (const auto& s : loop->body) {
+                    checkRedHotPleaseStatement(s.get(), lastPlease, lastSeen);
+                }
+                break;
+            }
+            case NodeType::TRY_EXPECT_STATEMENT: {
+                auto* te = dynamic_cast<TryExpectStatement*>(stmt);
+                if (te->tryBlock) {
+                    for (const auto& s : te->tryBlock->statements) {
+                        checkRedHotPleaseStatement(s.get(), lastPlease, lastSeen);
+                    }
+                }
+                if (te->expectBlock) {
+                    for (const auto& s : te->expectBlock->statements) {
+                        checkRedHotPleaseStatement(s.get(), lastPlease, lastSeen);
+                    }
+                }
+                break;
+            }
+            default:
+                // FUNCTION_DECLARATION and the rest: any nested function body is
+                // scanned by its own analyzeFunction() call; nothing to do here.
+                break;
+        }
+    }
+
     bool analyzeExpression(Expression* expr) {
         if (!expr) return true;
         

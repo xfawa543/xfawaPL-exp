@@ -959,7 +959,13 @@ std::unique_ptr<Statement> Parser::parseStatement() {
     } else if (peek().is(TokenType::KEYWORD_DO)) {
         return parseDoStatement();
     } else if (peek().is(TokenType::KEYWORD_PLEASE)) {
-        return parsePleaseStatement();
+        // `please` and `please.` are two SEPARATE keywords. `please.` is the
+        // statement modifier (thank you! + inner). A bare `please` is the
+        // red-hot-only compliance keyword with no runtime effect.
+        if (peek(1).is(TokenType::PUNCTUATOR_DOT)) {
+            return parsePleaseStatement();
+        }
+        return parsePleaseNoticeStatement();
     } else if (peek().is(TokenType::KEYWORD_SHUTUP)) {
         return parseShutupStatement();
     } else if (peek().is(TokenType::KEYWORD_WRATH)) {
@@ -1316,6 +1322,15 @@ std::unique_ptr<Statement> Parser::parsePleaseStatement() {
     auto inner = parseStatement();
     if (!inner) return nullptr;
     return std::make_unique<PleaseStatement>(std::move(inner), loc);
+}
+
+// EXP bare `please`: a keyword on its own with no runtime effect (see
+// PleaseNoticeStatement / rage.md). Only meaningful while the compiler is
+// red-hot; parsing is unconditional so it stays valid everywhere.
+std::unique_ptr<Statement> Parser::parsePleaseNoticeStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_PLEASE)) return nullptr;
+    return std::make_unique<PleaseNoticeStatement>(loc);
 }
 
 std::unique_ptr<Statement> Parser::parseShutupStatement() {

@@ -127,6 +127,48 @@ try {
 
 每次成功捕获 `rage += 1`（上限 5），详见 [rage.md](rage.md)。红温只在编译期发生（try 不再有运行时行为）。
 
+- `try...expect` 捕获本身**不直接触发**红温强制规则：红温（`rage < 3`）之前，无论捕到多少次错误，编译器都不会做任何额外要求。
+- 裸 `please`（红温时固定 `rage -= 1`）与 `sorry`（随机 `rage -= delta`，任何状态都有效）可以把 rage 降回 `rage < 3`，此时该函数不再处于红温态，强制规则随之解除——但下一次捕获仍会重新升温。**注意：`please.`（修饰符，如 `please.print(...)`）不改 rage、也不是合规字，只改变运行行为（thank you! + 执行），见 [ignore-do-please.md](ignore-do-please.md)。**
+
+### 红温状态下的"每五行 please"强制规则
+
+这是红温对编译结果**唯一**的语义影响，且只在红温（`rage >= 3`）状态下生效：
+
+> 编译到任一函数结束时，编译器会按**源代码物理行号体系**扫描该函数体内所有语句：**连续 5 行代码内必须出现一次裸 `please`**，否则编译失败（强制错误）。
+
+规则细节：
+
+- **红温判定**：每个函数在**语义分析结束后**检查——用"该函数分析完时刻"的 `rage` 值判定。函数内部若有裸 `please`/`sorry` 把自己降回 `rage < 3`，检查时已不在红温态，规则不触发。
+- **合规字**：只有**裸 `please`**（单独一行，无任何运行时行为）满足规则。`please.`（如 `please.print(...)`）只是一条普通代码行，会推进计数但**不会**重置窗口。
+- **计数单位**：按**源代码物理行号**（语句起始行）计数，不是"每五个 AST 节点 / 每五条语句 / 每五个 token / 每五次循环"。连续的多行结构、空行、注释、与上一句同行的闭合花括号都不增加计数——只有语句起始物理行推进计数。
+- **窗口重置**：裸 `please` 所在行就地重置计数，覆盖其后最多 4 行代码。
+- **检查范围**：函数体内所有语句（含 `try`/`expect`、`if`/`else`、`while`、`lie`、`loop` 等块内的语句，嵌套同类节点不遗漏）；嵌套函数体由各自的 `analyzeFunction()` 独立检查。
+- **违规后果**：强制错误 → 编译失败（exit 1），例如：
+
+```
+error: red-hot (rage 4/5): a `please` is required within every 5 code lines - missing at line 9
+```
+
+- **红温之前**：普通代码、`try...expect` 捕获、`sorry`、`please.` 等都**不**要求出现裸 `please`；未红温时写不写裸 `please` 纯属个人选择。
+- 非红温程序里出现裸 `please` 只会收到一句"现在没红温，please 没用"的提示，不会被要求进入任何红温流程。
+
+裸 `please` 的红温行为：仅红温（`rage >= 3`）时固定 `rage -= 1`（触发时 `rage >= 3`，下降后 `>= 2`，绝不产生负值），并输出一行 `[warning:syntax] [rage -1] ... rage = N/5`。
+
+示例（红温到 3 后满足规则）：
+
+```
+please                        // 裸请字，重置窗口
+try { notFound() } expect { }
+try { notFound() } expect { }
+try { notFound() } expect { }
+please                        // 5 行内出现裸 please → 合法
+print("ok")
+```
+
+红温后不满足规则 → 编译失败（没有裸 please 兜底，连续 5 个起始行无合规字）。
+
+**实现位置**：`SemanticAnalyzer::checkRedHotPlease` / `checkRedHotPleaseStatement`（每个函数语义分析结束时、`rage >= 3` 时按物理行号扫描"每五行必须出现裸 please"；窗口只在 `PLEASE_NOTICE_STATEMENT` 处重置）；`PLEASE_STATEMENT`（please.）不参与。裸 please 的固定降温在 `PLEASE_NOTICE_STATEMENT` 的语义分析里、且仅当 `rage >= 3` 时生效。
+
 ## 代码生成行为
 
 - **捕获到错误**（`trySucceeded = false`）：仅生成 `expect` 块代码，`try` 块完全不生成。
@@ -150,3 +192,10 @@ try {
 - `tests/exp/test_try_illegal_noexpect.xf` — 缺少 expect
 - `tests/exp/test_try_illegal_nobody.xf` — try 后缺少 `{`
 - `tests/exp/test_try_expect_error.xf` — expect 自身错误传播 → 编译失败
+
+**红温"每五行 please"专项（`tests/exp/test_rage_please_t*.xf`，由 `tests/run_rage_please_tests.ps1` 驱动）：**
+- `t1_basic` / `t7_catch_not_trigger`：未红温时普通 `try...expect` 不做任何 please 要求；
+- `t2_redhot_no_please`（应编译失败）/ `t2_redhot_comply`（应编译成功）：红温时"每五行 please"启用、遵守与否（合规字是裸 `please`）；
+- `t3_please_minus_one`：裸 please 精确 `rage -= 1`，且只在红温时生效（4 捕 → 4，3 裸 please → 停在 2，第三个无效；`rage` CLI 验证）；
+- `t4_sorry_random`：sorry 随机下降且永不为负（5 捕 + 5 sorry 随机 [0,5] + 5 裸 please → 停在 [0,2]；`rage` CLI 用范围断言）；
+- `t5_cross_a/b/c`：跨文件共享持久化 rage（A 升温 → B 承继红温 → C 用裸 please 从 4 降到 2，同一份状态停下）。

@@ -2205,6 +2205,14 @@ llvm::Value* LLVMCodegen::codegen(PleaseStatement* stmt) {
     return nullptr;
 }
 
+// EXP bare `please`: a keyword with NO runtime meaning whatsoever (no
+// "thank you!" print). Its only effects are compile-time (rage meter /
+// red-hot compliance), handled entirely inside the semantic analyzer.
+llvm::Value* LLVMCodegen::codegen(PleaseNoticeStatement* stmt) {
+    (void)stmt;
+    return nullptr;
+}
+
 // EXP `shutup`: warnings were already suppressed at parse time; no code is emitted.
 llvm::Value* LLVMCodegen::codegen(ShutupStatement* stmt) {
     return nullptr;
@@ -3788,6 +3796,7 @@ bool LLVMCodegen::codegenOnce(Statement* stmt) {
     if (dynamic_cast<IgnoreStatement*>(stmt)) { codegen(dynamic_cast<IgnoreStatement*>(stmt)); return true; }
     if (dynamic_cast<DoStatement*>(stmt)) return codegen(dynamic_cast<DoStatement*>(stmt)) != nullptr;
     if (dynamic_cast<PleaseStatement*>(stmt)) return codegen(dynamic_cast<PleaseStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<PleaseNoticeStatement*>(stmt)) { codegen(dynamic_cast<PleaseNoticeStatement*>(stmt)); return true; }
     if (dynamic_cast<ShutupStatement*>(stmt)) return codegen(dynamic_cast<ShutupStatement*>(stmt)) != nullptr;
     if (dynamic_cast<EllipsisStatement*>(stmt)) return codegen(dynamic_cast<EllipsisStatement*>(stmt)) != nullptr;
     if (dynamic_cast<SleepStatement*>(stmt)) return codegen(dynamic_cast<SleepStatement*>(stmt)) != nullptr;
