@@ -1,0 +1,11 @@
+#bads {
+// EXP `pinocchio` compile-error case: limit: 0 is invalid.
+// Compiling this file must FAIL with a `[pinocchio] limit must be a positive integer (>= 1)` error.
+
+    fn main() {
+        x = 0
+        pinocchio (x == 3) {
+            x = x + 1
+        } limit: 0
+    }
+}

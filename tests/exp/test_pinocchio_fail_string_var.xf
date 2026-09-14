@@ -1,0 +1,11 @@
+#bads {
+// EXP `pinocchio` compile-error case: proposition references a STRING variable.
+// Compiling this file must FAIL with a `[pinocchio] proposition may only reference numeric/bool variables` error.
+
+    fn main() {
+        str = "hi"
+        pinocchio (str) {
+            print("done")
+        }
+    }
+}

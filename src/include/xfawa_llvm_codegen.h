@@ -34,6 +34,26 @@ private:
     std::map<std::string, VarType> funcReturnTypes;
     std::map<std::string, llvm::GlobalVariable*> windowInputGlobals;
     std::map<std::string, VarType> windowInputTypes;
+
+    // EXP `fate`: per-fated-variable destiny + persistent recovery floor.
+    // Both are i64 allocas created once (in the entry block) when the `fate`
+    // statement executes; the floor is updated monotonically by each recovery
+    // so every future recovery result stays >= the highest value fate has ever
+    // pulled the variable up to. Cleared together with `locals` per function.
+    struct FateSlot {
+        llvm::AllocaInst* destiny = nullptr; // the destiny value (i64)
+        llvm::AllocaInst* floor = nullptr;   // highest recovery result so far (i64)
+    };
+    std::map<std::string, FateSlot> fateSlots;
+    llvm::Function* fateRecoverFn = nullptr; // shared i64 fate recovery helper
+    llvm::Function* getFateRecoverFunction();
+    llvm::AllocaInst* createAllocaInEntry(llvm::Type* type, const std::string& name);
+    llvm::AllocaInst* birthLocalAlloca(const std::string& name, llvm::Value* value);
+    void storeValueNormalized(llvm::Value* value, llvm::AllocaInst* alloca);
+    void emitFateRecovery(const FateSlot& slot, llvm::AllocaInst* varAlloca);
+    llvm::Value* codegen(FateStatement* stmt);
+    llvm::Value* codegen(EnvyStatement* stmt);
+    llvm::Value* codegenRandomBinaryOp(xfawa::BinaryOp* expr);
     std::vector<std::string> errors;
     std::vector<std::string> warnings;
     bool hasMainFunction;
@@ -61,6 +81,10 @@ private:
     bool bodyIsDangerous(const Function* func) const;
     llvm::Function* getRandFunction();
     void emitRandomCallSeedOnce();
+    llvm::Value* emitDriftRandomValue(VarType type, llvm::Type* paramType,
+                                      const Function::DriftConfig& cfg, int index);
+    llvm::Value* codegenDriftedSelfCall(llvm::Function* callee, CallExpression* expr,
+                                        const std::string& funcName);
     void emitRandomStringFill(llvm::GlobalVariable* buffer, int index);
     llvm::Function* createRandomCallTrampoline(const RandomCallCandidate& cand, int index);
     llvm::Value* emitRandomCallDispatch();
@@ -122,6 +146,14 @@ private:
 
     struct FunctionSpan { std::string name; int start; int end; };
     std::vector<FunctionSpan> functionLineSpans; // all functions, for cross-function errors
+
+    // EXP `drift`: random recursive parameters.
+    std::string currentFuncName;  // LLVM name of the function being compiled
+    // funcName -> per-param set of VarTypes observed at every call site.
+    std::map<std::string, std::vector<std::set<VarType>>> driftSeenParamTypes;
+    // funcName -> config of the drift function currently being compiled.
+    std::map<std::string, Function::DriftConfig> driftConfigs;
+    llvm::GlobalVariable* driftDepthGlobal = nullptr; // lazily created counter
 
     void scanFunctionBody(const Statement* stmt, ComeScan& scan, bool inForeignUnit) const;
     void placeComeLanding(int comeLine);
@@ -217,6 +249,8 @@ private:
     llvm::Value* codegen(SleepStatement* stmt);
     llvm::Value* codegen(WrathStatement* stmt);
     llvm::Value* codegen(ParadoxStatement* stmt);
+    llvm::Value* codegen(DejaStatement* stmt);
+    llvm::Value* codegen(PinocchioStatement* stmt);
     llvm::Value* codegen(TryExpectStatement* stmt);
     llvm::Value* codegen(SorryStatement* stmt);
     llvm::Value* codegen(ComeStatement* stmt);

@@ -1,0 +1,78 @@
+#test {
+// EXP `?!` 随机二元运算符测试 (docs/exp/randop.md)
+// t1 两个整数:   候选 + - * / % && || -> 结果集 {0,2,3,4,6,8,12}
+// t2 两个浮点数: 候选 + - * / %       -> 结果集 {0.5,3.25,4.5,8.5,13.0}
+// t3 两个布尔值: 候选 && ||           -> 结果集 {0,1}
+// t4 不同类型(int×float):提升为 float -> 结果集 {0.5,1.2,5.5,7.5}
+// t5 没有合法候选(字符串参与):[?!] 警告 + 退化为左操作数
+// t6 结果类型不兼容上下文:比较类被排除,5 ?! 3 永不产生比较结果 0
+// t7 同一表达式多次执行:10 ?! 6 的值总是落在合法候选结果集内
+
+    fn main() {
+        // t1 两个整数
+        val_a = 6
+        val_b = 2
+        iter = 0
+        while (iter < 40) {
+            print(val_a ?! val_b)
+            iter = iter + 1
+        }
+        print("t1")
+
+        // t2 两个浮点数
+        fl_a = 6.5
+        fl_b = 2.0
+        iter = 0
+        while (iter < 40) {
+            print(fl_a ?! fl_b)
+            iter = iter + 1
+        }
+        print("t2")
+
+        // t3 两个布尔值
+        bl_t = true
+        bl_f = false
+        iter = 0
+        while (iter < 40) {
+            print(bl_t ?! bl_f)
+            iter = iter + 1
+        }
+        print("t3")
+
+        // t4 不同类型(int × float):混合数值提升为 float
+        iter = 0
+        while (iter < 40) {
+            print(3 ?! 2.5)
+            iter = iter + 1
+        }
+        print("t4")
+
+        // t5 没有合法候选:字符串无候选集 -> 退化为左操作数
+        st1 = "abc"
+        numv = 5
+        res_s = st1 ?! numv      // 退化 = st1 的值
+        print(res_s)
+        print(numv ?! st1)       // 退化 = numv 的值
+        res_s2 = st1 ?! st1
+        print(res_s2)
+        print("t5")
+
+        // t6 结果类型不兼容上下文:比较类被排除,数值 ?! 数值 永不返回比较结果
+        iter = 0
+        while (iter < 40) {
+            print(5 ?! 3)
+            iter = iter + 1
+        }
+        print("t6")
+
+        // t7 多次执行:每次随机结果都在合法候选结果集内
+        ran_var = 0
+        iter = 0
+        while (iter < 30) {
+            ran_var = 10 ?! 6
+            print(ran_var)
+            iter = iter + 1
+        }
+        print("t7")
+    }
+}

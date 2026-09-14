@@ -1,0 +1,12 @@
+#unknownq {
+// EXP `drift` compile-error case: the parameter type cannot be inferred
+// (only self-recursion, no call site with a concrete literal/int/float arg).
+// Compiling this file must FAIL with a `[drift] cannot infer` error.
+drift fn u(q) {
+    print(q)
+    u(q)
+}
+
+    fn main() {
+    }
+}

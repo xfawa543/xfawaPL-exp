@@ -39,12 +39,16 @@ std::string nodeTypeToString(NodeType type) {
         case NodeType::GHOST_EXPRESSION: return "ghost_expression";
         case NodeType::WRATH_STATEMENT: return "wrath_statement";
         case NodeType::PARADOX_STATEMENT: return "paradox_statement";
+        case NodeType::DEJA_STATEMENT: return "deja_statement";
+        case NodeType::FATE_STATEMENT: return "fate_statement";
+        case NodeType::ENVY_STATEMENT: return "envy_statement";
         case NodeType::TRY_EXPECT_STATEMENT: return "try_expect_statement";
         case NodeType::SORRY_STATEMENT: return "sorry_statement";
         case NodeType::PLEASE_STATEMENT: return "please_statement";
         case NodeType::PLEASE_NOTICE_STATEMENT: return "please_notice_statement";
         case NodeType::SLEEP_STATEMENT: return "sleep_statement";
         case NodeType::COME_STATEMENT: return "come_statement";
+        case NodeType::PINOCCHIO_STATEMENT: return "pinocchio_statement";
         case NodeType::STATEMENT: return "statement";
         case NodeType::PRINT_STATEMENT: return "print_statement";
         case NodeType::EXPRESSION_STATEMENT: return "expression_statement";

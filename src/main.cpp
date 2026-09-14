@@ -861,6 +861,152 @@ static void applyWrathParadoxTransform(xfawa::Program* program, xfawa::ErrorSyst
     }
 }
 
+// ---------------------------------------------------------------------------
+// EXP `deja`: sense a variable's first constant future (straight-line only).
+// `deja x` is compile-time only. The transform looks forward for the FIRST
+// assignment to `x` (方案 B: the first future decides, constant or not). If its
+// RHS is a compile-time constant, the deja statement is rewritten into an
+// implicit `x = <cloned constant>` (isReassignment=false, so the read stays an
+// implicit birth at the deja position). Reads between the deja and the real
+// future assignment therefore return the premonition value, and the future
+// assignment still executes exactly once. Any miss (non-constant future,
+// future behind control flow, no future at all) drops the deja with a warning
+// and keeps normal semantics.
+// ---------------------------------------------------------------------------
+
+// True when the expression is a compile-time constant in the believe spirit:
+// only integer/bool literals combined via arithmetic/comparison/logical ops.
+// Variable reads are excluded on purpose (no multi-level dependency tracking):
+// a future that reads another variable, calls a function, is a string/float,
+// an array, an o-literal, a ghost or a paradox expression is never constant.
+static bool isDejaConstantExpr(const xfawa::Expression* e) {
+    if (!e) return false;
+    if (dynamic_cast<const xfawa::NumberLiteral*>(e)) return true;
+    if (dynamic_cast<const xfawa::BooleanLiteral*>(e)) return true;
+    if (auto* u = dynamic_cast<const xfawa::UnaryOp*>(e)) {
+        if (u->op != xfawa::UnaryOpType::NEGATE && u->op != xfawa::UnaryOpType::NOT) return false;
+        return isDejaConstantExpr(u->expr.get());
+    }
+    if (auto* b = dynamic_cast<const xfawa::BinaryOp*>(e)) {
+        switch (b->op) {
+            case xfawa::BinaryOpType::ADD:
+            case xfawa::BinaryOpType::SUB:
+            case xfawa::BinaryOpType::MUL:
+            case xfawa::BinaryOpType::DIV:
+            case xfawa::BinaryOpType::MOD:
+            case xfawa::BinaryOpType::EQUAL:
+            case xfawa::BinaryOpType::NOT_EQUAL:
+            case xfawa::BinaryOpType::LESS:
+            case xfawa::BinaryOpType::LESS_EQUAL:
+            case xfawa::BinaryOpType::GREATER:
+            case xfawa::BinaryOpType::GREATER_EQUAL:
+            case xfawa::BinaryOpType::AND:
+            case xfawa::BinaryOpType::OR:
+                return isDejaConstantExpr(b->left.get()) && isDejaConstantExpr(b->right.get());
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+// The forward scan may not look through any statement that contains nested
+// code: a future hiding inside a block, loop, function, or try/expect body is
+// invisible to `deja` (straight-line code only).
+static bool isDejaBoundary(const xfawa::Statement* s) {
+    switch (s->getNodeType()) {
+        case xfawa::NodeType::BLOCK_STATEMENT:
+        case xfawa::NodeType::IF_STATEMENT:
+        case xfawa::NodeType::WHILE_STATEMENT:
+        case xfawa::NodeType::FOR_IN_STATEMENT:
+        case xfawa::NodeType::LOOP_STATEMENT:
+        case xfawa::NodeType::TRY_EXPECT_STATEMENT:
+        case xfawa::NodeType::LIE_STATEMENT:
+        case xfawa::NodeType::FUNCTION_DECLARATION:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void dejaBlock(std::vector<std::unique_ptr<xfawa::Statement>>& stmts,
+                      xfawa::ErrorSystem& rep) {
+    for (size_t i = 0; i < stmts.size(); i++) {
+        auto& up = stmts[i];
+        xfawa::Statement* s = up.get();
+
+        // Recurse into nested compound bodies (straight-line inside each block).
+        if (auto* b = dynamic_cast<xfawa::BlockStatement*>(s)) { dejaBlock(b->statements, rep); continue; }
+        if (auto* iff = dynamic_cast<xfawa::IfStatement*>(s)) {
+            if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(iff->thenBranch.get())) dejaBlock(bb->statements, rep);
+            if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(iff->elseBranch.get())) dejaBlock(bb->statements, rep);
+            for (auto& ei : iff->elseIfBranches) if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(ei.second.get())) dejaBlock(bb->statements, rep);
+            continue;
+        }
+        if (auto* wh = dynamic_cast<xfawa::WhileStatement*>(s)) {
+            if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(wh->body.get())) dejaBlock(bb->statements, rep);
+            continue;
+        }
+        if (auto* fi = dynamic_cast<xfawa::ForInStatement*>(s)) {
+            if (auto* bb = dynamic_cast<xfawa::BlockStatement*>(fi->body.get())) dejaBlock(bb->statements, rep);
+            continue;
+        }
+        if (auto* lp = dynamic_cast<xfawa::LoopStatement*>(s)) { dejaBlock(lp->body, rep); continue; }
+        if (auto* te = dynamic_cast<xfawa::TryExpectStatement*>(s)) {
+            if (te->tryBlock) dejaBlock(te->tryBlock->statements, rep);
+            if (te->expectBlock) dejaBlock(te->expectBlock->statements, rep);
+            continue;
+        }
+        if (auto* lie = dynamic_cast<xfawa::LieStatement*>(s)) {
+            if (lie->body) dejaBlock(lie->body->statements, rep);
+            continue;
+        }
+
+        if (auto* d = dynamic_cast<xfawa::DejaStatement*>(s)) {
+            std::string name = d->name;
+
+            // Forward scan for the FIRST assignment to `name`.
+            std::unique_ptr<xfawa::Expression> futureConst;
+            for (size_t j = i + 1; j < stmts.size(); j++) {
+                xfawa::Statement* f = stmts[j].get();
+                if (isDejaBoundary(f)) break;  // can't sense through control flow
+                const xfawa::Expression* rhs = nullptr;
+                if (auto* a = dynamic_cast<xfawa::AssignmentStatement*>(f)) {
+                    if (a->name == name) rhs = a->value.get();
+                }
+                if (rhs) {
+                    if (isDejaConstantExpr(rhs)) futureConst = cloneExpr(rhs);
+                    break;  // 方案 B: the first future decides, constant or not
+                }
+            }
+
+            if (futureConst) {
+                auto assign = std::make_unique<xfawa::AssignmentStatement>(name, std::move(futureConst), d->location);
+                // isReassignment=false: the premonition assignment gives the
+                // variable a fresh implicit alloca right at the deja position;
+                // the real future assignment reuses it and overwrites it.
+                up = std::move(assign);
+            } else {
+                rep.addSyntaxWarning(0, 0, "[deja] 无法预感 " + name + " 的未来值（未来赋值不是常量），保持常规语义");
+                up = nullptr;  // drop; normal semantics preserved
+            }
+            continue;
+        }
+    }
+
+    stmts.erase(std::remove_if(stmts.begin(), stmts.end(),
+                               [](const std::unique_ptr<xfawa::Statement>& p) { return p == nullptr; }),
+                stmts.end());
+}
+
+static void applyDejaTransform(xfawa::Program* program, xfawa::ErrorSystem& rep) {
+    for (auto& mod : program->modules) {
+        for (auto& fn : mod->functions) {
+            if (fn->body) dejaBlock(fn->body->statements, rep);
+        }
+    }
+}
+
 // Map each `repeat: N` directive to the first statement whose source line is
 // strictly greater than the directive's line.
 static void buildRepeatMap(
@@ -1026,6 +1172,8 @@ static std::string expAnnotationDescription(xfawa::NodeType t) {
         case xfawa::NodeType::SHUTUP_STATEMENT:     return "// EXP: shutup —— 立即压制后续所有 warning（荒诞恐吓）";
         case xfawa::NodeType::ELLIPSIS_STATEMENT:   return "// EXP: ... —— 随机执行一个允许调用的安全动作";
         case xfawa::NodeType::SLEEP_STATEMENT:      return "// EXP: sleep —— 让程序暂停指定的秒数";
+        case xfawa::NodeType::FATE_STATEMENT:       return "// EXP: fate —— 设定变量命运值；反抗后被不完美地拉回（恢复历史成为新的底数）";
+        case xfawa::NodeType::ENVY_STATEMENT:       return "// EXP: envy —— 嫉妒比自己更好的变量：差距小则超越（+1）、中等则成为它、悬殊则摧毁它的优势";
         default: return "";
     }
 }
@@ -1542,6 +1690,9 @@ int main(int argc, char** argv) {
     
     // ---- EXP `wrath` / `paradox`: retroactive history + causal paradox -----
     applyWrathParadoxTransform(program.get(), xfawa::ErrorReporter::get());
+
+    // ---- EXP `deja`: sense a variable's first constant future --------------
+    applyDejaTransform(program.get(), xfawa::ErrorReporter::get());
     
     if (g_debug) {
         std::cout << "[debug] AST:" << std::endl;

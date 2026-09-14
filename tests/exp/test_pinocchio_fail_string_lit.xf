@@ -1,0 +1,10 @@
+#bads {
+// EXP `pinocchio` compile-error case: proposition is a string literal expression.
+// Compiling this file must FAIL with a `[pinocchio] proposition must be a bool/numeric expression` error.
+
+    fn main() {
+        pinocchio ("abc") {
+            print("done")
+        }
+    }
+}

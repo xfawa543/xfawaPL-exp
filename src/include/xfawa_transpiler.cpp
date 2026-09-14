@@ -119,6 +119,7 @@ std::string Transpiler::transpileBinaryOp(const BinaryOp* op) {
         case BinaryOpType::GREATER_EQUAL: opStr = ">="; break;
         case BinaryOpType::AND: opStr = "&&"; break;
         case BinaryOpType::OR: opStr = "||"; break;
+        case BinaryOpType::BANG_QUESTION: opStr = "?!"; break;
         default: opStr = "?"; break;
     }
     

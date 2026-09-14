@@ -43,11 +43,16 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::keywords = {
     {"shutup", TokenType::KEYWORD_SHUTUP},
     {"wrath", TokenType::KEYWORD_WRATH},
     {"paradox", TokenType::KEYWORD_PARADOX},
+    {"deja", TokenType::KEYWORD_DEJA},
+    {"fate", TokenType::KEYWORD_FATE},
+    {"envy", TokenType::KEYWORD_ENVY},
     {"try", TokenType::KEYWORD_TRY},
     {"expect", TokenType::KEYWORD_EXPECT},
     {"sorry", TokenType::KEYWORD_SORRY},
     {"sleep", TokenType::KEYWORD_SLEEP},
-    {"come", TokenType::KEYWORD_COME}
+    {"come", TokenType::KEYWORD_COME},
+    {"drift", TokenType::KEYWORD_DRIFT},
+    {"pinocchio", TokenType::KEYWORD_PINOCCHIO}
 };
 
 const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
@@ -69,6 +74,7 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
     {"==", TokenType::PUNCTUATOR_EQUAL_EQUAL},
     {"!", TokenType::PUNCTUATOR_EXCLAIM},
     {"!=", TokenType::PUNCTUATOR_EXCLAIM_EQUAL},
+    {"?!", TokenType::PUNCTUATOR_BANG_QUESTION},
     {"<", TokenType::PUNCTUATOR_LESS},
     {"<=", TokenType::PUNCTUATOR_LESS_EQUAL},
     {">", TokenType::PUNCTUATOR_GREATER},
@@ -124,11 +130,16 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_SHUTUP: return "shutup";
         case TokenType::KEYWORD_WRATH: return "wrath";
         case TokenType::KEYWORD_PARADOX: return "paradox";
+        case TokenType::KEYWORD_DEJA: return "deja";
+        case TokenType::KEYWORD_FATE: return "fate";
+        case TokenType::KEYWORD_ENVY: return "envy";
         case TokenType::KEYWORD_TRY: return "try";
         case TokenType::KEYWORD_EXPECT: return "expect";
         case TokenType::KEYWORD_SORRY: return "sorry";
         case TokenType::KEYWORD_SLEEP: return "sleep";
         case TokenType::KEYWORD_COME: return "come";
+        case TokenType::KEYWORD_DRIFT: return "drift";
+        case TokenType::KEYWORD_PINOCCHIO: return "pinocchio";
         case TokenType::PUNCTUATOR_LPAREN: return "(";
         case TokenType::PUNCTUATOR_RPAREN: return ")";
         case TokenType::PUNCTUATOR_LBRACE: return "{";
@@ -146,6 +157,7 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::PUNCTUATOR_EQUAL_EQUAL: return "==";
         case TokenType::PUNCTUATOR_EXCLAIM: return "!";
         case TokenType::PUNCTUATOR_EXCLAIM_EQUAL: return "!=";
+        case TokenType::PUNCTUATOR_BANG_QUESTION: return "?!";
         case TokenType::PUNCTUATOR_LESS: return "<";
         case TokenType::PUNCTUATOR_LESS_EQUAL: return "<=";
         case TokenType::PUNCTUATOR_GREATER: return ">";

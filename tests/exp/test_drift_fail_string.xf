@@ -1,0 +1,12 @@
+#bads {
+// EXP `drift` compile-error case: a STRING parameter cannot be randomized.
+// Compiling this file must FAIL with a `[drift] cannot randomize parameter` error.
+drift fn bad(s) {
+    print(s)
+    bad(s)
+}
+
+    fn main() {
+        bad("hi")
+    }
+}

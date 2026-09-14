@@ -1,0 +1,58 @@
+#test {
+// EXP `pinocchio`：自指命题（匹诺曹悖论）(docs/exp/pinocchio.md)
+// p1 稳定为真：P 真 且 P 引用的状态未变 → 运行时输出 [pinocchio] stable true
+// p2 稳定为假：P 假、无 else 动作、状态未变 → [pinocchio] stable false
+// p3 状态变化推动命题收敛：x 每轮 +1 直到 x>=3；1 2 3 打完后第 4 轮 P 变假且状态不再变化 → [pinocchio] stable false
+// p4 振荡：x>=0 时递减、否则递增；真值序列 T,F,T,F，两轮完整交替 → [pinocchio] oscillation
+// p5 达最大轮数仍无解：P 恒真、状态每轮都在变 → limit:5 后 [pinocchio] no stable solution (max iterations 5)
+// p6 未被 P 引用的变量变化不算状态变化：P 只读 x，then 内写 y → 第 1 轮即稳定，随后输出 99
+
+    fn main() {
+        // p1 stable true
+        x = 3
+        pinocchio (x == 3) {
+            x = 3
+        }
+        print("p1")
+
+        // p2 stable false
+        x = 2
+        pinocchio (x == 3) {
+            x = 3
+        }
+        print("p2")
+
+        // p3 converging: 1 2 3 then stable false
+        x = 0
+        pinocchio (x < 3) {
+            x = x + 1
+            print(x)
+        }
+        print("p3")
+
+        // p4 oscillation
+        x = 0
+        pinocchio (x >= 0) {
+            x = x - 1
+        } else {
+            x = x + 1
+        }
+        print("p4")
+
+        // p5 max iterations
+        x = 1
+        pinocchio (x > 0) {
+            x = x + 1
+        } limit: 5
+        print("p5")
+
+        // p6 writing an unrelated variable is not state change
+        x = 3
+        y = 0
+        pinocchio (x == 3) {
+            y = 99
+        }
+        print(y)
+        print("p6")
+    }
+}

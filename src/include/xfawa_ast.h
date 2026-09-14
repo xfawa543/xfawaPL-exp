@@ -141,6 +141,7 @@ public:
             case BinaryOpType::GREATER_EQUAL: result += " >= "; break;
             case BinaryOpType::AND: result += " && "; break;
             case BinaryOpType::OR: result += " || "; break;
+            case BinaryOpType::BANG_QUESTION: result += " ?! "; break;
             default: result += " ? "; break;
         }
         result += right->toString();
@@ -516,6 +517,38 @@ public:
     }
 };
 
+// EXP `pinocchio`: a self-referential proposition (Pinocchio paradox).
+// `pinocchio (P) { THEN } else { ELSE } limit: N` re-evaluates the boolean
+// proposition P over user state; each round runs THEN when P is true and ELSE
+// when P is false (either may mutate state). The loop terminates when:
+//   - the state P depends on stops changing          -> stable (P self-consistent)
+//   - P's truth alternates (T,F,T, ...)              -> oscillation (paradox)
+//   - `limit` rounds (default 1000) elapse            -> no stable solution
+// Each termination prints an explicit `[pinocchio] ...` runtime result.
+class PinocchioStatement : public Statement {
+public:
+    std::unique_ptr<Expression> condition;    // the self-referential proposition P
+    std::unique_ptr<Statement> thenBlock;     // runs each round when P is true
+    std::unique_ptr<Statement> elseBlock;     // runs each round when P is false (optional)
+    int limit;                                 // max iterations (default 1000)
+
+    PinocchioStatement(std::unique_ptr<Expression> cond,
+                       std::unique_ptr<Statement> thenB,
+                       std::unique_ptr<Statement> elseB,
+                       int lim,
+                       const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::PINOCCHIO_STATEMENT, loc),
+          condition(std::move(cond)), thenBlock(std::move(thenB)),
+          elseBlock(std::move(elseB)), limit(lim) {}
+
+    std::string toString() const override {
+        std::string result = "pinocchio (" + (condition ? condition->toString() : "") + ") { ... }";
+        if (elseBlock) result += " else { ... }";
+        result += " limit: " + std::to_string(limit);
+        return result;
+    }
+};
+
 // EXP `wrath`: retroactively rewrite the history of a variable. `wrath x = v`
 // assigns `v` to `x`, then re-evaluates every later variable that (transitively)
 // depended on `x`, so future reads of those dependents see the new value. Already
@@ -546,6 +579,73 @@ public:
 
     std::string toString() const override {
         return "paradox " + name;
+    }
+};
+
+// EXP `deja`: sense a variable's first constant future. `deja x` looks forward
+// (straight-line code only) for x's FIRST assignment; if its RHS is a
+// compile-time constant expression, the transform rewrites `deja x` into an
+// implicit `x = <that constant>` so reads between the deja and the real
+// assignment see the future value. Otherwise deja is dropped and a warning is
+// emitted (normal semantics preserved). The real future assignment still runs.
+class DejaStatement : public Statement {
+public:
+    std::string name;
+
+    DejaStatement(const std::string& n, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::DEJA_STATEMENT, loc), name(n) {}
+
+    std::string toString() const override {
+        return "deja " + name;
+    }
+};
+
+// EXP `fate`: give a variable a destiny value. `fate x = 100` records 100 as
+// x's destiny (and sets x to it). x may still be assigned ANY value afterwards
+// (`x = 20` is not an error), but each such deviation immediately triggers an
+// IMPERFECT recovery: the stored value is pulled back toward the destiny value
+// (midpoint halving), never set straight to it. Every recovery result becomes
+// the persistent floor (底数) for later recoveries if it is the highest so far,
+// so the variable can never be cleanly restored below its own recovery history
+// — "you can resist fate, but your own traces keep fate from ever restoring
+// you perfectly." Implemented purely in LLVM codegen (never transformed away).
+class FateStatement : public Statement {
+public:
+    std::string name;
+    std::unique_ptr<Expression> value;
+
+    FateStatement(const std::string& n, std::unique_ptr<Expression> v,
+                  const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::FATE_STATEMENT, loc), name(n), value(std::move(v)) {}
+
+    std::string toString() const override {
+        return "fate " + name + " = " + (value ? value->toString() : "");
+    }
+};
+
+// EXP `envy`: the jealous variable `receiver` discovers that `target` is
+// better (higher) on a comparable dimension and tries to close the gap.
+// Never a plain `if a < b: a = b`. The reaction is chosen by how big the
+// perceived disparity is (path selection at runtime, straight-line selects):
+//   1. 超越 (surpass)   – small gap (gap <= self):  self jumps to target + 1.
+//   2. 成为 (become)    – middling gap (self < gap <= 2*self): self becomes target.
+//   3. 摧毁 (destroy)   – hopeless gap (gap > 2*self): target dragged below self
+//                          (target = self - 1), self untouched — extreme envy.
+// If self is already not worse (self >= target) nothing happens at all.
+// Only same-typed integer/float variable pairs take part; any other combination
+// (strings, bools, arrays, mixed types) is an incomparable dimension → no-op
+// and a warning. Implemented purely in LLVM codegen (never transformed away).
+class EnvyStatement : public Statement {
+public:
+    std::string receiver;
+    std::string target;
+
+    EnvyStatement(const std::string& recv, const std::string& tgt,
+                  const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::ENVY_STATEMENT, loc), receiver(recv), target(tgt) {}
+
+    std::string toString() const override {
+        return "envy " + receiver + " " + target;
     }
 };
 
@@ -780,6 +880,21 @@ public:
     std::unique_ptr<BlockStatement> body;
     SourceLocation location;
     
+    // EXP `drift`: random recursive parameters. When enabled, every self call
+    // inside the body substitutes its written argument values with runtime
+    // random values drawn from a per-function range; the depth counter caps
+    // how many randomized self calls can chain before returning 0.
+    struct DriftConfig {
+        bool enabled = false;
+        bool hasRange = false;
+        long long rangeLo = 0;      // int/long domain lower bound
+        long long rangeHi = 0;      // int/long domain upper bound
+        double rangeLoF = 0.0;      // float domain lower bound
+        double rangeHiF = 0.0;      // float domain upper bound
+        bool rangeIsFloat = false;  // user gave float literal bounds
+        long long depthLimit = 0;   // 0 -> built-in default
+    } drift;
+    
     Function(const std::string& n, std::vector<std::unique_ptr<VariableDeclaration>> p,
              std::unique_ptr<BlockStatement> b, const SourceLocation& loc = SourceLocation())
         : name(n), ns(""), blockName(""), params(std::move(p)), body(std::move(b)), location(loc) {}
@@ -789,7 +904,7 @@ public:
         : name(n), ns(ns_name), blockName(""), params(std::move(p)), body(std::move(b)), location(loc) {}
     
     std::string toString() const {
-        std::string result = "fn ";
+        std::string result = drift.enabled ? "drift fn " : "fn ";
         if (!ns.empty()) {
             result += ns + ":";
         }

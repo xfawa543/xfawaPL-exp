@@ -11,6 +11,7 @@
 | `boom` | 播放爆炸音效、打印 BOOM!!、正常退出 | [boom.md](boom.md) |
 | `bsod` | 显示一个假蓝屏，2.5 秒后继续执行 | [bsod.md](bsod.md) |
 | `believe "x + y = z"` | 让程序把一个等式当成真的（影响该运算的常量折叠） | [believe.md](believe.md) |
+| `come 行号` / `come if(条件) 行号` | 跳转：执行线走到目标行时回到 come 位置重跑一段（构成循环）；`come if` 条件为真才跳、为假放行；目标必须是本函数内的普通语句行 | [come.md](come.md) |
 | `lie x = v { ... }` | 块内读 x 得到 v（谎言值），真实值不变 | [lie.md](lie.md) |
 | `un print/boom/bsod` | 禁用某个语句，直到程序结束 | [un.md](un.md) |
 | `!print(...)` | 单次绕过 `un print` 的禁用 | [un.md](un.md)（含在 un 的文档里） |
@@ -28,6 +29,12 @@
 | `O` / `OO` / `1O` 等 | O 十进制位字面量（一种另类数字写法） | [O_LITERAL_EXP.md](O_LITERAL_EXP.md) |
 | `wrath x = v` | 修改已经发生的历史，重算依赖状态 | [wrath.md](wrath.md) |
 | `paradox x` | 改变过去：下游因果链重新验证失败，受影响变量保留原值并成为 GHOST（重合论→幽灵论） | [paradox.md](paradox.md) |
+| `pinocchio (P) { } else { } limit: N` | 自指命题：反复"用当前状态求值 P → 执行 then/else → 比对 P 引用的变量"；状态不再变化 → 稳定（stable true/false）、真值连续交替 → 振荡、超过 limit 轮 → 无解，三种结果必终止输出 | [pinocchio.md](pinocchio.md) |
+| `deja x` | 偷未来：把 `x` 的第一个常量未来赋值提前可见；非常量/控制流内/跨函数时保持常规语义 + 警告 | [deja.md](deja.md) |
+| `drift fn f/...` | 递归随机参数：drift 修饰的函数，其递归自调用在运行时按参数类型与范围现算随机实参（外部调用仍传原值）；内置 1000 层深度上限保证终止，可 `drift(depth: N)` 覆盖；字符串/类型不可推导参数 → 编译错误 | [drift.md](drift.md) |
+| `fate x = v` | 设定命运值：反抗后被以"中点折半"的方式不完美拉回（永不直接等于命运值）；恢复史上最高结果成为持久底数，之后不可低于 | [fate.md](fate.md) |
+| `envy a b` | 嫉妒比自己更好的变量：按差距强度选择 超越(+1)/成为(复制目标)/摧毁(目标被拉低)；自身不弱于目标则完全不动；不可比较维度 → warning + 原样 | [envy.md](envy.md) |
+| `a ?! b` | 随机二元运算符：运行时从对 a、b 类型都合法且结果类型一致的一组运算（`+ - * / % && \|\|`，按类型分组）中随机挑一个真算；比较类因结果类型不同被排除；字符串等无候选组合 → `[?!]` warning + 退化为左操作数 | [randop.md](randop.md) |
 | `try { } expect { }` | 编译器错误拦截：编译期捕获语义错误，执行 expect 块 | [try_expect.md](try_expect.md) |
 | `sorry` | 向编译器道歉，使 rage 随机下降 delta∈[0,rage]（最低 0） | [rage.md](rage.md) |
 | 编译器红温机制 | rage 持久化状态（0–5）+ 成功捕获升温 + sorry 随机降温；红温时的"每五行"强制规则见 try_expect.md；`xfawac rage` / `rage reset` | [rage.md](rage.md) |

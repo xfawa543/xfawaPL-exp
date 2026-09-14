@@ -1,0 +1,105 @@
+#test {
+    // t1 基础预感：赋值在后、读取在前，输出 42
+    // t2 未来为常量表达式 100 - 1：输出 99
+    // t3 未来为变量 / 函数调用 → 预感失败 + warning（保持常规语义）
+    // t4 多次常量赋值边界：取第一个常量未来（方案 B）
+    // t5 与 wrath / paradox 叠加：各自独立、正交
+    // t6 函数边界：不跨函数猜未来
+    // t7 控制流内未来：不可预感，保持常规语义
+    // t8 无副作用：未来赋值照常执行一次，不跳过、不重复
+
+    fn helper() {
+        return 7
+    }
+
+    fn store() {
+        sv = 7
+    }
+
+    fn need() {
+        return 3
+    }
+
+    fn main() {
+        // t1 + t2
+        deja x
+        print(x)          // 42（预感）
+        x = 42
+        print("t1")
+
+        deja y
+        print(y)          // 99（预感 100 - 1）
+        y = 100 - 1
+        print("t2")
+
+        // t3：未来不是常量 → 预感失败，保持常规语义
+        a = 1
+        deja b
+        b = a             // 未来是变量 → 失败
+        print(b)          // 1（正常值）
+        deja w
+        w = helper()      // 未来是函数调用 → 失败
+        print(w)          // 7（正常值）
+        print("t3")
+
+        // t4：取第一个常量未来（方案 B）
+        deja x4
+        print(x4)         // 5（预感第一个常量未来）
+        x4 = 5
+        x4 = 6
+        print(x4)         // 6（真实值）
+        print("t4")
+
+        // t5：与 wrath / paradox 正交，互不干扰
+        q1 = 1
+        q2 = q1 + 10
+        wrath q1 = 5
+        print(q2)         // 15（wrath 生效）
+        deja q3
+        print(q3)         // 9（预感不受 wrath 影响）
+        q3 = 9
+        print(q3)         // 9
+        print("t5a")
+
+        p1 = 1
+        p2 = p1 + 1
+        paradox p1
+        print(p2)         // 2#（paradox 生效）
+        deja p3
+        print(p3)         // 8（预感不受幽灵状态影响）
+        p3 = 8
+        print(p3)         // 8
+        print("t5b")
+
+        // t6：不跨函数边界猜未来（sv = 7 在另一个函数里，main 看不见）
+        deja v
+        print("t6a")
+        v = need()        // main 里第一个未来是函数调用 → 预感失败
+        print(v)          // 3（正常值）
+        store()           // 另一个函数里的 sv = 7，与 main 的 deja 无关
+        print("t6b")
+
+        // t7：未来在控制流块内 → 不可预感
+        deja h
+        if true {
+            h = 5
+        }
+        print(h)          // 5（运行时控制流赋值，不是预感）
+
+        int g = 0
+        deja g
+        while (false) {
+            g = 7
+        }
+        g = 1
+        print(g)          // 1（未来在循环块内 → 失败；常规语义）
+        print("t7")
+
+        // t8：无副作用——预感只是把未来常量提前可见，未来赋值照常执行一次
+        deja m
+        print(m * 2)      // 200（预感 100 在真实赋值前被读取使用）
+        m = 100
+        print(m)          // 100（未来赋值照常执行一次）
+        print("t8")
+    }
+}

@@ -1,0 +1,83 @@
+#test {
+// t1 目标明显优于自身：按差距强度选择路径（差距 ≤ 自身 → 超越：a = 100+1）
+// t2 自身已经不弱于目标：不发生任何嫉妒行为（大于等于都无变化）
+// t3 超越路径：自己跳到目标之上（差额小）
+// t4 成为 / 模仿路径：自己复制目标的数值（自身 < 差距 ≤ 2×自身）
+// t5 极端嫉妒 → 摧毁路径：目标被拉到自己之下（差距 > 2×自身 ← 绝望差距）
+// t6 无关变量不受影响
+// t7 不同数据类型无法比较：不产生嫉妒行为 + [envy] 警告 + 原样保持
+
+    fn main() {
+        // t1：目标明显优于自身 → 差距 50 = 自身 50（≤ 自身）→ 超越
+        a = 50
+        b = 100
+        envy a b
+        print(a)          // 101（超越：a = b + 1）
+        print(b)          // 100（目标不变）
+        print("t1")
+
+        // t2：自身已经不弱于目标 → 完全不动
+        c = 100
+        d = 50
+        envy c d
+        print(c)          // 100
+        print(d)          // 50
+        comp1 = 60
+        comp2 = 60
+        envy comp1 comp2    // 平手：也不产生嫉妒
+        print(comp1)       // 60
+        print(comp2)       // 60
+        print("t2")
+
+        // t3：超越路径（差距 20 ≤ 自身 40）：p → 61
+        p = 40
+        q = 60
+        envy p q
+        print(p)          // 61
+        print(q)          // 60
+        print("t3")
+
+        // t4：成为 / 模仿路径（自身 30 < 差距 40 ≤ 60）：x → 70
+        x = 30
+        y = 70
+        envy x y
+        print(x)          // 70（成为）
+        print(y)          // 70
+        print("t4")
+
+        // t5：极端嫉妒 → 摧毁（自身 10，差距 90 > 2×10）：目标被拉低
+        m = 10
+        k = 100
+        envy m k
+        print(m)          // 10（自己不变）
+        print(k)          // 9（目标失去优势，被拉到 m - 1）
+        print("t5")
+
+        // t6：无关变量完全不受影响
+        poor = 10
+        rich = 100
+        envy poor rich    // 摧毁：rich → 9
+        print(poor)       // 10
+        print(rich)       // 9
+        extra1 = 5
+        extra2 = 6
+        extra3 = 7
+        print(extra1)     // 5
+        print(extra2)     // 6
+        print(extra3)     // 7
+        print("t6")
+
+        // t7：无法比较的数据类型 → 原样 + [envy] 警告
+        s1 = "hello"
+        s2 = "world"
+        envy s1 s2        // 字符串 vs 字符串：无高低维度
+        print(s1)         // hello
+        print(s2)         // world
+        x1 = 5
+        s3 = "hi"
+        envy x1 s3        // int vs 字符串：维度不同
+        print(x1)         // 5
+        print(s3)         // hi
+        print("t7")
+    }
+}

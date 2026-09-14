@@ -29,6 +29,8 @@ bool isKeywordLikeNameToken(TokenType type) {
         case TokenType::KEYWORD_STRING:
         case TokenType::KEYWORD_FOR:
         case TokenType::KEYWORD_WINDOW:
+        case TokenType::KEYWORD_DRIFT:
+        case TokenType::KEYWORD_PINOCCHIO:
             return true;
         default:
             return false;
@@ -225,7 +227,12 @@ std::unique_ptr<Module> Parser::parseModule() {
             addError("class declarations must be inside 'window' blocks in .xf files (only .xfw libraries allow top-level class)");
             return nullptr;
         } else {
-            auto func = parseFunction();
+            std::unique_ptr<Function> func;
+            if (peek().is(TokenType::KEYWORD_DRIFT)) {
+                func = parseDriftFunction();
+            } else {
+                func = parseFunction();
+            }
             if (func) {
                 // Alpha17: Set block name for the function
                 if (func->ns.empty()) {
@@ -865,6 +872,118 @@ std::unique_ptr<ClassDeclarationStatement> Parser::parseClassDeclarationStatemen
     return classDecl;
 }
 
+std::unique_ptr<Function> Parser::parseDriftFunction() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_DRIFT)) {
+        return nullptr;
+    }
+
+    Function::DriftConfig cfg;
+    cfg.enabled = true;
+
+    if (peek().is(TokenType::PUNCTUATOR_LPAREN)) {
+        advance();
+
+        bool haveRange = false;
+        bool haveDepth = false;
+
+        while (!peek().is(TokenType::PUNCTUATOR_RPAREN)) {
+            if (peek().is(TokenType::IDENTIFIER) && peek().text == "depth" &&
+                peek(1).is(TokenType::PUNCTUATOR_COLON)) {
+                advance(); // 'depth'
+                advance(); // ':'
+                if (!peek().is(TokenType::NUMBER_LITERAL)) {
+                    addError("Expected a number after 'depth:' in 'drift(...)' modifier");
+                    return nullptr;
+                }
+                long long d = std::stoll(peek().text);
+                if (d < 1) {
+                    addError("drift depth limit must be >= 1");
+                    return nullptr;
+                }
+                cfg.depthLimit = d;
+                haveDepth = true;
+                advance();
+            } else if (!haveRange) {
+                auto parseBound = [&](bool& neg, long long& lo, double& loF, bool& isFloat) -> bool {
+                    neg = false;
+                    if (peek().is(TokenType::PUNCTUATOR_MINUS)) { neg = true; advance(); }
+                    if (peek().is(TokenType::NUMBER_LITERAL)) {
+                        isFloat = false;
+                        long long v = std::stoll(peek().text);
+                        lo = neg ? -v : v;
+                        loF = neg ? -static_cast<double>(v) : static_cast<double>(v);
+                        return true;
+                    }
+                    if (peek().is(TokenType::FLOAT_LITERAL)) {
+                        isFloat = true;
+                        double v = std::stod(peek().text);
+                        loF = neg ? -v : v;
+                        lo = static_cast<long long>(neg ? -v : v);
+                        return true;
+                    }
+                    addError("Expected a number bound in 'drift(...)' modifier");
+                    return false;
+                };
+
+                bool neg1 = false, isFloat1 = false;
+                long long loI = 0; double loF = 0.0;
+                if (!parseBound(neg1, loI, loF, isFloat1)) return nullptr;
+                advance();
+
+                if (!consume(TokenType::PUNCTUATOR_COMMA)) {
+                    addError("Expected ',' between the two range bounds in 'drift(...)'");
+                    return nullptr;
+                }
+
+                bool neg2 = false, isFloat2 = false;
+                long long hiI = 0; double hiF = 0.0;
+                if (!parseBound(neg2, hiI, hiF, isFloat2)) return nullptr;
+                advance();
+
+                bool isFloat = isFloat1 || isFloat2;
+                cfg.hasRange = true;
+                cfg.rangeIsFloat = isFloat;
+                cfg.rangeLoF = loF;
+                cfg.rangeHiF = hiF;
+                cfg.rangeLo = loI;
+                cfg.rangeHi = hiI;
+                haveRange = true;
+            } else {
+                addError("Unexpected token in 'drift(...)' modifier");
+                return nullptr;
+            }
+
+            if (peek().is(TokenType::PUNCTUATOR_COMMA)) {
+                advance();
+            }
+        }
+
+        if (!consume(TokenType::PUNCTUATOR_RPAREN)) {
+            addError("Expected ')' after 'drift(...)' modifier");
+            return nullptr;
+        }
+
+        if (!haveRange && !haveDepth) {
+            addError("Empty 'drift()' modifier; use 'drift(lo, hi)' and/or 'depth: N'");
+            return nullptr;
+        }
+    }
+
+    if (!peek().is(TokenType::KEYWORD_FN)) {
+        addError("Expected 'fn' after 'drift'");
+        return nullptr;
+    }
+
+    auto func = parseFunction();
+    if (!func) {
+        return nullptr;
+    }
+    func->drift = cfg;
+    return func;
+}
+
 std::unique_ptr<Function> Parser::parseFunction() {
     SourceLocation loc = peek().location;
     
@@ -972,6 +1091,12 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         return parseWrathStatement();
     } else if (peek().is(TokenType::KEYWORD_PARADOX)) {
         return parseParadoxStatement();
+    } else if (peek().is(TokenType::KEYWORD_DEJA)) {
+        return parseDejaStatement();
+    } else if (peek().is(TokenType::KEYWORD_FATE)) {
+        return parseFateStatement();
+    } else if (peek().is(TokenType::KEYWORD_ENVY)) {
+        return parseEnvyStatement();
     } else if (peek().is(TokenType::KEYWORD_TRY)) {
         return parseTryExpectStatement();
     } else if (peek().is(TokenType::KEYWORD_SORRY)) {
@@ -1002,6 +1127,13 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         auto func = parseFunction();
         if (!func) return nullptr;
         return std::make_unique<FunctionDeclarationStatement>(std::move(func), loc);
+    } else if (peek().is(TokenType::KEYWORD_DRIFT)) {
+        SourceLocation loc = peek().location;
+        auto func = parseDriftFunction();
+        if (!func) return nullptr;
+        return std::make_unique<FunctionDeclarationStatement>(std::move(func), loc);
+    } else if (peek().is(TokenType::KEYWORD_PINOCCHIO)) {
+        return parsePinocchioStatement();
     } else if (peek().is(TokenType::KEYWORD_INT)) {
         advance();
         return parseTypedAssignmentStatement(VarType::INT);
@@ -1448,6 +1580,114 @@ std::unique_ptr<Statement> Parser::parseParadoxStatement() {
     return std::make_unique<ParadoxStatement>(name, loc);
 }
 
+std::unique_ptr<Statement> Parser::parseDejaStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_DEJA)) return nullptr;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after 'deja'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    return std::make_unique<DejaStatement>(name, loc);
+}
+
+std::unique_ptr<Statement> Parser::parseEnvyStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_ENVY)) return nullptr;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected jealous variable name after 'envy'");
+        return nullptr;
+    }
+    std::string receiver = peek(-1).text;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected target variable name after 'envy <name>'");
+        return nullptr;
+    }
+    std::string target = peek(-1).text;
+
+    // envy does NOT declare variables: both sides must already exist with a
+    // value. Unknown names are handled (warned, no-op) at codegen time.
+    return std::make_unique<EnvyStatement>(receiver, target, loc);
+}
+
+std::unique_ptr<Statement> Parser::parsePinocchioStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_PINOCCHIO)) return nullptr;
+
+    // Condition: the self-referential proposition. Parens are optional (they
+    // are absorbed by the expression parser, exactly like `if` conditions).
+    auto cond = parseExpression();
+    if (!cond) return nullptr;
+
+    std::unique_ptr<Statement> thenBlock = parseStatement();
+    if (!thenBlock) {
+        addError("Expected block after 'pinocchio' condition");
+        return nullptr;
+    }
+
+    std::unique_ptr<Statement> elseBlock = nullptr;
+    if (consume(TokenType::KEYWORD_ELSE)) {
+        elseBlock = parseStatement();
+        if (!elseBlock) {
+            addError("Expected block after 'else' in 'pinocchio'");
+            return nullptr;
+        }
+    }
+
+    int limit = 1000;
+    if (peek().is(TokenType::IDENTIFIER) && peek().text == "limit") {
+        advance();
+        if (!consume(TokenType::PUNCTUATOR_COLON)) {
+            addError("Expected ':' after 'limit' in 'pinocchio'");
+            return nullptr;
+        }
+        if (!peek().is(TokenType::NUMBER_LITERAL)) {
+            addError("Expected a positive integer after 'limit:' in 'pinocchio'");
+            return nullptr;
+        }
+        limit = static_cast<int>(std::stoll(peek().text));
+        advance();
+        if (limit < 1) {
+            addError("[pinocchio] limit must be a positive integer (>= 1)");
+            return nullptr;
+        }
+    }
+
+    return std::make_unique<PinocchioStatement>(std::move(cond), std::move(thenBlock),
+                                                std::move(elseBlock), limit, loc);
+}
+
+std::unique_ptr<Statement> Parser::parseFateStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_FATE)) return nullptr;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after 'fate'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after variable name in 'fate'");
+        return nullptr;
+    }
+
+    auto expr = parseExpression();
+    if (!expr) return nullptr;
+
+    // `fate x = ...` births the variable: later plain assignments to x reuse
+    // the same storage (isReassignment) instead of declaring it again.
+    if (!isVariableDeclared(name)) {
+        declareVariable(name);
+    }
+
+    return std::make_unique<FateStatement>(name, std::move(expr), loc);
+}
+
 std::unique_ptr<Statement> Parser::parseTryExpectStatement() {
     SourceLocation loc = peek().location;
     if (!consume(TokenType::KEYWORD_TRY)) return nullptr;
@@ -1709,7 +1949,16 @@ std::unique_ptr<IfStatement> Parser::parseIfStatement() {
 }
 
 std::unique_ptr<Expression> Parser::parseExpression() {
-    return parseLogicalOr();
+    auto left = parseLogicalOr();
+    
+    while (!isAtEnd() && peek().is(TokenType::PUNCTUATOR_BANG_QUESTION)) {
+        BinaryOpType op = BinaryOpType::BANG_QUESTION;
+        advance();
+        auto right = parseLogicalOr();
+        left = std::make_unique<BinaryOp>(op, std::move(left), std::move(right), peek().location);
+    }
+    
+    return left;
 }
 
 std::unique_ptr<Expression> Parser::parseLogicalOr() {

@@ -54,6 +54,7 @@ private:
     std::unique_ptr<ClassDeclarationStatement> parseClassDeclarationStatement();
     std::unique_ptr<XraphicsObjectStatement> parseXraphicsObjectStatement();
     std::unique_ptr<Function> parseFunction();
+    std::unique_ptr<Function> parseDriftFunction();
     std::unique_ptr<Statement> parseStatement();
     std::unique_ptr<PrintStatement> parsePrintStatement();
     std::unique_ptr<AssignmentStatement> parseAssignmentStatement();
@@ -75,6 +76,10 @@ private:
     std::unique_ptr<Statement> parseComeStatement();
     std::unique_ptr<Statement> parseWrathStatement();
     std::unique_ptr<Statement> parseParadoxStatement();
+    std::unique_ptr<Statement> parseDejaStatement();
+    std::unique_ptr<Statement> parseFateStatement();
+    std::unique_ptr<Statement> parseEnvyStatement();
+    std::unique_ptr<Statement> parsePinocchioStatement();
     std::unique_ptr<Statement> parseTryExpectStatement();
     void recoverTryBlockError();
     std::unique_ptr<Statement> parseSorryStatement();

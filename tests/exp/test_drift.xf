@@ -1,0 +1,68 @@
+#drift {
+// EXP `drift`：递归随机参数 (docs/exp/drift.md)
+// t1 单参数整数递归，显式范围 drift(-5,5)：外部调用传原值 3；后续自调用参数 ∈ [-5,5]；n<=0 自然返回 42
+drift(-5, 5) fn walk(n) {
+    print(n)
+    if (n <= 0) return 42
+    return walk(n)
+}
+
+// t2 默认随机范围 [0,100]（int），无终止条件：由内置深度上限(1000)兜底，最终返回 0
+drift fn rngd(n) {
+    print(n)
+    rngd(n)
+}
+
+// t3 多参数递归：drift(-5,5) 对每个参数独立随机
+drift(-5, 5) fn two(n, m) {
+    print(n)
+    print(m)
+    if (n + m <= 0) return 9
+    return two(n, m)
+}
+
+// t4 浮点参数：drift(0.0, 1.0)，f32 输出，n<0.5 自然返回 3
+drift(0.0, 1.0) fn fval(n) {
+    print(n)
+    if (n < 0.5) return 3
+    return fval(n)
+}
+
+// t5 最大递归深度：drift(depth: 50)；无任何可命中的终止条件，必在第 51 次自调用被截断
+drift(depth: 50) fn cap(n) {
+    print(n)
+    if (n < 0) return 7
+    return cap(n)
+}
+
+// t6 原有终止条件仍然有效：drift(-5,5) 下 n<=0 命中即自然返回 42
+drift(-5, 5) fn okay(n) {
+    print(n)
+    if (n <= 0) return 42
+    return okay(n)
+}
+
+// t7 普通递归不受 drift 影响：精确 5 4 3 2 1 0
+fn norm(x) {
+    if (x <= 0) return 0
+    print(x)
+    return norm(x - 1)
+}
+
+    fn main() {
+        print(walk(3))
+        print("t1")
+        print(rngd(0))
+        print("t2")
+        print(two(2, 2))
+        print("t3")
+        print(fval(0.5))
+        print("t4")
+        print(cap(1))
+        print("t5")
+        print(okay(3))
+        print("t6")
+        print(norm(5))
+        print("t7")
+    }
+}

@@ -508,6 +508,12 @@ llvm::Value* LLVMCodegen::codegen(UnaryOp* expr) {
 }
 
 llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
+    // EXP `?!`: randomly pick a binary op among those valid for the operand
+    // types. Handled before the plain-op paths below.
+    if (expr->op == BinaryOpType::BANG_QUESTION) {
+        return codegenRandomBinaryOp(expr);
+    }
+
     // EXP `believe`: if both operands are constant ints, check the belief table.
     if (auto* l = dynamic_cast<NumberLiteral*>(expr->left.get())) {
         if (auto* r = dynamic_cast<NumberLiteral*>(expr->right.get())) {
@@ -774,6 +780,118 @@ llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
         default:
             return nullptr;
     }
+}
+
+// EXP `?!`: `a ?! b` runs a binary op picked at RUNTIME from the set of ops
+// that are legal for the operand types. Each candidate is filtered so that it
+// is applicable to a and b AND produces the same result type, keeping the
+// static type system intact. The candidates are computed straight-line (no
+// branches) and one is selected by `rand() % N`. Fallback (no legal candidate
+// for the operand pair): warning + the left operand's value.
+llvm::Value* LLVMCodegen::codegenRandomBinaryOp(xfawa::BinaryOp* expr) {
+    llvm::Value* leftVal = codegen(expr->left.get());
+    if (!leftVal) return nullptr;
+    llvm::Value* rightVal = codegen(expr->right.get());
+    if (!rightVal) return nullptr;
+
+    llvm::Type* leftType = leftVal->getType();
+    llvm::Type* rightType = rightVal->getType();
+
+    bool leftInt = leftType->isIntegerTy(32) || leftType->isIntegerTy(64);
+    bool rightInt = rightType->isIntegerTy(32) || rightType->isIntegerTy(64);
+    bool leftFloat = leftType->isFloatTy();
+    bool rightFloat = rightType->isFloatTy();
+    bool leftBool = leftType->isIntegerTy(1);
+    bool rightBool = rightType->isIntegerTy(1);
+
+    std::vector<xfawa::BinaryOpType> candidates;
+
+    if (leftBool && rightBool) {
+        // bool ?! bool -> logical AND / OR, result i32 0/1 (matches && / ||).
+        candidates = {xfawa::BinaryOpType::AND, xfawa::BinaryOpType::OR};
+    } else if (leftInt && rightInt) {
+        // int ?! int (i32/i64, mixed widths ok) -> arithmetic + logical(bitwise).
+        candidates = {xfawa::BinaryOpType::ADD, xfawa::BinaryOpType::SUB,
+                      xfawa::BinaryOpType::MUL, xfawa::BinaryOpType::DIV,
+                      xfawa::BinaryOpType::MOD, xfawa::BinaryOpType::AND,
+                      xfawa::BinaryOpType::OR};
+    } else if ((leftInt || leftFloat) && (rightInt || rightFloat) &&
+               (leftFloat || rightFloat)) {
+        // float ?! float, or int ?! float (promoted) -> arithmetic only.
+        candidates = {xfawa::BinaryOpType::ADD, xfawa::BinaryOpType::SUB,
+                      xfawa::BinaryOpType::MUL, xfawa::BinaryOpType::DIV,
+                      xfawa::BinaryOpType::MOD};
+    } else {
+        // Strings, bool mixed with numbers/floats, arrays, etc: no candidate
+        // set with a consistent result type -> fall back to the left operand.
+        addWarning("[?!] 没有合法候选运算，?! 退化为左操作数");
+        return leftVal;
+    }
+
+    // Normalize operands to a common type and compute every candidate value.
+    std::vector<llvm::Value*> values;
+    values.reserve(candidates.size());
+
+    if (leftBool && rightBool) {
+        llvm::Value* l = builder.CreateZExt(leftVal, builder.getInt32Ty(), "bq.lzb");
+        llvm::Value* r = builder.CreateZExt(rightVal, builder.getInt32Ty(), "bq.rzb");
+        for (xfawa::BinaryOpType op : candidates) {
+            switch (op) {
+                case xfawa::BinaryOpType::AND: values.push_back(builder.CreateAnd(l, r, "bq.and")); break;
+                case xfawa::BinaryOpType::OR:  values.push_back(builder.CreateOr(l, r, "bq.or")); break;
+                default: break;
+            }
+        }
+    } else if (leftFloat || rightFloat) {
+        llvm::Value* l = leftFloat ? leftVal
+                                   : builder.CreateSIToFP(leftVal, builder.getFloatTy(), "bq.itofl");
+        llvm::Value* r = rightFloat ? rightVal
+                                    : builder.CreateSIToFP(rightVal, builder.getFloatTy(), "bq.itofr");
+        for (xfawa::BinaryOpType op : candidates) {
+            switch (op) {
+                case xfawa::BinaryOpType::ADD: values.push_back(builder.CreateFAdd(l, r, "bq.fadd")); break;
+                case xfawa::BinaryOpType::SUB: values.push_back(builder.CreateFSub(l, r, "bq.fsub")); break;
+                case xfawa::BinaryOpType::MUL: values.push_back(builder.CreateFMul(l, r, "bq.fmul")); break;
+                case xfawa::BinaryOpType::DIV: values.push_back(builder.CreateFDiv(l, r, "bq.fdiv")); break;
+                case xfawa::BinaryOpType::MOD: values.push_back(builder.CreateFRem(l, r, "bq.frem")); break;
+                default: break;
+            }
+        }
+    } else {
+        llvm::Value* l = leftVal;
+        llvm::Value* r = rightVal;
+        if (leftType->getIntegerBitWidth() > rightType->getIntegerBitWidth()) {
+            r = builder.CreateSExt(r, leftType, "bq.intext");
+        } else if (rightType->getIntegerBitWidth() > leftType->getIntegerBitWidth()) {
+            l = builder.CreateSExt(l, rightType, "bq.intext");
+        }
+        for (xfawa::BinaryOpType op : candidates) {
+            switch (op) {
+                case xfawa::BinaryOpType::ADD: values.push_back(builder.CreateAdd(l, r, "bq.add")); break;
+                case xfawa::BinaryOpType::SUB: values.push_back(builder.CreateSub(l, r, "bq.sub")); break;
+                case xfawa::BinaryOpType::MUL: values.push_back(builder.CreateMul(l, r, "bq.mul")); break;
+                case xfawa::BinaryOpType::DIV: values.push_back(builder.CreateSDiv(l, r, "bq.div")); break;
+                case xfawa::BinaryOpType::MOD: values.push_back(builder.CreateSRem(l, r, "bq.mod")); break;
+                case xfawa::BinaryOpType::AND: values.push_back(builder.CreateAnd(l, r, "bq.and")); break;
+                case xfawa::BinaryOpType::OR:  values.push_back(builder.CreateOr(l, r, "bq.or")); break;
+                default: break;
+            }
+        }
+    }
+
+    // Runtime random selection: rand() % N -> select chain.
+    usesRandomBuiltin = true;
+    emitRandomCallSeedOnce();
+    llvm::Function* randFunc = getRandFunction();
+    llvm::Value* randVal = builder.CreateCall(randFunc, {}, "bq.rand");
+    llvm::Value* idx = builder.CreateSRem(randVal, builder.getInt32((int)values.size()), "bq.idx");
+
+    llvm::Value* result = values[0];
+    for (int i = 1; i < (int)values.size(); i++) {
+        llvm::Value* eq = builder.CreateICmpEQ(idx, builder.getInt32(i), "bq.cmp");
+        result = builder.CreateSelect(eq, values[i], result, "bq.sel");
+    }
+    return result;
 }
 
 llvm::Value* LLVMCodegen::codegen(CallExpression* expr) {
@@ -1055,6 +1173,23 @@ llvm::Value* LLVMCodegen::codegen(CallExpression* expr) {
         
         addError(errorMsg);
         return nullptr;
+    }
+
+    // EXP `drift`: a self call inside a drift-enabled function replaces the
+    // written argument values with runtime random values and enforces the
+    // depth cap.  Compare the bare name after the last ':' to the call-site
+    // name, because funcName includes the module prefix (e.g. "bads:bad")
+    // while the call expression holds only the unqualified name ("bad").
+    {
+        std::string currentBare = currentFuncName;
+        auto colon = currentFuncName.find_last_of(':');
+        if (colon != std::string::npos) currentBare = currentFuncName.substr(colon + 1);
+        if (callee && !currentBare.empty() && currentBare == funcName) {
+            auto dcIt = driftConfigs.find(currentFuncName);
+            if (dcIt != driftConfigs.end()) {
+                return codegenDriftedSelfCall(callee, expr, currentFuncName);
+            }
+        }
     }
     
     std::vector<llvm::Value*> args;
@@ -1732,6 +1867,14 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
     }
     
     builder.CreateStore(storeVal, alloca);
+    
+    // EXP `fate`: after storing a deviation into a fated variable, pull the
+    // value back toward the destiny value (imperfect + floor-limited).
+    auto fatedIt = fateSlots.find(stmt->name);
+    if (fatedIt != fateSlots.end()) {
+        emitFateRecovery(fatedIt->second, alloca);
+    }
+    
     return value;
 }
 
@@ -2277,6 +2420,10 @@ llvm::Value* LLVMCodegen::codegen(SleepStatement* stmt) {
 
 // One-shot runtime seed for rand(). The seed mixes second-resolution time with
 // the millisecond tick counter so reruns within the same second still differ.
+// The seed is emitted into the CURRENT function's entry block (not the current
+// insert point): if the first rand() user sits inside a loop, the seed must run
+// once per function call, not once per loop iteration (otherwise every iteration
+// re-seeds rand() with the same constant and the "random" pick never varies).
 void LLVMCodegen::emitRandomCallSeedOnce() {
     if (hasEllipsisRandSeeded) return;
     llvm::Function* timeFunc = module->getFunction("time");
@@ -2297,11 +2444,192 @@ void LLVMCodegen::emitRandomCallSeedOnce() {
             llvm::FunctionType::get(builder.getVoidTy(), {builder.getInt32Ty()}, false),
             llvm::Function::ExternalLinkage, "srand", module);
     }
+    llvm::Function* seedFunc = builder.GetInsertBlock()->getParent();
+    llvm::IRBuilderBase::InsertPoint savedIP = builder.saveIP();
+    llvm::Instruction* entryTerm = seedFunc->getEntryBlock().getTerminator();
+    if (entryTerm) {
+        builder.SetInsertPoint(entryTerm);
+    } else {
+        builder.SetInsertPoint(&seedFunc->getEntryBlock());
+    }
     llvm::Value* now   = builder.CreateCall(timeFunc, {llvm::Constant::getNullValue(builder.getPtrTy())});
     llvm::Value* ticks = builder.CreateCall(tickFunc, {});
     llvm::Value* seed  = builder.CreateXor(builder.CreateTrunc(now, builder.getInt32Ty()), ticks);
     builder.CreateCall(srandFunc, {seed});
+    builder.restoreIP(savedIP);
     hasEllipsisRandSeeded = true;
+}
+
+// EXP `drift`: draw one random argument value for a parameter of `type`.
+// INT/LONG use lo + rand()%(hi-lo+1) (mirrors the rnd(min,max) builtin);
+// FLOAT uses lo + (rand()/32768.0)*(hi-lo); BOOL uses the low bit of rand().
+// The value is emitted directly in the callee's LLVM parameter type.
+llvm::Value* LLVMCodegen::emitDriftRandomValue(VarType type, llvm::Type* paramType,
+                                               const Function::DriftConfig& cfg, int index) {
+    (void)index;
+    llvm::Function* randFunc = getRandFunction();
+    llvm::Value* randVal = builder.CreateCall(randFunc, {}, "drift.rand");
+
+    if (type == VarType::INT || type == VarType::LONG) {
+        long long lo = cfg.hasRange ? cfg.rangeLo : 0;
+        long long hi = cfg.hasRange ? cfg.rangeHi : 100;
+        unsigned long long width = (unsigned long long)(hi) - (unsigned long long)(lo) + 1ULL;
+        if (width == 0ULL || width > (unsigned long long)INT64_MAX) {
+            addError("[drift] int range width is too large; use smaller bounds");
+            return nullptr;
+        }
+        llvm::Value* randWide = builder.CreateZExt(randVal, builder.getInt64Ty(), "drift.rand64");
+        llvm::Value* widthVal = builder.getInt64(static_cast<int64_t>(width));
+        llvm::Value* off = builder.CreateSRem(randWide, widthVal, "drift.off");
+        llvm::Value* res = builder.CreateAdd(off, builder.getInt64(lo), "drift.int");
+        if (paramType->isIntegerTy(32)) {
+            return builder.CreateTrunc(res, paramType, "drift.int32");
+        }
+        return res;
+    }
+
+    if (type == VarType::FLOAT) {
+        double loF = cfg.hasRange ? cfg.rangeLoF : 0.0;
+        double hiF = cfg.hasRange ? cfg.rangeHiF : 1.0;
+        llvm::Value* rf = builder.CreateUIToFP(randVal, builder.getDoubleTy(), "drift.randf");
+        llvm::Value* ratio = builder.CreateFDiv(rf, llvm::ConstantFP::get(builder.getDoubleTy(), 32768.0), "drift.ratio");
+        llvm::Value* span = llvm::ConstantFP::get(builder.getDoubleTy(), hiF - loF);
+        llvm::Value* scaled = builder.CreateFMul(ratio, span, "drift.scaled");
+        llvm::Value* base = llvm::ConstantFP::get(builder.getDoubleTy(), loF);
+        llvm::Value* resD = builder.CreateFAdd(scaled, base, "drift.f");
+        if (paramType->isFloatTy()) {
+            return builder.CreateFPTrunc(resD, builder.getFloatTy(), "drift.f32");
+        }
+        if (paramType->isDoubleTy()) {
+            return resD;
+        }
+        addError("[drift] float parameter has an unsupported LLVM type");
+        return nullptr;
+    }
+
+    if (type == VarType::BOOL) {
+        llvm::Value* bit = builder.CreateAnd(randVal, builder.getInt32(1), "drift.bit");
+        llvm::Value* b = builder.CreateICmpNE(bit, builder.getInt32(0), "drift.bool");
+        if (paramType->isIntegerTy(32)) return builder.CreateZExt(b, paramType, "drift.bool32");
+        if (paramType->isIntegerTy(64)) return builder.CreateZExt(b, paramType, "drift.bool64");
+        if (paramType->isIntegerTy(1)) return b;
+        return b;
+    }
+
+    addError("[drift] cannot randomize parameter of unsupported type");
+    return nullptr;
+}
+
+// EXP `drift`: emit a guarded randomized self call. The depth counter is a
+// module-level i32 global; each randomized self call increments it, and the
+// store-path unwinds it back to the saved value on both outcomes. When the
+// chain exceeds the limit the call is skipped and evaluates to 0.
+llvm::Value* LLVMCodegen::codegenDriftedSelfCall(llvm::Function* callee, CallExpression* expr,
+                                                 const std::string& funcName) {
+    auto dcIt = driftConfigs.find(funcName);
+    if (dcIt == driftConfigs.end()) return nullptr;
+    Function::DriftConfig& cfg = dcIt->second;
+
+    constexpr long long kDefaultDriftDepth = 1000;
+    long long depthMax = (cfg.depthLimit > 0) ? cfg.depthLimit : kDefaultDriftDepth;
+
+    llvm::FunctionType* ft = callee->getFunctionType();
+    if (expr->args.size() != ft->getNumParams()) {
+        addError("[drift] recursive call to '" + funcName + "' has " +
+                 std::to_string(expr->args.size()) + " argument(s) but the function takes " +
+                 std::to_string(ft->getNumParams()));
+        return nullptr;
+    }
+
+    // Parameter types come from the written argument expressions: for a self
+    // call the variables are the function's own parameters (via localTypes),
+    // and literals report their exact type. STRING / UNKNOWN are rejected.
+    std::vector<VarType> argTypes;
+    for (auto& arg : expr->args) {
+        argTypes.push_back(getExpressionType(arg.get()));
+    }
+    for (size_t i = 0; i < argTypes.size(); i++) {
+        if (argTypes[i] == VarType::STRING) {
+            addError("[drift] cannot randomize parameter #" + std::to_string(i) +
+                     " of '" + funcName + "': its type is string");
+            return nullptr;
+        }
+        if (argTypes[i] == VarType::UNKNOWN) {
+            addError("[drift] cannot infer the type/range of parameter #" + std::to_string(i) +
+                     " of '" + funcName + "'; pass it concrete literal/int/float arguments "
+                     "or call the function with typed arguments");
+            return nullptr;
+        }
+    }
+    if (cfg.hasRange && cfg.rangeLo > cfg.rangeHi) {
+        addError("[drift] range lower bound is greater than upper bound");
+        return nullptr;
+    }
+
+    llvm::Function* currentFn = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock* callBB = llvm::BasicBlock::Create(context, "drift.call", currentFn);
+    llvm::BasicBlock* capBB = llvm::BasicBlock::Create(context, "drift.capped", currentFn);
+    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context, "drift.merge", currentFn);
+
+    if (!driftDepthGlobal) {
+        driftDepthGlobal = new llvm::GlobalVariable(
+            *module, builder.getInt32Ty(), false,
+            llvm::GlobalValue::LinkageTypes::InternalLinkage,
+            builder.getInt32(0), "__xfawa_drift_depth");
+    }
+
+    llvm::Value* prev = builder.CreateLoad(builder.getInt32Ty(), driftDepthGlobal, "drift.prev");
+    llvm::Value* cur = builder.CreateAdd(prev, builder.getInt32(1), "drift.depth");
+    builder.CreateStore(cur, driftDepthGlobal);
+    llvm::Value* over = builder.CreateICmpSGT(cur, builder.getInt32(static_cast<int>(depthMax)), "drift.over");
+    builder.CreateCondBr(over, capBB, callBB);
+
+    builder.SetInsertPoint(callBB);
+    std::vector<llvm::Value*> args;
+    for (size_t i = 0; i < expr->args.size(); i++) {
+        llvm::Value* rv = emitDriftRandomValue(argTypes[i], ft->getParamType(i), cfg, static_cast<int>(i));
+        if (!rv) return nullptr;
+        args.push_back(rv);
+    }
+    llvm::CallInst* callInst = builder.CreateCall(ft, callee, args);
+    bool floatRet = false, boolRet = false;
+    llvm::Value* norm = callInst;
+    auto retTypeIt = funcReturnTypes.find(funcName);
+    if (retTypeIt == funcReturnTypes.end()) {
+        std::string funcBare = funcName;
+        size_t colonPos = funcBare.find(':');
+        if (colonPos != std::string::npos) funcBare = funcBare.substr(colonPos + 1);
+        auto it = funcReturnTypes.find(funcBare);
+        if (it != funcReturnTypes.end()) retTypeIt = it;
+    }
+    if (retTypeIt != funcReturnTypes.end() && retTypeIt->second == VarType::FLOAT) {
+        llvm::Value* bits = builder.CreateBitCast(callInst, builder.getDoubleTy(), "drift.float.bits");
+        norm = builder.CreateFPTrunc(bits, builder.getFloatTy(), "drift.float.ret");
+        floatRet = true;
+    } else if (retTypeIt != funcReturnTypes.end() && retTypeIt->second == VarType::BOOL) {
+        norm = builder.CreateTrunc(callInst, builder.getInt1Ty(), "drift.bool.ret");
+        boolRet = true;
+    }
+    builder.CreateStore(prev, driftDepthGlobal); // unwind depth after the call
+    builder.CreateBr(mergeBB);
+
+    builder.SetInsertPoint(capBB);
+    llvm::Value* capVal;
+    if (floatRet) {
+        capVal = llvm::ConstantFP::get(builder.getFloatTy(), 0.0);
+    } else if (boolRet) {
+        capVal = llvm::ConstantInt::get(builder.getInt1Ty(), 0);
+    } else {
+        capVal = llvm::ConstantInt::get(builder.getInt64Ty(), 0);
+    }
+    builder.CreateStore(prev, driftDepthGlobal);
+    builder.CreateBr(mergeBB);
+
+    builder.SetInsertPoint(mergeBB);
+    llvm::PHINode* phi = builder.CreatePHI(norm->getType(), 2, "drift.result");
+    phi->addIncoming(norm, callBB);
+    phi->addIncoming(capVal, capBB);
+    return phi;
 }
 
 // Fill a per-candidate [64 x i8] buffer with random printable ASCII and a '\0'
@@ -2634,15 +2962,596 @@ bool LLVMCodegen::bodyIsDangerous(const Function* func) const {
     return Walker::stmt(func->body.get());
 }
 
-// EXP `wrath` / `paradox`: these are normally rewritten into plain assignments
-// (and paradox reads) by an AST pass before codegen runs. If one ever reaches
-// codegen un-rewritten, treat it as a no-op rather than failing.
+// EXP `wrath` / `paradox` / `deja`: these are normally rewritten into plain
+// assignments (and paradox reads) by an AST pass before codegen runs. If one
+// ever reaches codegen un-rewritten, treat it as a no-op rather than failing.
 llvm::Value* LLVMCodegen::codegen(WrathStatement* stmt) {
     return nullptr;
 }
 
 llvm::Value* LLVMCodegen::codegen(ParadoxStatement* stmt) {
     return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(DejaStatement* stmt) {
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// EXP `pinocchio`: a self-referential proposition (Pinocchio paradox).
+//
+// `pinocchio (P) { THEN } else { ELSE } limit: N` treats P as a proposition
+// whose truth is judged on the CURRENT values of the variables it reads (the
+// "self-referential state"). Each round:
+//   1. evaluate P  -> truth
+//   2. run THEN when P is true, ELSE when P is false (either may mutate state)
+//   3. if no variable P reads changed -> P is self-consistent -> STABLE,
+//      and the final truth of P is the verdict (stable true / stable false).
+// The loop terminates before `limit` rounds (default 1000) elapse whenever
+// the state settles (stable) or when P's truth ALTERNATES for two full
+// cycles (T,F,T,F -> oscillation, the paradox state). Running out of rounds
+// means "no stable solution". Each outcome prints an explicit runtime result.
+//
+// The state tracked by the stability check is exactly the set of variables P
+// reads; writing other variables inside THEN/ELSE does not itself keep a
+// proposition "unstable" (P cannot observe them, so P is settled). Only
+// scalar numeric/bool variables are valid pinocchio state; strings and arrays
+// are rejected at compile time.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Collect every variable name referenced by a pinocchio proposition. These
+// names define the self-referential state the stability check must observe.
+void collectPinocchioVars(const xfawa::Expression* e, std::vector<std::string>& out) {
+    if (!e) return;
+    switch (e->getNodeType()) {
+        case xfawa::NodeType::VARIABLE_EXPRESSION:
+            out.push_back(static_cast<const xfawa::VariableExpression*>(e)->name);
+            break;
+        case xfawa::NodeType::BINARY_OP: {
+            const auto* b = static_cast<const xfawa::BinaryOp*>(e);
+            collectPinocchioVars(b->left.get(), out);
+            collectPinocchioVars(b->right.get(), out);
+            break;
+        }
+        case xfawa::NodeType::UNARY_OP: {
+            const auto* u = static_cast<const xfawa::UnaryOp*>(e);
+            collectPinocchioVars(u->expr.get(), out);
+            break;
+        }
+        case xfawa::NodeType::CALL_EXPRESSION: {
+            const auto* c = static_cast<const xfawa::CallExpression*>(e);
+            for (const auto& a : c->args) collectPinocchioVars(a.get(), out);
+            break;
+        }
+        case xfawa::NodeType::ARRAY_RANGE_EXPRESSION: {
+            const auto* r = static_cast<const xfawa::ArrayRangeExpression*>(e);
+            collectPinocchioVars(r->array.get(), out);
+            collectPinocchioVars(r->start.get(), out);
+            collectPinocchioVars(r->end.get(), out);
+            break;
+        }
+        case xfawa::NodeType::ARRAY_INDEX_EXPRESSION: {
+            const auto* a = static_cast<const xfawa::ArrayIndexExpression*>(e);
+            collectPinocchioVars(a->array.get(), out);
+            collectPinocchioVars(a->index.get(), out);
+            break;
+        }
+        case xfawa::NodeType::ARRAY_LITERAL: {
+            const auto* al = static_cast<const xfawa::ArrayLiteral*>(e);
+            if (al->isRange) {
+                collectPinocchioVars(al->rangeStart.get(), out);
+                collectPinocchioVars(al->rangeEnd.get(), out);
+            } else {
+                for (const auto& el : al->elements) collectPinocchioVars(el.get(), out);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+} // namespace
+
+llvm::Value* LLVMCodegen::codegen(PinocchioStatement* stmt) {
+    // 1. The variables P reads ARE the self-referential state. Validate them:
+    //    only scalar numeric/bool storage is comparable, so strings/arrays are
+    //    illegal proposition state (compile error, not a silent misbehaviour).
+    std::vector<std::string> refVars;
+    collectPinocchioVars(stmt->condition.get(), refVars);
+    std::set<std::string> refSet(refVars.begin(), refVars.end());
+    for (const auto& v : refSet) {
+        auto tIt = localTypes.find(v);
+        if (tIt != localTypes.end()) {
+            VarType vt = tIt->second;
+            if (vt == VarType::STRING ||
+                vt == VarType::ARRAY_INT || vt == VarType::ARRAY_LONG ||
+                vt == VarType::ARRAY_FLOAT || vt == VarType::ARRAY_BOOL ||
+                vt == VarType::ARRAY_STRING) {
+                addError("[pinocchio] proposition may only reference numeric/bool variables (illegal state type: '" + v + "')");
+                return nullptr;
+            }
+        }
+    }
+
+    llvm::Function* func = builder.GetInsertBlock()->getParent();
+
+    // 2. Loop bookkeeping: iteration counter + one-round truth history + the
+    //    alternation count used to detect oscillation (two full alternating
+    //    cycles).
+    llvm::AllocaInst* iterAlloca = createAllocaInEntry(builder.getInt32Ty(), "pin.iter");
+    llvm::AllocaInst* prevTruthAlloca = createAllocaInEntry(builder.getInt32Ty(), "pin.prevtruth");
+    llvm::AllocaInst* altCountAlloca = createAllocaInEntry(builder.getInt32Ty(), "pin.altcount");
+    llvm::Value* minusOne = createConstInt(context, builder.getInt32Ty(), -1);
+    builder.CreateStore(createConstInt(context, builder.getInt32Ty(), 0), iterAlloca);
+    builder.CreateStore(minusOne, prevTruthAlloca);
+    builder.CreateStore(createConstInt(context, builder.getInt32Ty(), 0), altCountAlloca);
+
+    // 3. Snapshot storage for each tracked variable (created in the entry
+    //    block so the stores survive across the generated loop).
+    std::map<std::string, llvm::AllocaInst*> snapAllocas;
+    for (const auto& v : refSet) {
+        auto lIt = locals.find(v);
+        if (lIt == locals.end()) continue; // globals/functions aren't tracked
+        llvm::AllocaInst* snap = createAllocaInEntry(lIt->second->getAllocatedType(), "pin.snap." + v);
+        snapAllocas[v] = snap;
+    }
+
+    // The current round's proposition verdict, shared across the loop blocks.
+    llvm::Value* pinTruth = nullptr;
+    llvm::Value* pinTruthI32 = nullptr;
+
+    // 4. Build the loop CFG.
+    llvm::BasicBlock* LoopHeadBB = llvm::BasicBlock::Create(context, "pinhead", func);
+    llvm::BasicBlock* BodyBB = llvm::BasicBlock::Create(context, "pinbody");
+    llvm::BasicBlock* ThenBB = llvm::BasicBlock::Create(context, "pinthen");
+    llvm::BasicBlock* ElseBB = llvm::BasicBlock::Create(context, "pinelse");
+    llvm::BasicBlock* MergeBB = llvm::BasicBlock::Create(context, "pinmerge");
+    llvm::BasicBlock* StableBB = llvm::BasicBlock::Create(context, "pinstable");
+    llvm::BasicBlock* ChangeCheckBB = llvm::BasicBlock::Create(context, "pincheck");
+    llvm::BasicBlock* OscillateBB = llvm::BasicBlock::Create(context, "pinoscillate");
+    llvm::BasicBlock* TimeoutBB = llvm::BasicBlock::Create(context, "pintimeout", func);
+    llvm::BasicBlock* DoneBB = llvm::BasicBlock::Create(context, "pindone", func);
+
+    // A `do.*` inside either effect block is hoisted (mirrors while/if).
+    hoistDoFromBranch(stmt->thenBlock.get());
+    if (stmt->elseBlock) hoistDoFromBranch(stmt->elseBlock.get());
+
+    builder.CreateBr(LoopHeadBB);
+    builder.SetInsertPoint(LoopHeadBB);
+    {
+        llvm::Value* iter = builder.CreateLoad(builder.getInt32Ty(), iterAlloca, "pin_iter");
+        llvm::Value* inRange = builder.CreateICmpSLT(
+            iter, createConstInt(context, builder.getInt32Ty(), stmt->limit), "pin_inrange");
+        builder.CreateCondBr(inRange, BodyBB, TimeoutBB);
+    }
+
+    func->insert(func->end(), BodyBB);
+    builder.SetInsertPoint(BodyBB);
+    {
+        // Snapshot the current self-referential state.
+        for (const auto& kv : snapAllocas) {
+            auto lIt = locals.find(kv.first);
+            if (lIt == locals.end()) continue;
+            llvm::Value* cur = builder.CreateLoad(kv.second->getAllocatedType(), lIt->second, "pin_snapval");
+            builder.CreateStore(cur, kv.second);
+        }
+        llvm::Value* truthRaw = codegen(stmt->condition.get());
+        if (!truthRaw) return nullptr;
+        pinTruth = truthRaw;
+        if (pinTruth->getType()->isIntegerTy(1)) {
+            // already a bool
+        } else if (auto* it = llvm::dyn_cast<llvm::IntegerType>(pinTruth->getType())) {
+            pinTruth = builder.CreateICmpNE(pinTruth, createConstInt(context, it, 0), "pin_truth");
+        } else if (pinTruth->getType()->isFloatTy() || pinTruth->getType()->isDoubleTy()) {
+            pinTruth = builder.CreateFCmpONE(pinTruth, llvm::ConstantFP::get(pinTruth->getType(), 0.0), "pin_truth");
+        } else {
+            addError("[pinocchio] proposition must be a bool/numeric expression (not a string or an array)");
+            return nullptr;
+        }
+        pinTruthI32 = builder.CreateZExt(pinTruth, builder.getInt32Ty(), "pin_truthi32");
+        builder.CreateCondBr(pinTruth, ThenBB, ElseBB);
+    }
+
+    func->insert(func->end(), ThenBB);
+    builder.SetInsertPoint(ThenBB);
+    {
+        llvm::BasicBlock* prevLoopEnd = loopEndBB;
+        loopEndBB = DoneBB;
+        codegen(stmt->thenBlock.get());
+        if (!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(MergeBB);
+        loopEndBB = prevLoopEnd;
+    }
+
+    func->insert(func->end(), ElseBB);
+    builder.SetInsertPoint(ElseBB);
+    {
+        llvm::BasicBlock* prevLoopEnd = loopEndBB;
+        loopEndBB = DoneBB;
+        if (stmt->elseBlock) codegen(stmt->elseBlock.get());
+        if (!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(MergeBB);
+        loopEndBB = prevLoopEnd;
+    }
+
+    func->insert(func->end(), MergeBB);
+    builder.SetInsertPoint(MergeBB);
+    {
+        // Did any variable P reads change this round? Untouched -> stable.
+        llvm::Value* changed = builder.getFalse();
+        for (const auto& kv : snapAllocas) {
+            auto lIt = locals.find(kv.first);
+            if (lIt == locals.end()) continue;
+            llvm::Type* vty = kv.second->getAllocatedType();
+            llvm::Value* cur = builder.CreateLoad(vty, lIt->second, "pin_cur");
+            llvm::Value* old = builder.CreateLoad(vty, kv.second, "pin_old");
+            llvm::Value* eq;
+            if (vty->isFloatingPointTy()) {
+                eq = builder.CreateFCmpOEQ(cur, old, "pin_eq");
+            } else {
+                eq = builder.CreateICmpEQ(cur, old, "pin_eq");
+            }
+            changed = builder.CreateOr(changed, builder.CreateNot(eq, "pin_neq"), "pin_changed");
+        }
+        builder.CreateCondBr(changed, ChangeCheckBB, StableBB);
+    }
+
+    func->insert(func->end(), StableBB);
+    builder.SetInsertPoint(StableBB);
+    {
+        llvm::Function* printfFunc = module->getFunction("printf");
+        if (printfFunc) {
+            llvm::Value* fmtTrue = builder.CreateGlobalStringPtr("[pinocchio] stable true\n", "pin_stable_true");
+            llvm::Value* fmtFalse = builder.CreateGlobalStringPtr("[pinocchio] stable false\n", "pin_stable_false");
+            llvm::Value* fmt = builder.CreateSelect(pinTruth, fmtTrue, fmtFalse, "pin_stable_fmt");
+            builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {fmt}, "pin_printf");
+        }
+    }
+    builder.CreateBr(DoneBB);
+
+    func->insert(func->end(), ChangeCheckBB);
+    builder.SetInsertPoint(ChangeCheckBB);
+    {
+        // Advance iteration counter.
+        llvm::Value* iter = builder.CreateLoad(builder.getInt32Ty(), iterAlloca, "pin_iter2");
+        llvm::Value* nextIter = builder.CreateAdd(iter, createConstInt(context, builder.getInt32Ty(), 1), "pin_nextiter");
+        builder.CreateStore(nextIter, iterAlloca);
+
+        // Update the one-round truth history and the alternation counter.
+        llvm::Value* prev = builder.CreateLoad(builder.getInt32Ty(), prevTruthAlloca, "pin_prev");
+        llvm::Value* flip = builder.CreateICmpNE(pinTruthI32, prev, "pin_flip");
+        llvm::Value* oldAlt = builder.CreateLoad(builder.getInt32Ty(), altCountAlloca, "pin_altc");
+        llvm::Value* nextAlt = builder.CreateSelect(flip,
+            builder.CreateAdd(oldAlt, createConstInt(context, builder.getInt32Ty(), 1), "pin_altinc"),
+            createConstInt(context, builder.getInt32Ty(), 0), "pin_altnext");
+        // The first round's "flip from -1 sentinel" must not start counting.
+        llvm::Value* fakeFlip = builder.CreateICmpEQ(prev, minusOne, "pin_fake");
+        nextAlt = builder.CreateSelect(fakeFlip, createConstInt(context, builder.getInt32Ty(), 0), nextAlt, "pin_altfix");
+        builder.CreateStore(nextAlt, altCountAlloca);
+        builder.CreateStore(pinTruthI32, prevTruthAlloca);
+
+        llvm::Value* osc = builder.CreateICmpSGE(nextAlt, createConstInt(context, builder.getInt32Ty(), 3), "pin_osc");
+        builder.CreateCondBr(osc, OscillateBB, LoopHeadBB);
+    }
+
+    func->insert(func->end(), OscillateBB);
+    builder.SetInsertPoint(OscillateBB);
+    {
+        llvm::Function* printfFunc = module->getFunction("printf");
+        if (printfFunc) {
+            llvm::Value* fmt = builder.CreateGlobalStringPtr("[pinocchio] oscillation\n", "pin_osc_fmt");
+            builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {fmt}, "pin_printf");
+        }
+    }
+    builder.CreateBr(DoneBB);
+
+    builder.SetInsertPoint(TimeoutBB);
+    {
+        llvm::Function* printfFunc = module->getFunction("printf");
+        if (printfFunc) {
+            std::string msg = "[pinocchio] no stable solution (max iterations " + std::to_string(stmt->limit) + ")\n";
+            llvm::Value* fmt = builder.CreateGlobalStringPtr(msg, "pin_timeout_fmt");
+            builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {fmt}, "pin_printf");
+        }
+    }
+    builder.CreateBr(DoneBB);
+
+    builder.SetInsertPoint(DoneBB);
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// EXP `fate`: destiny value + imperfect, history-limitied recovery.
+//
+// `fate x = 100` births x (if needed), sets x to 100 and records (destiny=100,
+// floor=unset) in entry-block allocas. Every later `x = v` assignment runs a
+// recovery right after the store: it pulls x back toward the destiny value by
+// halving the gap (never jumps straight to it) and records each result as the
+// new persistent floor if it is the highest recovery result so far. Later
+// recoveries can never go below that floor, so rebelling once forever prevents
+// a clean restore — "you can resist fate, and your traces keep it imperfect".
+// Only integer variables take part; non-integer destiny falls back to a plain
+// assignment (with a warning) so normal semantics are never broken.
+// ---------------------------------------------------------------------------
+
+llvm::AllocaInst* LLVMCodegen::createAllocaInEntry(llvm::Type* type, const std::string& name) {
+    llvm::Function* func = builder.GetInsertBlock()->getParent();
+    llvm::IRBuilderBase::InsertPoint ip = builder.saveIP();
+    llvm::BasicBlock* entryBB = &func->getEntryBlock();
+    if (entryBB->empty()) {
+        builder.SetInsertPoint(entryBB);
+    } else {
+        builder.SetInsertPoint(entryBB, entryBB->getFirstInsertionPt());
+    }
+    llvm::AllocaInst* alloca = builder.CreateAlloca(type, nullptr, name.c_str());
+    builder.restoreIP(ip);
+    return alloca;
+}
+
+// Birth (or reuse) the storage for a variable from a freshly-computed value.
+llvm::AllocaInst* LLVMCodegen::birthLocalAlloca(const std::string& name, llvm::Value* value) {
+    auto it = locals.find(name);
+    if (it != locals.end()) return it->second;
+    llvm::Type* vt = value->getType();
+    VarType vtype = VarType::INT;
+    if (vt->isFloatTy()) {
+        vtype = VarType::FLOAT;
+    } else if (vt->isIntegerTy(64)) {
+        vtype = VarType::LONG;
+    } else if (vt->isIntegerTy(1)) {
+        vtype = VarType::BOOL;
+        vt = builder.getInt32Ty();
+    } else if (vt->isPointerTy()) {
+        vtype = VarType::STRING;
+    }
+    llvm::AllocaInst* alloca = createAllocaInEntry(vt, name.c_str());
+    locals[name] = alloca;
+    localTypes[name] = vtype;
+    return alloca;
+}
+
+// Store `value` into `alloca`, applying the same int width conversions used by
+// ordinary assignments (i1/i32/i64). Non-integer values are stored as-is.
+void LLVMCodegen::storeValueNormalized(llvm::Value* value, llvm::AllocaInst* alloca) {
+    llvm::Type* allocaType = alloca->getAllocatedType();
+    llvm::Value* storeVal = value;
+    if (value->getType()->isIntegerTy(1) && allocaType->isIntegerTy(32)) {
+        storeVal = builder.CreateZExt(value, allocaType, "intstore");
+    } else if (value->getType()->isIntegerTy(32) && allocaType->isIntegerTy(64)) {
+        storeVal = builder.CreateSExt(value, allocaType, "intlongstore");
+    } else if (value->getType()->isIntegerTy(64) && allocaType->isIntegerTy(32)) {
+        storeVal = builder.CreateTrunc(value, allocaType, "longintstore");
+    }
+    builder.CreateStore(storeVal, alloca);
+}
+
+// The shared i64 recovery routine (one per module). Returns the recovered value
+// and updates *floor to the persistent max recovery result.
+llvm::Function* LLVMCodegen::getFateRecoverFunction() {
+    if (fateRecoverFn) return fateRecoverFn;
+    if (llvm::Function* existing = module->getFunction("__xfawa_fate_recover")) {
+        fateRecoverFn = existing;
+        return existing;
+    }
+    llvm::FunctionType* ft = llvm::FunctionType::get(
+        builder.getInt64Ty(),
+        {builder.getInt64Ty(), builder.getInt64Ty(), llvm::PointerType::get(context, 0)},
+        false);
+    fateRecoverFn = llvm::Function::Create(ft, llvm::Function::InternalLinkage, 0,
+                                           "__xfawa_fate_recover", module);
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(context, "entry", fateRecoverFn);
+    llvm::IRBuilderBase::InsertPoint savedIP = builder.saveIP();
+    builder.SetInsertPoint(bb);
+
+    llvm::Value* cur = fateRecoverFn->getArg(0);
+    llvm::Value* dst = fateRecoverFn->getArg(1);
+    llvm::Value* floorPtr = fateRecoverFn->getArg(2);
+
+    // Recovery: move the current value halfway toward the destiny value.
+    llvm::Value* diff = builder.CreateSub(dst, cur, "fate.diff");
+    llvm::Value* half = builder.CreateSDiv(diff, builder.getInt64(2), "fate.half");
+    llvm::Value* mid0 = builder.CreateAdd(cur, half, "fate.mid0");
+    llvm::Value* fl = builder.CreateLoad(builder.getInt64Ty(), floorPtr, "fate.floor");
+    // If that result would fall below the floor, instead pull from the floor
+    // toward the destiny value (still never below the floor).
+    llvm::Value* below = builder.CreateICmpSLT(mid0, fl, "fate.below");
+    llvm::Value* fdiff = builder.CreateSub(dst, fl, "fate.fdiff");
+    llvm::Value* fhalf = builder.CreateSDiv(fdiff, builder.getInt64(2), "fate.fhalf");
+    llvm::Value* mid1a = builder.CreateAdd(fl, fhalf, "fate.mid1a");
+    llvm::Value* below2 = builder.CreateICmpSLT(mid1a, fl, "fate.below2");
+    llvm::Value* mid1 = builder.CreateSelect(below2, fl, mid1a, "fate.mid1");
+    llvm::Value* mid = builder.CreateSelect(below, mid1, mid0, "fate.mid");
+    // On-target values are not deviations: keep them, never touch the floor.
+    llvm::Value* same = builder.CreateICmpEQ(cur, dst, "fate.same");
+    llvm::Value* result = builder.CreateSelect(same, cur, mid, "fate.result");
+    // A recovery result that is the highest so far becomes the new floor.
+    llvm::Value* grow = builder.CreateICmpSGT(result, fl, "fate.grow");
+    llvm::Value* newFloor = builder.CreateSelect(grow, result, fl, "fate.newfloor");
+    llvm::Value* keepFloor = builder.CreateSelect(same, fl, newFloor, "fate.floorkeep");
+    builder.CreateStore(keepFloor, floorPtr);
+    builder.CreateRet(result);
+
+    builder.restoreIP(savedIP);
+    return fateRecoverFn;
+}
+
+// After an assignment to a fated variable, pull the stored value back toward
+// the destiny value (imperfect, floor-limited).
+void LLVMCodegen::emitFateRecovery(const FateSlot& slot, llvm::AllocaInst* varAlloca) {
+    llvm::Type* at = varAlloca->getAllocatedType();
+    if (!at->isIntegerTy()) return;
+    llvm::Value* cur = builder.CreateLoad(at, varAlloca, "fate.cur");
+    if (at->isIntegerTy(32)) {
+        cur = builder.CreateSExt(cur, builder.getInt64Ty(), "fate.cur64");
+    } else if (at->isIntegerTy(1)) {
+        cur = builder.CreateZExt(cur, builder.getInt64Ty(), "fate.cur64");
+    } else {
+        // Only i64/smaller handled; larger widths are out of scope.
+        if (at->getIntegerBitWidth() > 64) return;
+    }
+    llvm::Value* dst = builder.CreateLoad(builder.getInt64Ty(), slot.destiny, "fate.destiny");
+    llvm::Value* r = builder.CreateCall(getFateRecoverFunction(),
+                                        {cur, dst, slot.floor}, "fate.rec");
+    if (at->isIntegerTy(32)) {
+        r = builder.CreateTrunc(r, builder.getInt32Ty(), "fate.rec32");
+    } else if (at->isIntegerTy(1)) {
+        r = builder.CreateICmpNE(r, builder.getInt64(0), "fate.recbool");
+    }
+    builder.CreateStore(r, varAlloca);
+}
+
+llvm::Value* LLVMCodegen::codegen(FateStatement* stmt) {
+    llvm::Value* value = codegen(stmt->value.get());
+    if (!value) return nullptr;
+
+    llvm::AllocaInst* alloca = birthLocalAlloca(stmt->name, value);
+
+    if (!value->getType()->isIntegerTy()) {
+        addWarning("[fate] " + stmt->name + " 的命运值不是整数，已退化为普通赋值（fate 恢复只作用于整数变量）");
+        storeValueNormalized(value, alloca);
+        return value;
+    }
+
+    // Store the destiny value into the variable.
+    storeValueNormalized(value, alloca);
+
+    // Initialize (or replace) the persistent fate state: destiny + floor.
+    FateSlot slot;
+    slot.destiny = createAllocaInEntry(builder.getInt64Ty(), "fate." + stmt->name + ".destiny");
+    slot.floor = createAllocaInEntry(builder.getInt64Ty(), "fate." + stmt->name + ".floor");
+
+    llvm::Value* dstVal = value;
+    if (value->getType()->isIntegerTy(32)) {
+        dstVal = builder.CreateSExt(value, builder.getInt64Ty(), "fate.dst64");
+    } else if (value->getType()->isIntegerTy(1)) {
+        dstVal = builder.CreateZExt(value, builder.getInt64Ty(), "fate.dst64");
+    }
+    if (dstVal->getType()->isIntegerTy(64)) {
+        builder.CreateStore(dstVal, slot.destiny);
+    } else {
+        builder.CreateStore(builder.CreateSExt(dstVal, builder.getInt64Ty(), "fate.dst64b"), slot.destiny);
+    }
+    // The floor starts "unset" so the first recovery result establishes it.
+    builder.CreateStore(builder.getInt64(INT64_MIN), slot.floor);
+
+    fateSlots[stmt->name] = slot;
+    return value;
+}
+
+// ---------------------------------------------------------------------------
+// EXP `envy`: jealousy directed at a better target.
+//
+// `envy a b` — variable `a` envies (嫉妒) variable `b`.  The algorithm
+// (deterministic, runtime, straight-line select, never branchy):
+//
+//   gap = target - receiver
+//   超越 (mild, gap <= self)   : receiver ← target + 1   (surpass)
+//   成为 (middling, self < gap <= 2*self): receiver ← target
+//   摧毁 (hopeless, gap > 2*self)        : target   ← self - 1
+//   不嫉妒 (self >= target)               : nothing changes
+//
+// Only same-width integer or same-width float pairs participate; any other
+// combination (bool, string, array, mixed types) is "incomparable" → no-op
+// + warning. Missing variables → warning + no-op.
+// ---------------------------------------------------------------------------
+
+llvm::Value* LLVMCodegen::codegen(EnvyStatement* stmt) {
+    llvm::Value* rDummy = llvm::ConstantInt::get(builder.getInt32Ty(), 0, true);
+
+    auto rIt = locals.find(stmt->receiver);
+    auto tIt = locals.find(stmt->target);
+    if (rIt == locals.end()) {
+        addWarning("[envy] 变量 '" + stmt->receiver + "' 未声明，嫉妒无法作用");
+        return rDummy;
+    }
+    if (tIt == locals.end()) {
+        addWarning("[envy] 变量 '" + stmt->target + "' 未声明，嫉妒无法作用");
+        return rDummy;
+    }
+
+    llvm::AllocaInst* rAlloca = rIt->second;
+    llvm::AllocaInst* tAlloca = tIt->second;
+    llvm::Type* rTy = rAlloca->getAllocatedType();
+    llvm::Type* tTy = tAlloca->getAllocatedType();
+
+    if (!rTy->isFloatingPointTy() && !rTy->isIntegerTy()) {
+        addWarning("[envy] " + stmt->receiver + " 的维度不可比较，不产生嫉妒行为");
+        return rDummy;
+    }
+    if (!tTy->isFloatingPointTy() && !tTy->isIntegerTy()) {
+        addWarning("[envy] " + stmt->target + " 的维度不可比较，不产生嫉妒行为");
+        return rDummy;
+    }
+
+    // --- integer paths (i8/i16/i32/i64) ---
+    if (rTy->isIntegerTy() && tTy->isIntegerTy()) {
+        if (rTy->getIntegerBitWidth() <= 1) {
+            addWarning("[envy] " + stmt->receiver + " 和 " + stmt->target + " 的维度不可比较（布尔没有高低之分），不产生嫉妒行为");
+            return rDummy;
+        }
+        if (rTy != tTy) {
+            addWarning("[envy] " + stmt->receiver + " 和 " + stmt->target + " 的整数宽度不同，不产生嫉妒行为");
+            return rDummy;
+        }
+        llvm::Value* self = builder.CreateLoad(rTy, rAlloca, "envy.self");
+        llvm::Value* tgt  = builder.CreateLoad(rTy, tAlloca, "envy.tgt");
+
+        llvm::Value* gap = builder.CreateSub(tgt, self, "envy.gap");
+        llvm::Value* noEnvy    = builder.CreateICmpSGE(self, tgt, "envy.noenvy");
+        llvm::Value* isSurpass = builder.CreateICmpSLE(gap, self, "envy.surpass");
+        llvm::Value* twiceSelf = builder.CreateAdd(self, self, "envy.2x");
+        llvm::Value* isDestroy = builder.CreateICmpSGT(gap, twiceSelf, "envy.destroy");
+
+        llvm::Value* surpVal = builder.CreateAdd(tgt, llvm::ConstantInt::get(rTy, 1), "envy.surp");
+        llvm::Value* destVal = builder.CreateSub(self, llvm::ConstantInt::get(rTy, 1), "envy.dest");
+
+        // receiverNew = noEnvy ? self : (destroy ? self : (surpass ? target+1 : target))
+        llvm::Value* rMid = builder.CreateSelect(isSurpass, surpVal, tgt, "envy.rmid");
+        llvm::Value* rNew = builder.CreateSelect(isDestroy, self, rMid, "envy.rnew");
+        rNew = builder.CreateSelect(noEnvy, self, rNew, "envy.rfinal");
+
+        // targetNew  = noEnvy ? target : (destroy ? self-1 : target)
+        llvm::Value* tNew = builder.CreateSelect(isDestroy, destVal, tgt, "envy.tnew");
+        tNew = builder.CreateSelect(noEnvy, tgt, tNew, "envy.tfinal");
+
+        builder.CreateStore(rNew, rAlloca);
+        builder.CreateStore(tNew, tAlloca);
+        return rNew;
+    }
+
+    // --- float paths ---
+    if (rTy->isFloatingPointTy() && tTy->isFloatingPointTy()) {
+        if (rTy != tTy) {
+            addWarning("[envy] " + stmt->receiver + " 和 " + stmt->target + " 的浮点宽度不同，不产生嫉妒行为");
+            return rDummy;
+        }
+        llvm::Value* self = builder.CreateLoad(rTy, rAlloca, "envy.self");
+        llvm::Value* tgt  = builder.CreateLoad(rTy, tAlloca, "envy.tgt");
+
+        llvm::Value* gap = builder.CreateFSub(tgt, self, "envy.gap");
+        llvm::Value* noEnvy    = builder.CreateFCmpOGE(self, tgt, "envy.noenvy");
+        llvm::Value* isSurpass = builder.CreateFCmpOLE(gap, self, "envy.surpass");
+        llvm::Value* twiceSelf = builder.CreateFAdd(self, self, "envy.2x");
+        llvm::Value* isDestroy = builder.CreateFCmpOGT(gap, twiceSelf, "envy.destroy");
+
+        llvm::Value* surpVal = builder.CreateFAdd(tgt,
+            llvm::ConstantFP::get(rTy, 1.0), "envy.surp");
+        llvm::Value* destVal = builder.CreateFSub(self,
+            llvm::ConstantFP::get(rTy, 1.0), "envy.dest");
+
+        llvm::Value* rMid = builder.CreateSelect(isSurpass, surpVal, tgt, "envy.rmid");
+        llvm::Value* rNew = builder.CreateSelect(isDestroy, self, rMid, "envy.rnew");
+        rNew = builder.CreateSelect(noEnvy, self, rNew, "envy.rfinal");
+        llvm::Value* tNew = builder.CreateSelect(isDestroy, destVal, tgt, "envy.tnew");
+        tNew = builder.CreateSelect(noEnvy, tgt, tNew, "envy.tfinal");
+
+        builder.CreateStore(rNew, rAlloca);
+        builder.CreateStore(tNew, tAlloca);
+        return rNew;
+    }
+
+    // --- incomparable types (int vs float / bool vs anything / string / array) ---
+    addWarning("[envy] " + stmt->receiver + " 和 " + stmt->target + " 的维度不可比较，不产生嫉妒行为");
+    return rDummy;
 }
 
 llvm::Value* LLVMCodegen::codegen(TryExpectStatement* stmt) {
@@ -3305,9 +4214,16 @@ void LLVMCodegen::collectCallArgTypes(Expression* expr) {
     if (auto* callExpr = dynamic_cast<CallExpression*>(expr)) {
         std::string funcName = callExpr->ns.empty() ? callExpr->name : (callExpr->ns + ":" + callExpr->name);
         std::vector<VarType> argTypes;
-        for (auto& arg : callExpr->args) {
-            argTypes.push_back(getExpressionType(arg.get()));
-            collectCallArgTypes(arg.get());
+        for (size_t i = 0; i < callExpr->args.size(); i++) {
+            VarType t = getExpressionType(callExpr->args[i].get());
+            argTypes.push_back(t);
+            // EXP `drift`: accumulate every call site's per-param type so a
+            // drift function can infer stable param types regardless of the
+            // textual order of the call sites (last-write-wins is too fragile).
+            auto& seen = driftSeenParamTypes[funcName];
+            if (seen.size() <= i) seen.resize(i + 1);
+            seen[i].insert(t);
+            collectCallArgTypes(callExpr->args[i].get());
         }
         callArgTypes[funcName] = argTypes;
     } else if (auto* binOp = dynamic_cast<BinaryOp*>(expr)) {
@@ -3421,6 +4337,42 @@ void LLVMCodegen::collectCallArgTypes(Program* program) {
             }
         }
     }
+
+    // Third pass: EXP `drift` — derive stable per-parameter types for drift
+    // functions from (a) body inference and (b) the union of literal types
+    // seen at every call site, then upgrade UNKNOWN entries in callArgTypes so
+    // the LLVM signature, the param allocas and the randomized self calls all
+    // agree. A parameter with no concrete evidence stays UNKNOWN and is
+    // rejected at compile time the first time a randomized self call needs it.
+    for (auto& mod : program->modules) {
+        for (auto& func : mod->functions) {
+            if (!func->drift.enabled || !func->body) continue;
+            bool isMain = (func->name == "main");
+            std::string funcName = isMain ? func->name : (func->ns.empty() ? func->name : (func->ns + ":" + func->name));
+
+            auto seenIt = driftSeenParamTypes.find(funcName);
+            auto& record = callArgTypes[funcName];
+            if (record.size() < func->params.size()) record.resize(func->params.size(), VarType::UNKNOWN);
+
+            for (size_t i = 0; i < func->params.size(); i++) {
+                VarType bodyType = inferParamTypeFromBody(func->body.get(), func->params[i]->name);
+
+                VarType seenType = VarType::UNKNOWN;
+                int nonUnknown = 0;
+                if (seenIt != driftSeenParamTypes.end() && i < seenIt->second.size()) {
+                    for (VarType s : seenIt->second[i]) {
+                        if (s != VarType::UNKNOWN) { seenType = s; nonUnknown++; }
+                    }
+                }
+
+                VarType derived = (bodyType != VarType::UNKNOWN) ? bodyType
+                                : (nonUnknown == 1 ? seenType : VarType::UNKNOWN);
+                if (record[i] == VarType::UNKNOWN && derived != VarType::UNKNOWN) {
+                    record[i] = derived;
+                }
+            }
+        }
+    }
 }
 
 bool LLVMCodegen::codegenProgram(Program* program) {
@@ -3453,6 +4405,13 @@ bool LLVMCodegen::codegenProgram(Program* program) {
             }
             
             auto argTypesIt = callArgTypes.find(funcName);
+            if (argTypesIt == callArgTypes.end()) {
+                std::string funcBare = funcName;
+                size_t colonPos = funcBare.find(':');
+                if (colonPos != std::string::npos) funcBare = funcBare.substr(colonPos + 1);
+                auto it = callArgTypes.find(funcBare);
+                if (it != callArgTypes.end()) argTypesIt = it;
+            }
             for (size_t i = 0; i < func->params.size(); i++) {
                 VarType paramType = VarType::UNKNOWN;
                 if (argTypesIt != callArgTypes.end() && i < argTypesIt->second.size()) {
@@ -3532,11 +4491,14 @@ bool LLVMCodegen::codegen(Function* func) {
     auto savedLocals = locals;
     auto savedLocalTypes = localTypes;
     auto savedArrayLengths = arrayLengths;
+    auto savedFateSlots = fateSlots; // EXP `fate`
+    std::string savedCurrentFunc = currentFuncName; // EXP `drift`: restore on exit
     llvm::BasicBlock* savedInsertBlock = builder.GetInsertBlock();
     llvm::Function* savedInsertFunction = savedInsertBlock ? savedInsertBlock->getParent() : nullptr;
     
     locals.clear();
     localTypes.clear();
+    fateSlots.clear(); // EXP `fate`: per-function destiny/floor state
     
     bool isMain = (func->name == "main");
     
@@ -3553,11 +4515,29 @@ bool LLVMCodegen::codegen(Function* func) {
     } else {
         funcName = func->name;
     }
-    
+
+    currentFuncName = funcName; // EXP `drift`: used to detect self calls
+    if (func->drift.enabled) {
+        driftConfigs[funcName] = func->drift;
+    }
+
     llvm::Function* llvmFunc = module->getFunction(funcName);
     if (!llvmFunc) {
         std::vector<llvm::Type*> paramTypes;
+        // EXP `drift`: callArgTypes is keyed by the unqualified name (module
+        // functions use blockName for the LLVM symbol, not ns), so look up the
+        // bare name as a fallback. Without it the parameter types recorded by
+        // the pre-pass would never reach the drift randomized self calls.
         auto argTypesIt = callArgTypes.find(funcName);
+        if (argTypesIt == callArgTypes.end()) {
+            std::string funcBare = funcName;
+            size_t colonPos = funcBare.find(':');
+            if (colonPos != std::string::npos) funcBare = funcBare.substr(colonPos + 1);
+            auto it = callArgTypes.find(funcBare);
+            if (it != callArgTypes.end()) {
+                argTypesIt = it;
+            }
+        }
         
         for (size_t i = 0; i < func->params.size(); i++) {
             VarType paramType = VarType::UNKNOWN;
@@ -3586,6 +4566,13 @@ bool LLVMCodegen::codegen(Function* func) {
     if (llvmFunc->empty()) {
         llvm::BasicBlock* entryBB = llvm::BasicBlock::Create(context, "entry", llvmFunc);
         builder.SetInsertPoint(entryBB);
+
+        // EXP `drift`: random recursive self calls go through rand(); make sure
+        // main seeds the generator once at startup (drift sets usesRandomBuiltin,
+        // so main's entry block seeds before any drift function can run).
+        if (func->drift.enabled) {
+            usesRandomBuiltin = true;
+        }
         
         // Note: setvbuf removed due to Windows compatibility issues
         // Output will still work correctly with default buffering
@@ -3620,6 +4607,15 @@ bool LLVMCodegen::codegen(Function* func) {
         
         size_t i = 0;
         auto argTypesIt = callArgTypes.find(funcName);
+        if (argTypesIt == callArgTypes.end()) {
+            std::string funcBare = funcName;
+            size_t colonPos = funcBare.find(':');
+            if (colonPos != std::string::npos) funcBare = funcBare.substr(colonPos + 1);
+            auto it = callArgTypes.find(funcBare);
+            if (it != callArgTypes.end()) {
+                argTypesIt = it;
+            }
+        }
         for (auto& arg : llvmFunc->args()) {
             std::string paramName = func->params[i]->name;
             
@@ -3707,7 +4703,18 @@ bool LLVMCodegen::codegen(Function* func) {
                 }
             }
 
+            size_t errBaseline = errors.size();
+
             codegen(func->body.get());
+
+            // EXP `drift`: the body generators addError but the statement loop
+            // ignores their return value, so a drift error would otherwise be
+            // swallowed and the compile would silently "succeed". Mirror the
+            // `come` behaviour: any error raised while generating this function
+            // aborts it so codegenProgram returns false and main reports it.
+            if (errors.size() > errBaseline) {
+                return false;
+            }
 
             // EXP `come`: seal any landing block that was never wired up (the
             // come lives inside never-executed code) with a plain `ret 0` so
@@ -3754,6 +4761,8 @@ bool LLVMCodegen::codegen(Function* func) {
     locals = savedLocals;
     localTypes = savedLocalTypes;
     arrayLengths = savedArrayLengths;
+    fateSlots = savedFateSlots; // EXP `fate`
+    currentFuncName = savedCurrentFunc; // EXP `drift`
     
     if (savedInsertBlock && savedInsertFunction) {
         builder.SetInsertPoint(savedInsertBlock);
@@ -3803,6 +4812,10 @@ bool LLVMCodegen::codegenOnce(Statement* stmt) {
     if (dynamic_cast<ComeStatement*>(stmt)) { codegen(dynamic_cast<ComeStatement*>(stmt)); return true; }
     if (dynamic_cast<WrathStatement*>(stmt)) return codegen(dynamic_cast<WrathStatement*>(stmt)) != nullptr;
     if (dynamic_cast<ParadoxStatement*>(stmt)) return codegen(dynamic_cast<ParadoxStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<DejaStatement*>(stmt)) return codegen(dynamic_cast<DejaStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<PinocchioStatement*>(stmt)) return codegen(dynamic_cast<PinocchioStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<FateStatement*>(stmt)) return codegen(dynamic_cast<FateStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<EnvyStatement*>(stmt)) return codegen(dynamic_cast<EnvyStatement*>(stmt)) != nullptr;
     if (dynamic_cast<TryExpectStatement*>(stmt)) return codegen(dynamic_cast<TryExpectStatement*>(stmt)) != nullptr;
     if (dynamic_cast<SorryStatement*>(stmt)) return codegen(dynamic_cast<SorryStatement*>(stmt)) != nullptr;
     if (dynamic_cast<BlockStatement*>(stmt)) return codegen(dynamic_cast<BlockStatement*>(stmt)) != nullptr;
@@ -3894,6 +4907,7 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     auto savedLocals = locals;
     auto savedLocalTypes = localTypes;
     auto savedArrayLengths = arrayLengths;
+    auto savedFateSlots = fateSlots; // EXP `fate`
     auto savedLoopEndBB = loopEndBB;
     int savedActiveWindowId = activeWindowId;
     llvm::IRBuilderBase::InsertPoint savedInsertPoint = builder.saveIP();
@@ -3901,6 +4915,7 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     locals.clear();
     localTypes.clear();
     arrayLengths.clear();
+    fateSlots.clear(); // EXP `fate`: per-handler destiny/floor state
     loopEndBB = nullptr;
     activeWindowId = printWindowId;
     builder.SetInsertPoint(entryBB);
@@ -3922,6 +4937,7 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     locals = std::move(savedLocals);
     localTypes = std::move(savedLocalTypes);
     arrayLengths = std::move(savedArrayLengths);
+    fateSlots = std::move(savedFateSlots); // EXP `fate`
     loopEndBB = savedLoopEndBB;
     activeWindowId = savedActiveWindowId;
 
