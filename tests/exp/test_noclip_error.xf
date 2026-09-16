@@ -1,0 +1,6 @@
+#test {
+    fn main() {
+        noclip zz
+        print(1)
+    }
+}

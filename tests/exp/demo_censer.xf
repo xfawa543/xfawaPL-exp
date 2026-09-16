@@ -1,0 +1,20 @@
+#test {
+// EXP `censer[...]` 视频演示：内容熔断 —— 打印到敏感内容即终止程序
+// censer["文本"]（或 censer[数字]）登记一段"敏感内容"：
+//   之后每一条控制台打印都会和它做精确比较（完全相等才触发，子串不算）；
+//   一旦命中，这一行照常打印出来，然后程序立即以退出码 0 结束。
+// 登记的数字内容按十进制文本比对：censer[666] ↔ print(666)。
+
+    fn main() {
+        print("== 1. 登记敏感词：censer[\"bomb\"] ==")
+        censer["bomb"]
+        print("-- 登记完成，下面的打印照常 --")
+        print("hello world")
+        print("words and more")
+        print("substring bomb-in-sentence 不会触发")
+        print("== 2. 打印 bomb 的一瞬间：内容精确命中！==")
+        print("bomb")
+        print("== 3. 熔断生效：这一行永远不会执行 ==")
+        print("这段文字永远看不到")
+    }
+}

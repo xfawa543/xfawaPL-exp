@@ -1,0 +1,8 @@
+#test {
+fn main() {
+    dual t = 3
+    val = 2.5
+    dual t = val
+    print(t)
+}
+}

@@ -1,0 +1,13 @@
+#test {
+// EXP `disposable fn`：一次性函数。第一次调用正常执行，之后任何一次调用
+// 都报"未定义/不可用"并终止。
+
+    disposable fn one_shot() {
+        print(42)
+    }
+
+    fn main() {
+        one_shot()
+        one_shot()
+    }
+}

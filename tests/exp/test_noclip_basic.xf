@@ -1,0 +1,16 @@
+#test {
+    fn main() {
+        int a = 7
+        noclip a
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+        print(a)
+    }
+}

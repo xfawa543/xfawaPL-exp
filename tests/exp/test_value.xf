@@ -1,0 +1,33 @@
+#test {
+    fn main() {
+        // v1 保护前缀：右边数值直接参与运算
+        a = value 1 + 2
+        print(a)
+        print("v1")
+
+        // v2 value 仍可作普通变量名（非保护前缀用法）
+        value = 10
+        b = value + 1
+        print(b)
+        print("v2")
+
+        // v3 调用有返回值函数
+        c = value get5()
+        print(c)
+        print("v3")
+
+        // v4 字符串保护
+        s = value "ab" + "c"
+        print(s)
+        print("v4")
+
+        // v5 括号表达式保护
+        d = value (2 * 3)
+        print(d)
+        print("v5")
+    }
+
+    fn get5() {
+        return 5
+    }
+}

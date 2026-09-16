@@ -1,0 +1,89 @@
+#test {
+// EXP `disposable`：一次性存储与一次性函数 (docs/exp/disposable.md)
+// d1 覆盖与回退：a=1；disposable a=2 → b=a+1 = 3（读走 2 并消耗）
+// d2 消耗后未定义：disposable c=a+1（此时 a 已回退到 1 → c=2）；print(c)=2 后 c 消耗
+// d3 同名栈：4,3,2,1,1（读空逐层回退到普通值 1）
+// d4 普通赋值清层：a=1；disposable a=3；a=10 → 10,10
+// d5 次数参数：disposable[5] t=100 → 100 连续五读
+// d6 表达式连读：g=1；disposable g=2；h=g+g+g → 4（2+1+1，每次读都消耗）
+// d7 浮点：disposable val=1.5 → 1.5 后回退到 0.5
+// d8 布尔：disposable flag=true → 1 后回退到 0
+// d9 耗尽后重新建档 + 赋值清层：disposable g=9 → 9；g=5 → 5,5
+
+    fn main() {
+        // d1 shadow then fallback to base
+        first = 1
+        disposable first = 2
+        sum = first + 1
+        print(sum)
+        print("d1")
+
+        // d2 chain: after the layer above is consumed, the base remains
+        first = 1
+        disposable first = 2
+        sum = first + 1
+        disposable chain = first + 1
+        print(chain)
+        print("d2")
+
+        // d3 LIFO stack over a base value
+        stack = 1
+        disposable stack = 2
+        disposable stack = 3
+        disposable stack = 4
+        print(stack)
+        print(stack)
+        print(stack)
+        print(stack)
+        print(stack)
+        print("d3")
+
+        // d4 a normal assignment clears every layer
+        first = 1
+        disposable first = 2
+        disposable first = 3
+        first = 10
+        print(first)
+        print(first)
+        print("d4")
+
+        // d5 read-count parameter
+        disposable[5] ticket = 100
+        print(ticket)
+        print(ticket)
+        print(ticket)
+        print(ticket)
+        print(ticket)
+        print("d5")
+
+        // d6 every read inside one expression consumes a use
+        value = 1
+        disposable value = 2
+        total = value + value + value
+        print(total)
+        print("d6")
+
+        // d7 float layer
+        val = 0.5
+        disposable val = 1.5
+        print(val)
+        print(val)
+        print("d7")
+
+        // d8 bool layer
+        flag = false
+        disposable flag = true
+        print(flag)
+        print(flag)
+        print("d8")
+
+        // d9 re-push after exhaustion, then a plain assignment re-bases
+        redo = 0
+        disposable redo = 9
+        print(redo)
+        redo = 5
+        print(redo)
+        print(redo)
+        print("d9")
+    }
+}

@@ -1,0 +1,12 @@
+#test {
+    fn main() {
+        long x = 10000000000
+        noclip x
+        print(x)
+        print(x)
+        print(x)
+        print(x)
+        print(x)
+        print(x)
+    }
+}

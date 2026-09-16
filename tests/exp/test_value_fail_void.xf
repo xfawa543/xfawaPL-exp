@@ -1,0 +1,10 @@
+#test {
+    fn main() {
+        y = value hello()
+        print(y)
+    }
+
+    fn hello() {
+        print("hi")
+    }
+}

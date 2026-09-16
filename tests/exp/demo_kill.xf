@@ -1,0 +1,36 @@
+#test {
+// EXP `kill[N]` 视频演示：行级杀手 —— 让源码第 N 行从此不再执行
+// kill 按"源文件真实行号"杀人：一旦 kill[N] 被执行过，之后无论在哪
+// 个函数、哪段循环里，执行流再碰到源码第 N 行都会整行跳过、不再运行。
+
+    fn helper() {
+        print("H")              // 第 7 行：稍后被 kill[7] 杀掉
+    }
+
+    fn main() {
+        print("== 1. 动手之前：helper 每次都正常打印 ==")
+        helper()
+        helper()
+        print("== 2. kill[7]：杀掉 helper 函数体里的第 7 行 ==")
+        kill[7]
+        print("== 3. 之后每次调 helper：第 7 行整行消失 ==")
+        helper()
+        helper()
+        print("== 4. 循环体内：第一轮打印，随后杀掉自己的 print 行 ==")
+        num = 0
+        while (num < 3) {
+            num = num + 1
+            print(num)          // 第 23 行：第一轮会打印，然后被 kill
+            if (num == 1) {
+                kill[23]
+            }
+        }
+        print("== 5. 越界行号无害：kill[999999] / kill[0] 被忽略 ==")
+        kill[999999]
+        kill[0]
+        print("== 6. 特质：已被杀的行，后续任何到达都被跳过 ==")
+        helper()
+        helper()
+        print("== done ==")
+    }
+}

@@ -1,0 +1,24 @@
+#test {
+    fn main() {
+        helper()
+        print("k3a")
+        kill[19]
+        helper()
+        print("k3b")
+        helper()
+        looped()
+        kill[22]
+        looped()
+        print("k2")
+        kill[999999]
+        print("k4")
+        kill[0]
+        print("k5")
+    }
+    fn helper() {
+        print("kH")
+    }
+    fn looped() {
+        print("kL")
+    }
+}

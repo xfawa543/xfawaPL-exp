@@ -1,0 +1,50 @@
+#test {
+// EXP `value` 视频演示：保护前缀 —— 显式表明"这里有值"
+// value 加在赋值右侧表达式前，照常求值（不改变结果）；
+// 真正的作用是 void 守卫：value 后面如果是一个"没有 return 的函数调用"，
+// 编译直接报错 —— 不允许把空值往变量里塞。
+// value 同时保留为普通变量名，靠"下一记号是否可作表达式起点"来区分。
+
+    fn get5() {
+        return 5
+    }
+
+    fn say_hi() {
+        print("hi")
+    }
+
+    fn main() {
+        // 第 1 幕：保护算术 —— 结果不变
+        print("== 1. 保护算术：value 1 + 2 = 3 ==")
+        a = value 1 + 2
+        print(a)         // 3
+        print("--")
+
+        // 第 2 幕：value 仍可当普通变量名
+        print("== 2. value 也能做变量名 ==")
+        value = 10
+        b = value + 1    // value 后是运算符，这里 value 是普通变量
+        print(b)         // 11
+        print("--")
+
+        // 第 3 幕：保护函数返回值
+        print("== 3. 有返回值的函数可以被保护 ==")
+        c = value get5()
+        print(c)         // 5
+        print("--")
+
+        // 第 4 幕：保护字符串 / 括号表达式
+        print("== 4. 字符串与括号表达式 ==")
+        s = value "ab" + "c"
+        print(s)         // abc
+        d = value (2 * 3)
+        print(d)         // 6
+        print("--")
+
+        // 第 5 幕：void 守卫 —— 把空函数调用交给 value 编译会直接报错
+        print("== 5. void 守卫 ==")
+        print("say_hi 没有 return，所以下面这一句在编译期就会报错：")
+        print("   x = value say_hi()   （[value] ... does not return a value）")
+        print("value 正是为了拦住这种\"把空值塞进变量\"的写法。")
+    }
+}

@@ -1,0 +1,8 @@
+#test {
+// EXP `disposable` error: a new layer must keep the same base type.
+
+    fn main() {
+        disposable r = 1
+        disposable r = 2.5
+    }
+}

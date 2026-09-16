@@ -549,6 +549,112 @@ public:
     }
 };
 
+// EXP `dual`: split the existence of a variable into two independent selves.
+// `dual x = expr` (or `dual x` on an already-existing variable) turns x into a
+// bifurcated variable: from the split instant on, x has TWO independent
+// existences — the original self x[0] (also reachable as plain `x`) and the
+// second self x[1] — both born with the same value (one entity became two
+// identical selves). Afterwards each self evolves on its own: `x = v` or
+// `x[0] = v` touches only the original self, `x[1] = v` only the second self.
+// The two selves are separate storage slots that diverge freely (this is NOT
+// if/else, NOT thread/fork, NOT a copy into another name — it is a semantic
+// "one -> two" birth, implemented purely by the LLVM backend).
+class DualStatement : public Statement {
+public:
+    std::string name;
+    std::unique_ptr<Expression> value; // optional `= expr`; null -> split current value
+
+    DualStatement(const std::string& n, std::unique_ptr<Expression> v,
+                  const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::DUAL_STATEMENT, loc), name(n), value(std::move(v)) {}
+
+    std::string toString() const override {
+        if (value) return "dual " + name + " = " + value->toString();
+        return "dual " + name;
+    }
+};
+
+// EXP `dual`: write to one of the two selves (`x[0] = v` / `x[1] = v`).
+// Only dual variables can be targeted, and only constant indices 0 (original
+// self) and 1 (second self) are legal.
+class IndexedAssignmentStatement : public Statement {
+public:
+    std::string name;
+    std::unique_ptr<Expression> index;
+    std::unique_ptr<Expression> value;
+
+    IndexedAssignmentStatement(const std::string& n, std::unique_ptr<Expression> idx,
+                               std::unique_ptr<Expression> v,
+                               const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::INDEXED_ASSIGNMENT_STATEMENT, loc), name(n),
+          index(std::move(idx)), value(std::move(v)) {}
+
+    std::string toString() const override {
+        return name + "[" + (index ? index->toString() : "") + "] = " +
+               (value ? value->toString() : "");
+    }
+};
+
+// EXP `disposable`: a one-time (or N-time) store. `disposable a = v` pushes a
+// layer that yields `v` exactly once; `disposable[5] a = v` yields it up to 5
+// times. Every read consumes one use of the newest live layer and, once all
+// layers are spent, reads fall back to the base value (the plain variable, if
+// one existed) or report the variable as undefined/unavailable. A normal
+// assignment to `a` clears all disposable layers and re-establishes a plain
+// value. `disposable fn` (one-shot functions) is parsed as a plain
+// FunctionDeclarationStatement with `func->disposable` set instead.
+class DisposableStatement : public Statement {
+public:
+    std::string name;
+    int64_t count = 1;       // remaining reads for this layer (>= 1)
+    bool hasCount = false;   // true when the `disposable[n]` form is used
+    std::unique_ptr<Expression> value;
+
+    DisposableStatement(const std::string& n, int64_t cnt, bool hc,
+                        std::unique_ptr<Expression> v,
+                        const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::DISPOSABLE_STATEMENT, loc), name(n),
+          count(cnt), hasCount(hc), value(std::move(v)) {}
+
+    std::string toString() const override {
+        if (hasCount) {
+            return "disposable[" + std::to_string(count) + "] " + name + " = " +
+                   (value ? value->toString() : "");
+        }
+        return "disposable " + name + " = " + (value ? value->toString() : "");
+    }
+};
+
+// EXP `interest`: 利息变量。 `¥[0.1] a = v` (simple interest) / `$[0.1] a = v`
+// (compound interest) define `a` as a FLOAT variable and attach an interest
+// rule to it. Every READ of `a` returns its current value to the expression
+// first, then applies every attached rule in definition order:
+//   - ¥ simple:   add `principal * rate` where principal is a's value at the
+//                 moment THIS rule was created (fixed, like interest on a loan).
+//   - $ compound: add `current * rate` (interest on interest).
+// Two reads inside one expression therefore see two different growing values.
+// With no `[rate]` the rate defaults to 0.0001.
+class InterestStatement : public Statement {
+public:
+    bool isCompound = false; // false = ¥ simple, true = $ compound
+    bool hasRate = false;    // `¥[0.1] a = v` vs bare `¥a = v`
+    double rate = 0.0001;    // per-read interest rate (as a fraction)
+    std::string name;
+    std::unique_ptr<Expression> value;
+
+    InterestStatement(bool compound, bool hr, double r, const std::string& n,
+                      std::unique_ptr<Expression> v,
+                      const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::INTEREST_STATEMENT, loc), isCompound(compound),
+          hasRate(hr), rate(r), name(n), value(std::move(v)) {}
+
+    std::string toString() const override {
+        std::string prefix = isCompound ? "$" : "¥";
+        if (hasRate) prefix += "[" + std::to_string(rate) + "]";
+        return prefix + " " + name + " = " + (value ? value->toString() : "");
+    }
+};
+
 // EXP `wrath`: retroactively rewrite the history of a variable. `wrath x = v`
 // assigns `v` to `x`, then re-evaluates every later variable that (transitively)
 // depended on `x`, so future reads of those dependents see the new value. Already
@@ -894,6 +1000,11 @@ public:
         bool rangeIsFloat = false;  // user gave float literal bounds
         long long depthLimit = 0;   // 0 -> built-in default
     } drift;
+
+    // EXP `disposable`: a function that can be called only once. The first call
+    // runs normally; every later call reports an "undefined / unavailable"
+    // runtime error and terminates. For `disposable fn foo() {}`.
+    bool disposable = false;
     
     Function(const std::string& n, std::vector<std::unique_ptr<VariableDeclaration>> p,
              std::unique_ptr<BlockStatement> b, const SourceLocation& loc = SourceLocation())
@@ -904,7 +1015,7 @@ public:
         : name(n), ns(ns_name), blockName(""), params(std::move(p)), body(std::move(b)), location(loc) {}
     
     std::string toString() const {
-        std::string result = drift.enabled ? "drift fn " : "fn ";
+        std::string result = drift.enabled ? "drift fn " : (disposable ? "disposable fn " : "fn ");
         if (!ns.empty()) {
             result += ns + ":";
         }
@@ -1082,6 +1193,60 @@ public:
         }
         result += "}";
         return result;
+    }
+};
+
+// EXP `value`: a = value expr  — asserts expr produces a value (not void)
+class ValueExpression : public Expression {
+public:
+    std::unique_ptr<Expression> inner;
+    ValueExpression(std::unique_ptr<Expression> e, const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::VALUE_EXPRESSION, loc), inner(std::move(e)) {}
+    std::string toString() const override {
+        return "value " + (inner ? inner->toString() : "<null>");
+    }
+};
+
+// EXP `kill[x]`: invalidate line x at runtime
+class KillStatement : public Statement {
+public:
+    int64_t targetLine;
+    KillStatement(int64_t line, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::KILL_STATEMENT, loc), targetLine(line) {}
+    std::string toString() const override {
+        return "kill[" + std::to_string(targetLine) + "]";
+    }
+};
+
+// EXP `censer[x]`: terminate if program prints exactly text x
+class CenserStatement : public Statement {
+public:
+    std::string text;
+    CenserStatement(const std::string& t, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::CENSER_STATEMENT, loc), text(t) {}
+    std::string toString() const override {
+        return "censer[" + text + "]";
+    }
+};
+
+// EXP `noclip a`: variable enters backroom state — reads become non-deterministic
+class NoclipStatement : public Statement {
+public:
+    std::string variableName;
+    NoclipStatement(const std::string& name, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::NOCLIP_STATEMENT, loc), variableName(name) {}
+    std::string toString() const override {
+        return "noclip " + variableName;
+    }
+};
+
+// EXP `shuffleback`: randomly reorder values of all backroom variables
+class ShufflebackStatement : public Statement {
+public:
+    ShufflebackStatement(const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::SHUFFLEBACK_STATEMENT, loc) {}
+    std::string toString() const override {
+        return "shuffleback";
     }
 };
 

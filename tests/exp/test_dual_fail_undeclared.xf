@@ -1,0 +1,6 @@
+#test {
+fn main() {
+    dual nothing
+    print(nothing)
+}
+}

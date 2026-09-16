@@ -1,0 +1,14 @@
+#test {
+// EXP disposable - reading a consumed disposable variable is undefined
+// at runtime. Program prints 3 then 2, then reports undefined and exits
+
+    fn main() {
+        a = 1
+        disposable a = 2
+        b = a + 1
+        print(b)
+        disposable c = a + 1
+        print(c)
+        print(c)
+    }
+}

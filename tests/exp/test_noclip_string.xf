@@ -1,0 +1,16 @@
+#test {
+    fn main() {
+        string s = "hello"
+        noclip s
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+        print(s)
+    }
+}

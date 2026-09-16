@@ -1,0 +1,53 @@
+#test {
+    fn main() {
+        // 场景一 单利
+        ¥[0.1]a = 10
+        print(a)
+        print("i1")
+
+        // 场景二 表达式内多次读取各自计息
+        print(a + a + a)
+        print(a)
+        print("i2")
+
+        // 场景三 默认利率 0.0001
+        ¥dflt = 100
+        print(dflt)
+        print(dflt)
+        print("i3")
+
+        // 场景四 复利
+        $[0.1]b = 10
+        print(b)
+        print("i4")
+        print(b)
+        print("i5")
+        print(b)
+        print("i6")
+
+        // 场景五 叠加规则
+        ¥[0.1]x = 10
+        ¥[0.1]x = 10
+        $[0.1]x = 10
+        print(x)
+        print("i7")
+        print(x)
+        print("i8")
+
+        // 场景六 普通赋值后仍按原规则计息
+        ¥[0.1]d = 10
+        d = 20
+        print(d)
+        print("i9")
+        print(d)
+        print("i10")
+
+        // 场景七 表达式内赋值与原规则叠加
+        ¥[0.1]e = 5
+        e = e + 5
+        print(e)
+        print("i11")
+        print(e)
+        print("i12")
+    }
+}

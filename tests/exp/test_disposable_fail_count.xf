@@ -1,0 +1,7 @@
+#test {
+// EXP `disposable` error: read count must be >= 1.
+
+    fn main() {
+        disposable[0] r = 1
+    }
+}

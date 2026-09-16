@@ -1,0 +1,119 @@
+#test {
+// 后室变量的视频演示：noclip / shuffleback
+// 真实存储值不变，但之后每次读取像掷骰子——
+// 六成读到真值，两成引用失败（数值变 0、字符串变空串），两成漂移到别的后室变量。
+// 每个场景放进独立函数：后室成员按函数隔离，漂移候选只在本函数里挑。
+
+    fn scene1() {
+        // 一幕：跌出正常空间 —— 同一个 x，每次读取独立掷骰
+        print("== 1. 跌出正常空间：同一个 x，每次读取独立掷骰 ==")
+        int x = 7
+        noclip x
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print(x)     // 7 或 0
+        print("--")
+    }
+
+    fn scene2() {
+        // 二幕：字符串后室变量 —— 引用失败时就变空串
+        print("== 2. 字符串后室变量：偶尔读到空串 ==")
+        string s = "hello"
+        noclip s
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print(s)     // hello 或空
+        print("--")
+    }
+
+    fn scene3n4() {
+        // 三幕：双后室变量交叉漂移 —— a 可能读到 b，b 可能读到 a
+        print("== 3. 双后室变量：a 可能读到 b，b 可能读到 a ==")
+        int a = 11
+        int b = 22
+        noclip a
+        noclip b
+        print(a)     // 11 / 0 / 22（漂到 b）
+        print(b)     // 22 / 0 / 11（漂到 a）
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        print("--")
+
+        // 四幕：shuffleback —— 全体返回并重排，两两一对掷硬币 50% 交换存储值
+        print("== 4. shuffleback：全体返回并重排（50% 硬币交换存储值）==")
+        shuffleback
+        print(a)     // 11 或 22 或 0
+        print(b)     // 22 或 11 或 0
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        print("--")
+    }
+
+    fn scene5() {
+        // 五幕：派生传染 —— base 不稳，sum 跟着晃
+        print("== 5. 派生传染：base 不稳，sum 跟着晃 ==")
+        int base = 5
+        int sum = 0
+        noclip base
+        sum = base + 10
+        print(sum)   // 15 或 10
+        sum = base + 20
+        print(sum)   // 25 或 20
+        sum = base + 30
+        print(sum)   // 35 或 30
+        print("--")
+    }
+
+    fn scene6() {
+        // 六幕：浮点后室变量 —— 引用失败就变 0.000000
+        print("== 6. 浮点后室变量：偶尔读到 0.000000 ==")
+        float f = 3.5
+        noclip f
+        print(f)     // 3.500000 或 0.000000
+        print(f)
+        print(f)
+        print(f)
+        print(f)
+        print(f)
+        print(f)
+        print(f)
+        print(f)
+        print(f)
+        print("--")
+    }
+
+    fn main() {
+        scene1()
+        scene2()
+        scene3n4()
+        scene5()
+        scene6()
+        print("== done ==")
+    }
+}

@@ -1,0 +1,6 @@
+#test {
+    fn main() {
+        a = 5 fu*k 7
+        print(a)
+    }
+}

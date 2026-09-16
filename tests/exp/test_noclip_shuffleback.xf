@@ -1,0 +1,20 @@
+#test {
+    fn main() {
+        int a = 11
+        int b = 22
+        noclip a
+        noclip b
+        print(a)
+        print(b)
+        shuffleback
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+        shuffleback
+        print(a)
+        print(b)
+        print(a)
+        print(b)
+    }
+}

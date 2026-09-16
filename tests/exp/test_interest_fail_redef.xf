@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        int ok = 3
+        ¥[0.1]ok = 9
+        print(ok)
+    }
+}

@@ -1174,6 +1174,10 @@ static std::string expAnnotationDescription(xfawa::NodeType t) {
         case xfawa::NodeType::SLEEP_STATEMENT:      return "// EXP: sleep —— 让程序暂停指定的秒数";
         case xfawa::NodeType::FATE_STATEMENT:       return "// EXP: fate —— 设定变量命运值；反抗后被不完美地拉回（恢复历史成为新的底数）";
         case xfawa::NodeType::ENVY_STATEMENT:       return "// EXP: envy —— 嫉妒比自己更好的变量：差距小则超越（+1）、中等则成为它、悬殊则摧毁它的优势";
+        case xfawa::NodeType::KILL_STATEMENT:       return "// EXP: kill —— 行级杀手：之后该行所有执行永远跳过，无法撤销";
+        case xfawa::NodeType::CENSER_STATEMENT:     return "// EXP: censer —— 内容熔断：之后控制台打印若与登记文本完全相等，打印完即退出程序";
+        case xfawa::NodeType::NOCLIP_STATEMENT:     return "// EXP: noclip —— 变量跌入后室：离开正常执行空间，此后读取出现随机不稳定与传播";
+        case xfawa::NodeType::SHUFFLEBACK_STATEMENT:return "// EXP: shuffleback —— 现实挫败：将所有后室变量数值随机重新洗排，顺序被打乱";
         default: return "";
     }
 }

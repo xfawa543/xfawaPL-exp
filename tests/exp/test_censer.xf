@@ -1,0 +1,11 @@
+#test {
+    fn main() {
+        // c3 子串不触发，完全相等才触发并退出
+        censer["word"]
+        print("words")
+        print("a word")
+        print("plain")
+        print("word")
+        print("c3never")
+    }
+}

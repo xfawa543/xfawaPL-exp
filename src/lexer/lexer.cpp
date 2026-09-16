@@ -52,7 +52,13 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::keywords = {
     {"sleep", TokenType::KEYWORD_SLEEP},
     {"come", TokenType::KEYWORD_COME},
     {"drift", TokenType::KEYWORD_DRIFT},
-    {"pinocchio", TokenType::KEYWORD_PINOCCHIO}
+    {"pinocchio", TokenType::KEYWORD_PINOCCHIO},
+    {"dual", TokenType::KEYWORD_DUAL},
+    {"disposable", TokenType::KEYWORD_DISPOSABLE},
+    {"kill", TokenType::KEYWORD_KILL},
+    {"censer", TokenType::KEYWORD_CENSER},
+    {"noclip", TokenType::KEYWORD_NOCLIP},
+    {"shuffleback", TokenType::KEYWORD_SHUFFLEBACK}
 };
 
 const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
@@ -82,6 +88,8 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
     {"&&", TokenType::PUNCTUATOR_AND},
     {"||", TokenType::PUNCTUATOR_OR},
     {"#", TokenType::PUNCTUATOR_HASH},
+    {"¥", TokenType::KEYWORD_INTEREST_SIMPLE}, // U+00A5 YEN SIGN
+    {"￥", TokenType::KEYWORD_INTEREST_SIMPLE}, // U+FFE5 FULLWIDTH YEN SIGN
     {"$", TokenType::PUNCTUATOR_DOLLAR},
     {".", TokenType::PUNCTUATOR_DOT},
     {"...", TokenType::PUNCTUATOR_DOT_DOT_DOT}
@@ -140,6 +148,14 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_COME: return "come";
         case TokenType::KEYWORD_DRIFT: return "drift";
         case TokenType::KEYWORD_PINOCCHIO: return "pinocchio";
+        case TokenType::KEYWORD_DUAL: return "dual";
+        case TokenType::KEYWORD_DISPOSABLE: return "disposable";
+        case TokenType::KEYWORD_INTEREST_SIMPLE: return "¥";
+        case TokenType::KEYWORD_KILL: return "kill";
+        case TokenType::KEYWORD_CENSER: return "censer";
+        case TokenType::KEYWORD_NOCLIP: return "noclip";
+        case TokenType::KEYWORD_SHUFFLEBACK: return "shuffleback";
+        case TokenType::KEYWORD_VALUE: return "value";
         case TokenType::PUNCTUATOR_LPAREN: return "(";
         case TokenType::PUNCTUATOR_RPAREN: return ")";
         case TokenType::PUNCTUATOR_LBRACE: return "{";
@@ -169,6 +185,7 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::PUNCTUATOR_COLON: return ":";
         case TokenType::PUNCTUATOR_DOT: return ".";
         case TokenType::PUNCTUATOR_DOT_DOT_DOT: return "...";
+        case TokenType::PUNCTUATOR_FU_K: return "fu*k";
         default: return "unknown";
     }
 }
@@ -430,6 +447,16 @@ std::vector<Token> Lexer::tokenize() {
                 text += advance();
             }
             addToken(TokenType::KEYWORD_IMPORT, text);
+            continue;
+        }
+        
+        if (c == 'f' && peek(1) == 'u' && peek(2) == '*' && peek(3) == 'k' &&
+            !isAlphaNumeric(peek(4)) && peek(4) != '_') {
+            advance();
+            advance();
+            advance();
+            advance();
+            addToken(TokenType::PUNCTUATOR_FU_K, "fu*k");
             continue;
         }
         

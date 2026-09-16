@@ -1,0 +1,7 @@
+#test {
+fn main() {
+    s = "hi"
+    dual s
+    print(s)
+}
+}

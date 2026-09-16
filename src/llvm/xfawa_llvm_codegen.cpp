@@ -44,6 +44,47 @@ static llvm::ConstantInt* createConstInt(llvm::LLVMContext& ctx, llvm::IntegerTy
     return static_cast<llvm::ConstantInt*>(llvm::ConstantInt::get(ty, llvm::APInt(ty->getBitWidth(), value, true)));
 }
 
+// EXP `value`: does this statement subtree contain a `return` statement?
+static bool stmtHasReturn(const xfawa::Statement* s) {
+    if (!s) return false;
+    switch (s->getNodeType()) {
+        case xfawa::NodeType::RETURN_STATEMENT: return true;
+        case xfawa::NodeType::BLOCK_STATEMENT: {
+            const auto* b = static_cast<const xfawa::BlockStatement*>(s);
+            for (const auto& child : b->statements)
+                if (stmtHasReturn(child.get())) return true;
+            return false;
+        }
+        case xfawa::NodeType::IF_STATEMENT: {
+            const auto* i = static_cast<const xfawa::IfStatement*>(s);
+            if (i->thenBranch && stmtHasReturn(i->thenBranch.get())) return true;
+            for (const auto& e : i->elseIfBranches)
+                if (e.second && stmtHasReturn(e.second.get())) return true;
+            if (i->elseBranch && stmtHasReturn(i->elseBranch.get())) return true;
+            return false;
+        }
+        case xfawa::NodeType::WHILE_STATEMENT: {
+            const auto* w = static_cast<const xfawa::WhileStatement*>(s);
+            return w->body && stmtHasReturn(w->body.get());
+        }
+        case xfawa::NodeType::FOR_IN_STATEMENT: {
+            const auto* f = static_cast<const xfawa::ForInStatement*>(s);
+            return f->body && stmtHasReturn(f->body.get());
+        }
+        case xfawa::NodeType::LIE_STATEMENT: {
+            const auto* l = static_cast<const xfawa::LieStatement*>(s);
+            return l->body && stmtHasReturn(l->body.get());
+        }
+        case xfawa::NodeType::TRY_EXPECT_STATEMENT: {
+            const auto* te = static_cast<const xfawa::TryExpectStatement*>(s);
+            return (te->tryBlock && stmtHasReturn(te->tryBlock.get())) ||
+                   (te->expectBlock && stmtHasReturn(te->expectBlock.get()));
+        }
+        default:
+            return false;
+    }
+}
+
 static char binaryOpChar(xfawa::BinaryOpType op) {
     switch (op) {
         case xfawa::BinaryOpType::ADD: return '+';
@@ -243,6 +284,9 @@ void LLVMCodegen::initBuiltins() {
     llvm::FunctionType* randType = llvm::FunctionType::get(builder.getInt32Ty(), false);
     declareFunction("rand", randType);
 
+    declareFunction("strcmp", llvm::FunctionType::get(builder.getInt32Ty(), {ptrTy, ptrTy}, false));
+    declareFunction("exit", llvm::FunctionType::get(builder.getVoidTy(), {builder.getInt32Ty()}, false));
+
     llvm::FunctionType* srandType = llvm::FunctionType::get(builder.getVoidTy(), {builder.getInt32Ty()}, false);
     declareFunction("srand", srandType);
 
@@ -426,6 +470,46 @@ llvm::Value* LLVMCodegen::codegen(StringLiteral* expr) {
 }
 
 llvm::Value* LLVMCodegen::codegen(VariableExpression* expr) {
+    // EXP `noclip`: a variable that fell into the backrooms reads non-
+    // deterministically — sometimes its real value passes through, sometimes
+    // the reality/backrooms boundary swallows the read (default value), and
+    // sometimes the caller reaches into ANOTHER backroom variable instead.
+    if (backroomVars.count(expr->name)) {
+        auto bit = locals.find(expr->name);
+        if (bit != locals.end()) {
+            VarType vt = (localTypes.count(expr->name)) ? localTypes[expr->name] : VarType::UNKNOWN;
+            // Eligible: numeric/bool scalars, or a scalar string. Note the
+            // compiler stores `string s = "..."` internally as ARRAY_STRING —
+            // a real array has an arrayLengths entry, a scalar string does not.
+            bool numericLike = (vt == VarType::INT || vt == VarType::LONG ||
+                                vt == VarType::FLOAT || vt == VarType::BOOL);
+            bool scalarString = (vt == VarType::STRING || vt == VarType::ARRAY_STRING) &&
+                                !arrayLengths.count(expr->name);
+            if (numericLike || scalarString) {
+                return codegenBackroomRead(expr->name, bit->second);
+            }
+        }
+    }
+
+    // EXP `interest`: reading an interest-bearing variable returns its current
+    // float value and THEN grows the stored balance by every attached rule.
+    auto ivIt = interestVars.find(expr->name);
+    if (ivIt != interestVars.end()) {
+        auto baseIt = locals.find(expr->name);
+        llvm::AllocaInst* base = (baseIt != locals.end()) ? baseIt->second : nullptr;
+        return codegenInterestRead(expr->name, base);
+    }
+
+    // EXP `disposable`: reading a name with a live layer stack consumes the
+    // newest disposable value (falls back to the base alloca, or raises a
+    // runtime undefined error, once every layer is spent).
+    auto dIt = disposableVars.find(expr->name);
+    if (dIt != disposableVars.end() && dIt->second.top) {
+        auto baseIt = locals.find(expr->name);
+        llvm::AllocaInst* base = (baseIt != locals.end()) ? baseIt->second : nullptr;
+        return codegenDisposableRead(expr->name, base);
+    }
+
     auto it = locals.find(expr->name);
     if (it != locals.end()) {
         llvm::AllocaInst* alloca = it->second;
@@ -438,6 +522,178 @@ llvm::Value* LLVMCodegen::codegen(VariableExpression* expr) {
     }
     
     addError("Undefined variable: " + expr->name);
+    return nullptr;
+}
+
+// EXP `noclip`: a backrooms variable read. The result is a runtime coin flip:
+//   60% the real value passes through the boundary unchanged;
+//   20% the read is swallowed (a default/empty value: 引用失败/通读无物);
+//   20% the read reaches into ANOTHER backrooms variable of the same type
+//       (传播：读过它的人，拿到的是后室深处的东西).
+llvm::Value* LLVMCodegen::codegenBackroomRead(const std::string& name,
+                                              llvm::AllocaInst* alloca) {
+    llvm::Type* ty = alloca->getAllocatedType();
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+
+    auto defaultForType = [&]() -> llvm::Value* {
+        if (ty->isIntegerTy()) return createConstInt(context, llvm::cast<llvm::IntegerType>(ty), 0);
+        if (ty->isFloatingPointTy()) return llvm::ConstantFP::get(ty, 0.0);
+        // Pointers (strings): an empty string, never a null pointer (print-safe).
+        return builder.CreateGlobalStringPtr("", "noclip.empty");
+    };
+
+    usesRandomBuiltin = true;
+    emitRandomCallSeedOnce();
+    llvm::Function* randFunc = getRandFunction();
+
+    llvm::BasicBlock* savedBB = builder.GetInsertBlock();
+    llvm::BasicBlock* normBB = llvm::BasicBlock::Create(context, "noclip.norm", curFn);
+    llvm::BasicBlock* midBB = llvm::BasicBlock::Create(context, "noclip.mid", curFn);
+    llvm::BasicBlock* corrBB = llvm::BasicBlock::Create(context, "noclip.corr", curFn);
+    llvm::BasicBlock* driftBB = llvm::BasicBlock::Create(context, "noclip.drift", curFn);
+    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context, "noclip.merge", curFn);
+
+    llvm::Value* r = builder.CreateCall(randFunc, {}, "noclip.r");
+    llvm::Value* r100 = builder.CreateSRem(r, builder.getInt32(100), "noclip.r100");
+    llvm::Value* c60 = builder.CreateICmpSLT(r100, builder.getInt32(60), "noclip.c60");
+    builder.CreateCondBr(c60, normBB, midBB);
+
+    builder.SetInsertPoint(normBB);
+    llvm::Value* normalVal = builder.CreateLoad(ty, alloca, (name + ".noclip.norm").c_str());
+    builder.CreateBr(mergeBB);
+
+    builder.SetInsertPoint(midBB);
+    llvm::Value* c80 = builder.CreateICmpSLT(r100, builder.getInt32(80), "noclip.c80");
+    builder.CreateCondBr(c80, corrBB, driftBB);
+
+    builder.SetInsertPoint(corrBB);
+    llvm::Value* corrVal = defaultForType();
+    builder.CreateBr(mergeBB);
+
+    builder.SetInsertPoint(driftBB);
+    llvm::Value* driftVal = defaultForType();
+    std::vector<std::string> candidates;
+    for (const auto& other : backroomVars) {
+        if (other == name) continue;
+        auto oit = locals.find(other);
+        if (oit == locals.end()) continue;
+        auto tIt = localTypes.find(other);
+        if (tIt == localTypes.end()) continue;
+        VarType ot = tIt->second;
+        bool numericLike = (ot == VarType::INT || ot == VarType::LONG ||
+                            ot == VarType::FLOAT || ot == VarType::BOOL);
+        bool scalarString = (ot == VarType::STRING || ot == VarType::ARRAY_STRING) &&
+                            !arrayLengths.count(other);
+        if (!numericLike && !scalarString) continue;
+        if (oit->second->getAllocatedType() != ty) continue;
+        candidates.push_back(other);
+    }
+    if (!candidates.empty()) {
+        if (candidates.size() == 1) {
+            driftVal = builder.CreateLoad(ty, locals.at(candidates[0]), "noclip.drift.other");
+        } else {
+            size_t n = candidates.size();
+            if (n > 8) n = 8;
+            llvm::Value* idx = builder.CreateCall(randFunc, {}, "noclip.dr.r");
+            llvm::Value* modN = builder.CreateURem(
+                builder.CreateZExt(idx, builder.getInt64Ty()), builder.getInt64(n), "noclip.dr.n");
+            llvm::Value* selected = nullptr;
+            for (size_t i = 0; i < n; ++i) {
+                llvm::Value* v = builder.CreateLoad(ty, locals.at(candidates[i]),
+                                                    ("noclip.drift.o" + std::to_string(i)).c_str());
+                if (i == 0) { selected = v; continue; }
+                llvm::Value* eq = builder.CreateICmpEQ(modN, builder.getInt64(i), "noclip.dr.eq");
+                selected = builder.CreateSelect(eq, v, selected, "noclip.dr.sel");
+            }
+            driftVal = selected;
+        }
+    }
+    builder.CreateBr(mergeBB);
+
+    builder.SetInsertPoint(mergeBB);
+    llvm::PHINode* phi = builder.CreatePHI(ty, 3, (name + ".noclip").c_str());
+    phi->addIncoming(normalVal, normBB);
+    phi->addIncoming(corrVal, corrBB);
+    phi->addIncoming(driftVal, driftBB);
+    return phi;
+}
+
+// EXP `noclip a`: push variable `a` out of reality. The value stays put; every
+// later read of `a` goes through the instability above. Compile-time marking
+// is per-function and non-transitive (later variables keep working normally).
+llvm::Value* LLVMCodegen::codegen(NoclipStatement* stmt) {
+    auto it = locals.find(stmt->variableName);
+    if (it == locals.end()) {
+        addError("noclip: 变量 \"" + stmt->variableName + "\" 还未定义，无法让它跌入后室");
+        return nullptr;
+    }
+    usesRandomBuiltin = true;
+    emitRandomCallSeedOnce();
+    backroomVars.insert(stmt->variableName);
+    return nullptr;
+}
+
+// EXP `shuffleback`: the backrooms return everything at once — and the values
+// of all backrooms variables are reshuffled among themselves while they drip
+// back into reality. Implemented as a runtime 50/50 swap per same-typed pair,
+// so a global "all return + reorder" needs no deferred execution machinery in
+// this straight-line codegen.
+llvm::Value* LLVMCodegen::codegen(ShufflebackStatement* stmt) {
+    (void)stmt;
+    std::vector<std::string> strNames, intNames, longNames, floatNames, boolNames;
+    for (const auto& bv : backroomVars) {
+        if (!locals.count(bv)) continue;
+        auto tIt = localTypes.find(bv);
+        if (tIt == localTypes.end()) continue;
+        switch (tIt->second) {
+            case VarType::STRING: strNames.push_back(bv); break;
+            case VarType::ARRAY_STRING:
+                // `string s = "..."` is stored as ARRAY_STRING internally; only
+                // a scalar string (no arrayLengths entry) can be shuffled.
+                if (arrayLengths.count(bv)) break;
+                strNames.push_back(bv);
+                break;
+            case VarType::INT: intNames.push_back(bv); break;
+            case VarType::LONG: longNames.push_back(bv); break;
+            case VarType::FLOAT: floatNames.push_back(bv); break;
+            case VarType::BOOL: boolNames.push_back(bv); break;
+            default: break; // arrays and other storage are not shuffled
+        }
+    }
+
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+    llvm::Function* randFunc = getRandFunction();
+    usesRandomBuiltin = true;
+    emitRandomCallSeedOnce();
+
+    auto swapPairs = [&](const std::vector<std::string>& names) {
+        for (size_t i = 0; i < names.size(); ++i) {
+            for (size_t j = i + 1; j < names.size(); ++j) {
+                llvm::AllocaInst* ai = locals.at(names[i]);
+                llvm::AllocaInst* aj = locals.at(names[j]);
+                if (ai->getAllocatedType() != aj->getAllocatedType()) continue;
+                llvm::Type* ty = ai->getAllocatedType();
+                llvm::BasicBlock* swapBB = llvm::BasicBlock::Create(context, "noclip.swap", curFn);
+                llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(context, "noclip.next", curFn);
+                llvm::Value* rnd = builder.CreateCall(randFunc, {}, "noclip.sw.r");
+                llvm::Value* bit = builder.CreateAnd(rnd, builder.getInt32(1), "noclip.sw.bit");
+                llvm::Value* doSwap = builder.CreateICmpEQ(bit, builder.getInt32(0), "noclip.sw.tf");
+                builder.CreateCondBr(doSwap, swapBB, nextBB);
+                builder.SetInsertPoint(swapBB);
+                llvm::Value* vi = builder.CreateLoad(ty, ai, "noclip.swap.i");
+                llvm::Value* vj = builder.CreateLoad(ty, aj, "noclip.swap.j");
+                builder.CreateStore(vj, ai);
+                builder.CreateStore(vi, aj);
+                builder.CreateBr(nextBB);
+                builder.SetInsertPoint(nextBB);
+            }
+        }
+    };
+    swapPairs(strNames);
+    swapPairs(intNames);
+    swapPairs(longNames);
+    swapPairs(floatNames);
+    swapPairs(boolNames);
     return nullptr;
 }
 
@@ -512,6 +768,11 @@ llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
     // types. Handled before the plain-op paths below.
     if (expr->op == BinaryOpType::BANG_QUESTION) {
         return codegenRandomBinaryOp(expr);
+    }
+
+    // EXP `fu*k`: merge a random half of one list with a random half of another.
+    if (expr->op == BinaryOpType::FU_K) {
+        return codegenFuK(expr);
     }
 
     // EXP `believe`: if both operands are constant ints, check the belief table.
@@ -892,6 +1153,132 @@ llvm::Value* LLVMCodegen::codegenRandomBinaryOp(xfawa::BinaryOp* expr) {
         result = builder.CreateSelect(eq, values[i], result, "bq.sel");
     }
     return result;
+}
+
+// EXP `fu*k`: merge a random half of one list with a random half of another.
+// Both operands must be list-typed; element kinds are checked and must match.
+// Result is a newly malloc'd buffer with floor(lenA/2) + floor(lenB/2) elements.
+// Supported: int/long/string arrays. Float arrays are rejected.
+llvm::Value* LLVMCodegen::codegenFuK(xfawa::BinaryOp* expr) {
+    // kind: 0=int/bool, 1=long, 2=string, 3=float(unsupported)
+    llvm::Value* ptrA=nullptr; llvm::Value* ptrB=nullptr;
+    int64_t lenA=0, lenB=0;
+    int kindA=0, kindB=0;
+    auto analyse = [&](Expression* e, llvm::Value*& outPtr, int64_t& outLen, int& kind) -> bool {
+        if (auto* al = dynamic_cast<ArrayLiteral*>(e)) {
+            if (al->isRange) {
+                auto* s = dynamic_cast<NumberLiteral*>(al->rangeStart.get());
+                auto* en = dynamic_cast<NumberLiteral*>(al->rangeEnd.get());
+                if (!s||!en) { addError("[fu*k] range array must have constant integer bounds"); return false; }
+                outLen = en->value - s->value + 1;
+            } else {
+                outLen = (int64_t)al->elements.size();
+            }
+            if (al->isRange) kind = 0;
+            else if (al->elements.empty()) kind = 0;
+            else {
+                Expression* first = al->elements[0].get();
+                if (dynamic_cast<StringLiteral*>(first)) kind = 2;
+                else if (auto* num = dynamic_cast<NumberLiteral*>(first)) {
+                    constexpr int64_t INT32_MAX_VAL = 2147483647LL;
+                    if (num->value > INT32_MAX_VAL || num->value < -INT32_MAX_VAL - 1) kind = 1;
+                    else kind = 0;
+                } else if (dynamic_cast<FloatLiteral*>(first)) kind = 3;
+                else kind = 0;
+            }
+            if (kind == 3) { addError("[fu*k] float arrays are not supported yet"); return false; }
+            outPtr = codegen(e);
+            return outPtr != nullptr;
+        }
+        if (auto* ve = dynamic_cast<VariableExpression*>(e)) {
+            auto tIt = localTypes.find(ve->name);
+            if (tIt==localTypes.end()) { addError("[fu*k] undefined variable '"+ve->name+"'"); return false; }
+            VarType vt = tIt->second;
+            if (vt==VarType::ARRAY_FLOAT) { addError("[fu*k] float arrays are not supported yet"); return false; }
+            if (vt==VarType::ARRAY_STRING) kind = 2;
+            else if (vt==VarType::ARRAY_LONG) kind = 1;
+            else if (vt==VarType::ARRAY_INT || vt==VarType::ARRAY_BOOL || vt==VarType::UNKNOWN) kind = 0;
+            else { addError("[fu*k] variable '"+ve->name+"' is not a list"); return false; }
+            auto lIt = arrayLengths.find(ve->name);
+            if (lIt==arrayLengths.end()) { addError("[fu*k] length of '"+ve->name+"' is unknown"); return false; }
+            outLen = lIt->second;
+            auto aIt = locals.find(ve->name);
+            if (aIt==locals.end()) { addError("[fu*k] variable '"+ve->name+"' has no storage"); return false; }
+            llvm::Value* loaded = builder.CreateLoad(aIt->second->getAllocatedType(), aIt->second, "fk.load");
+            outPtr = loaded;
+            return true;
+        }
+        addError("[fu*k] operands must be array literals or array variables");
+        return false;
+    };
+    if (!analyse(expr->left.get(),  ptrA, lenA, kindA)) return nullptr;
+    if (!analyse(expr->right.get(), ptrB, lenB, kindB)) return nullptr;
+    if (kindA != kindB) {
+        addError("[fu*k] both lists must hold the same type of elements");
+        return nullptr;
+    }
+
+    llvm::Type* elemType = builder.getInt32Ty();
+    int elemSize = 4;
+    if (kindA == 1) {
+        elemType = builder.getInt64Ty();
+        elemSize = 8;
+    } else if (kindA == 2) {
+        elemType = builder.getInt8Ty()->getPointerTo();
+        elemSize = 8;
+    }
+
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+    llvm::Function* mallocFunc = module->getFunction("malloc");
+    llvm::Function* randFunc = getRandFunction();
+    usesRandomBuiltin = true;
+    emitRandomCallSeedOnce();
+
+    int64_t halfA = lenA / 2, halfB = lenB / 2;
+    int64_t resLen = halfA + halfB;
+    llvm::Value* outArr = builder.CreateCall(mallocFunc, {createConstInt(context, builder.getInt64Ty(), resLen * elemSize)}, "fk.out");
+
+    llvm::Value* outOffset = builder.getInt64(0);
+    // Emit partial Fisher-Yates selection for one source array.
+    auto emitHalfSelection = [&](llvm::Value* srcPtr, int64_t srcLen, int64_t half) {
+        if (half == 0 || srcLen == 0) return;
+        llvm::Value* idxArr = builder.CreateCall(mallocFunc, {createConstInt(context, builder.getInt64Ty(), srcLen * 4)}, "fk.idx");
+        // Fill [0..srcLen-1]
+        for (int64_t i = 0; i < srcLen; ++i)
+            builder.CreateStore(builder.getInt32((int)i),
+                builder.CreateGEP(builder.getInt32Ty(), idxArr,
+                    createConstInt(context, builder.getInt64Ty(), i)));
+        // Partial shuffle: pick `half` indices at idx[0..half-1]
+        for (int64_t i = 0; i < half; ++i) {
+            llvm::Value* rv = builder.CreateCall(randFunc, {}, "fk.rand");
+            llvm::Value* range = builder.getInt32((int)(srcLen - i));
+            llvm::Value* off = builder.CreateSRem(rv, range, "fk.off");
+            llvm::Value* aiIdx = createConstInt(context, builder.getInt64Ty(), i);
+            llvm::Value* aiPtr = builder.CreateGEP(builder.getInt32Ty(), idxArr, aiIdx, "fk.ai");
+            llvm::Value* biIdx = builder.CreateAdd(builder.getInt32(i), off, "fk.bi32");
+            llvm::Value* biPtr = builder.CreateGEP(builder.getInt32Ty(), idxArr,
+                builder.CreateSExt(biIdx, builder.getInt64Ty()), "fk.biptr");
+            llvm::Value* ai = builder.CreateLoad(builder.getInt32Ty(), aiPtr, "fk.ai.v");
+            llvm::Value* bi = builder.CreateLoad(builder.getInt32Ty(), biPtr, "fk.bi.v");
+            builder.CreateStore(bi, aiPtr);
+            builder.CreateStore(ai, biPtr);
+        }
+        // Copy selected elements into output
+        for (int64_t i = 0; i < half; ++i) {
+            llvm::Value* selIdx = builder.CreateLoad(builder.getInt32Ty(),
+                builder.CreateGEP(builder.getInt32Ty(), idxArr,
+                    createConstInt(context, builder.getInt64Ty(), i), "fk.si.ptr"), "fk.si");
+            llvm::Value* srcElem = builder.CreateGEP(elemType, srcPtr,
+                builder.CreateSExt(selIdx, builder.getInt64Ty()), "fk.se");
+            llvm::Value* val = builder.CreateLoad(elemType, srcElem, "fk.ev");
+            llvm::Value* dstElem = builder.CreateGEP(elemType, outArr, outOffset, "fk.de");
+            builder.CreateStore(val, dstElem);
+            outOffset = builder.CreateAdd(outOffset, builder.getInt64(1));
+        }
+    };
+    emitHalfSelection(ptrA, lenA, halfA);
+    emitHalfSelection(ptrB, lenB, halfB);
+    return outArr;
 }
 
 llvm::Value* LLVMCodegen::codegen(CallExpression* expr) {
@@ -1482,6 +1869,37 @@ llvm::Value* LLVMCodegen::codegen(ArrayLiteral* expr) {
 }
 
 llvm::Value* LLVMCodegen::codegen(ArrayIndexExpression* expr) {
+    // EXP `dual`: `x[0]` / `x[1]` read one of a dual variable's two selves.
+    if (auto* varExpr = dynamic_cast<VariableExpression*>(expr->array.get())) {
+        auto dIt = dualEchoVars.find(varExpr->name);
+        if (dIt != dualEchoVars.end()) {
+            int64_t idx = -1;
+            if (auto* num = dynamic_cast<NumberLiteral*>(expr->index.get())) {
+                idx = num->value;
+            } else {
+                llvm::Value* idxVal = codegen(expr->index.get());
+                if (idxVal) {
+                    if (auto* cIdx = llvm::dyn_cast<llvm::ConstantInt>(idxVal)) {
+                        idx = cIdx->getSExtValue();
+                    }
+                }
+            }
+            if (idx != 0 && idx != 1) {
+                addError("[dual] \"" + varExpr->name +
+                         "\" has exactly two selves: index must be a constant "
+                         "0 (original) or 1 (second)");
+                return nullptr;
+            }
+            auto lIt = locals.find(varExpr->name);
+            if (lIt == locals.end()) {
+                addError("Variable '" + varExpr->name + "' used before declaration");
+                return nullptr;
+            }
+            llvm::AllocaInst* slot = (idx == 0) ? lIt->second : dIt->second;
+            return builder.CreateLoad(slot->getAllocatedType(), slot, "dual.elem");
+        }
+    }
+
     llvm::Value* arrVal = codegen(expr->array.get());
     if (!arrVal) return nullptr;
     
@@ -1539,6 +1957,7 @@ llvm::Value* LLVMCodegen::codegen(ExpressionStatement* stmt) {
 
 llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
     int64_t arrayLen = 0;
+    VarType fuKTargetKind = VarType::UNKNOWN;
     if (auto* arrLit = dynamic_cast<ArrayLiteral*>(stmt->value.get())) {
         if (arrLit->isRange) {
             if (auto* startInt = dynamic_cast<NumberLiteral*>(arrLit->rangeStart.get())) {
@@ -1555,6 +1974,59 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
                 if (auto* endInt = dynamic_cast<NumberLiteral*>(arrSlice->end.get())) {
                     arrayLen = endInt->value - startInt->value + 1;
                 }
+            }
+        }
+    }
+    // EXP `fu*k`: `a = x fu*k y` produces a new array whose length is known at
+    // compile time (floor(lenA/2) + floor(lenB/2)), and whose element type is
+    // that of the (uniform) operands.
+    if (auto* fukBin = dynamic_cast<BinaryOp*>(stmt->value.get())) {
+        if (fukBin->op == BinaryOpType::FU_K) {
+            auto operandLength = [&](Expression* e, int64_t& len, VarType& kind) -> bool {
+                if (auto* al = dynamic_cast<ArrayLiteral*>(e)) {
+                    if (al->isRange) {
+                        auto* s = dynamic_cast<NumberLiteral*>(al->rangeStart.get());
+                        auto* en = dynamic_cast<NumberLiteral*>(al->rangeEnd.get());
+                        if (!s || !en) return false;
+                        len = en->value - s->value + 1;
+                    } else {
+                        len = (int64_t)al->elements.size();
+                        if (!al->elements.empty()) {
+                            Expression* first = al->elements[0].get();
+                            if (dynamic_cast<StringLiteral*>(first)) kind = VarType::STRING;
+                            else if (auto* num = dynamic_cast<NumberLiteral*>(first)) {
+                                constexpr int64_t INT32_MAX_VAL = 2147483647LL;
+                                if (num->value > INT32_MAX_VAL || num->value < -INT32_MAX_VAL - 1)
+                                    kind = VarType::LONG;
+                            }
+                        }
+                    }
+                    return true;
+                }
+                if (auto* ve = dynamic_cast<VariableExpression*>(e)) {
+                    auto lIt = arrayLengths.find(ve->name);
+                    if (lIt == arrayLengths.end()) return false;
+                    len = lIt->second;
+                    auto tIt = localTypes.find(ve->name);
+                    if (tIt != localTypes.end()) {
+                        VarType vt = tIt->second;
+                        if (vt == VarType::ARRAY_STRING) kind = VarType::STRING;
+                        else if (vt == VarType::ARRAY_LONG) kind = VarType::LONG;
+                    }
+                    return true;
+                }
+                return false;
+            };
+            int64_t lenA = 0, lenB = 0;
+            VarType kindA = VarType::INT, kindB = VarType::INT;
+            if (operandLength(fukBin->left.get(), lenA, kindA) &&
+                operandLength(fukBin->right.get(), lenB, kindB)) {
+                arrayLen = (lenA / 2) + (lenB / 2);
+                fuKTargetKind = (kindA == VarType::STRING || kindB == VarType::STRING)
+                                    ? VarType::ARRAY_STRING
+                                : (kindA == VarType::LONG || kindB == VarType::LONG)
+                                    ? VarType::ARRAY_LONG
+                                    : VarType::ARRAY_INT;
             }
         }
     }
@@ -1836,6 +2308,14 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
         }
     }
     
+    // EXP `fu*k`: when the RHS is a fu*k expression, the variable is an array
+    // whose element kind may differ from the default (ARRAY_INT). The pre-
+    // computed fuKTargetKind (set before codegen of the RHS) overrides the
+    // localType so that later typed reads and bounds-checks work correctly.
+    if (fuKTargetKind != VarType::UNKNOWN) {
+        localTypes[stmt->name] = fuKTargetKind;
+    }
+    
     if (arrayLen > 0) {
         arrayLengths[stmt->name] = arrayLen;
     }
@@ -1865,8 +2345,24 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
         // Convert int64 to pointer
         storeVal = builder.CreateIntToPtr(storeVal, allocaType, "longtoptr");
     }
-    
+
+    // EXP `interest`: the storage of an interest variable is always float, so
+    // a later plain `a = <int>` assignment must auto-convert to float too
+    // (ints are auto-converted per the spec; `a += 1` also lands here).
+    if (allocaType->isFloatTy() && storeType->isIntegerTy()) {
+        storeVal = builder.CreateSIToFP(storeVal, allocaType, "int.to.float");
+        storeType = storeVal->getType();
+    }
+
     builder.CreateStore(storeVal, alloca);
+
+    // EXP `disposable`: a normal assignment clears every disposable layer of
+    // this variable and re-establishes a plain value (stored into the base
+    // alloca above).
+    auto dspIt = disposableVars.find(stmt->name);
+    if (dspIt != disposableVars.end() && dspIt->second.top) {
+        builder.CreateStore(createConstInt(context, builder.getInt64Ty(), -1), dspIt->second.top);
+    }
     
     // EXP `fate`: after storing a deviation into a fated variable, pull the
     // value back toward the destiny value (imperfect + floor-limited).
@@ -2108,36 +2604,50 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
     if (printfFunc) {
         llvm::Value* formatPtr;
         llvm::Value* printArg = arg;
+        // EXP `censer`: when censoring is active we also build the exact printed
+        // text (same format, minus the trailing newline) so it can be compared.
+        bool censorMode = !censoredTexts.empty();
+        llvm::Value* censorFormatPtr = nullptr;
         
         if (arg->getType()->isFloatTy()) {
             formatPtr = makePrintFormat("%f\n");
+            if (censorMode) censorFormatPtr = makePrintFormat("%f");
             printArg = builder.CreateFPExt(arg, builder.getDoubleTy(), "float.ext");
         } else if (arg->getType()->isIntegerTy(1)) {
             formatPtr = makePrintFormat("%d\n");
+            if (censorMode) censorFormatPtr = makePrintFormat("%d");
             printArg = builder.CreateZExtOrTrunc(arg, builder.getInt32Ty(), "bool.ext");
         } else if (arg->getType()->isIntegerTy(64)) {
             formatPtr = makePrintFormat("%lld\n");
+            if (censorMode) censorFormatPtr = makePrintFormat("%lld");
         } else if (arg->getType()->isIntegerTy()) {
             formatPtr = makePrintFormat("%d\n");
+            if (censorMode) censorFormatPtr = makePrintFormat("%d");
         } else if (arg->getType()->isPointerTy()) {
             if (exprType == VarType::LONG || exprType == VarType::UNKNOWN) {
                 formatPtr = makePrintFormat("%lld\n");
+                if (censorMode) censorFormatPtr = makePrintFormat("%lld");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt64Ty(), "ptrtolong");
             } else if (exprType == VarType::INT) {
                 formatPtr = makePrintFormat("%d\n");
+                if (censorMode) censorFormatPtr = makePrintFormat("%d");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt32Ty(), "ptrtoint");
             } else if (exprType == VarType::BOOL) {
                 formatPtr = makePrintFormat("%d\n");
+                if (censorMode) censorFormatPtr = makePrintFormat("%d");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt32Ty(), "ptrtobool");
             } else if (exprType == VarType::FLOAT) {
                 formatPtr = makePrintFormat("%f\n");
+                if (censorMode) censorFormatPtr = makePrintFormat("%f");
                 printArg = builder.CreatePtrToInt(arg, builder.getInt64Ty(), "ptrtofloat");
                 printArg = builder.CreateSIToFP(printArg, builder.getDoubleTy(), "inttofp");
             } else {
                 formatPtr = makePrintFormat("%s\n");
+                if (censorMode) censorFormatPtr = makePrintFormat("%s");
             }
         } else {
             formatPtr = makePrintFormat("%d\n");
+            if (censorMode) censorFormatPtr = makePrintFormat("%d");
         }
         
         builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {formatPtr, printArg}, "printfcall");
@@ -2152,6 +2662,36 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
         }
         llvm::Value* stdoutPtr = builder.CreateCall(module->getFunction("__acrt_iob_func"), {builder.getInt32(1)}, "stdout");
         builder.CreateCall(fflushFunc, {stdoutPtr}, "fflush_stdout");
+        
+        // EXP `censer[x]`: if the output equals a censored text, exit immediately.
+        if (censorMode && censorFormatPtr) {
+            llvm::Function* snprintfFunc = module->getFunction("snprintf");
+            llvm::Function* strcmpFunc = module->getFunction("strcmp");
+            if (snprintfFunc && strcmpFunc) {
+                llvm::AllocaInst* cmpBuffer = builder.CreateAlloca(
+                    builder.getInt8Ty(), builder.getInt32(256), "censer_buffer");
+                llvm::Value* cmpBufferPtr = builder.CreateBitCast(
+                    cmpBuffer, builder.getInt8Ty()->getPointerTo(), "censer_buffer_ptr");
+                builder.CreateCall(snprintfFunc,
+                    {cmpBufferPtr, builder.getInt64(256), censorFormatPtr, printArg},
+                    "censer_snprintf");
+                for (const std::string& text : censoredTexts) {
+                    llvm::Value* censoredPtr = builder.CreateGlobalStringPtr(text, "censer_text");
+                    llvm::Value* cmp = builder.CreateCall(strcmpFunc, {cmpBufferPtr, censoredPtr}, "censer_cmp");
+                    llvm::Value* isHit = builder.CreateICmpEQ(cmp, builder.getInt32(0), "censer_hit");
+                    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+                    llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(context, "censer.then", curFn);
+                    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context, "censer.cont", curFn);
+                    builder.CreateCondBr(isHit, thenBB, mergeBB);
+                    builder.SetInsertPoint(thenBB);
+                    llvm::Function* exitFunc = module->getFunction("exit");
+                    if (exitFunc)
+                        builder.CreateCall(exitFunc, {builder.getInt32(0)});
+                    builder.CreateBr(mergeBB);
+                    builder.SetInsertPoint(mergeBB);
+                }
+            }
+        }
         
         return nullptr;
     }
@@ -2183,6 +2723,30 @@ llvm::Value* LLVMCodegen::codegen(ReturnStatement* stmt) {
     
     builder.CreateRet(value);
     return value;
+}
+
+// EXP `value`: a = value expr  — rejects void functions at compile time.
+// For non-call inner expressions (e.g. `value 1+2`) there is nothing to check.
+// The name "value" is still a normal identifier (not a reserved keyword) so
+// existing code using "value" as a variable name keeps working.
+llvm::Value* LLVMCodegen::codegen(ValueExpression* expr) {
+    // Void-function guard: if the inner expression is a call to a function
+    // that was defined without a return statement, emit a hard compile error.
+    if (auto* call = dynamic_cast<CallExpression*>(expr->inner.get())) {
+        // "input" always returns a string — never void.
+        if (call->name != "input") {
+            std::string fullName = call->ns.empty()
+                ? call->name
+                : (call->ns + ":" + call->name);
+            // `voidFuncNames` is populated once by codegenProgram (collectVoidFunctions)
+            if (voidFuncNames.count(fullName) || voidFuncNames.count(call->name)) {
+                addError("[value] the function '" + call->name +
+                         "' does not return a value (void), so it cannot be used here");
+                return nullptr;
+            }
+        }
+    }
+    return codegen(expr->inner.get());
 }
 
 llvm::Value* LLVMCodegen::codegen(BreakStatement* stmt) {
@@ -2978,6 +3542,447 @@ llvm::Value* LLVMCodegen::codegen(DejaStatement* stmt) {
 }
 
 // ---------------------------------------------------------------------------
+// EXP `dual`: split ONE existence into TWO independent selves.
+//
+// `dual x = expr` turns x into a bifurcated variable: from this statement on,
+// x has two separate live storage slots — the ORIGINAL self (plain `x` or
+// `x[0]`) and the SECOND self (`x[1]`) — both born holding the same value.
+// The two selves then evolve fully independently:
+//   `x = v`   -> only the original self changes
+//   `x[0] = v`-> only the original self changes
+//   `x[1] = v`-> only the second self changes
+// Reading `x`  sees the original self; `x[1]` sees the second self. This is
+// NOT a branch, NOT a fork/thread, NOT a copy into another name: it is the
+// "one entity became two identical entities" birth, done at the storage level
+// by the LLVM backend. Only constant indices 0/1 are legal, and only scalar
+// (numeric/bool) existence can be split (a string/array pointer cannot point
+// to "another self").
+llvm::Value* LLVMCodegen::codegen(DualStatement* stmt) {
+    const std::string& name = stmt->name;
+
+    llvm::Value* value = nullptr;
+    if (stmt->value) {
+        value = codegen(stmt->value.get());
+        if (!value) return nullptr;
+        if (value->getType()->isPointerTy()) {
+            addError("[dual] \"" + name +
+                     "\": strings/arrays cannot be split into two independent "
+                     "existences (only numeric/bool values can become dual)");
+            return nullptr;
+        }
+    }
+
+    auto lIt = locals.find(name);
+    llvm::AllocaInst* original = (lIt != locals.end()) ? lIt->second : nullptr;
+
+    if (!original) {
+        if (!value) {
+            addError("dual: no existence to split for '" + name +
+                     "' (assign it a value first, or use 'dual " + name +
+                     " = ...')");
+            return nullptr;
+        }
+        original = birthLocalAlloca(name, value); // born by the split itself
+    }
+
+    llvm::Type* at = original->getAllocatedType();
+    if (at->isPointerTy()) {
+        addError("[dual] \"" + name +
+                 "\" holds a string/array value, which cannot be split into "
+                 "two independent existences");
+        return nullptr;
+    }
+
+    // Type safety for a re-split (`dual x = ...` on an already-born x): the
+    // new value must be assignable to the original self's storage.
+    if (value) {
+        llvm::Type* st = value->getType();
+        bool ints = st->isIntegerTy() && at->isIntegerTy();
+        bool flts = st->isFloatTy() && (at->isFloatTy() || at->isDoubleTy());
+        if (!ints && !flts) {
+            addError("[dual] \"" + name +
+                     "\" already exists as a different type: a re-split must "
+                     "keep the same base type");
+            return nullptr;
+        }
+    }
+
+    llvm::AllocaInst* echo = nullptr;
+    auto eIt = dualEchoVars.find(name);
+    if (eIt != dualEchoVars.end()) {
+        echo = eIt->second;
+    } else {
+        echo = createAllocaInEntry(at, (name + ".dual2").c_str());
+        dualEchoVars[name] = echo;
+    }
+
+    auto storeInto = [&](llvm::AllocaInst* dst, llvm::Value* v) {
+        llvm::Type* dt = dst->getAllocatedType();
+        llvm::Type* st = v->getType();
+        if (st->isIntegerTy() && dt->isIntegerTy()) {
+            storeValueNormalized(v, dst);
+        } else if (st->isFloatTy() && dt->isDoubleTy()) {
+            builder.CreateStore(builder.CreateFPExt(v, dt, "dual.fpext"), dst);
+        } else if (st->isDoubleTy() && dt->isFloatTy()) {
+            builder.CreateStore(builder.CreateFPTrunc(v, dt, "dual.fptrunc"), dst);
+        } else {
+            builder.CreateStore(v, dst);
+        }
+    };
+
+    if (value) {
+        storeInto(original, value);
+        storeInto(echo, value);
+    } else {
+        // `dual x` after the original had a value: clone the current original
+        // self into the second self — one existence becomes two identical ones.
+        llvm::Value* cur = builder.CreateLoad(at, original, "dual.cur");
+        storeInto(echo, cur);
+    }
+
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(IndexedAssignmentStatement* stmt) {
+    auto dIt = dualEchoVars.find(stmt->name);
+    if (dIt == dualEchoVars.end()) {
+        addError("[dual] \"" + stmt->name +
+                 "\" is not a dual variable (use 'dual " + stmt->name +
+                 " = ...' first to split its existence into two selves)");
+        return nullptr;
+    }
+
+    auto lIt = locals.find(stmt->name);
+    if (lIt == locals.end()) {
+        addError("Variable '" + stmt->name + "' used before declaration");
+        return nullptr;
+    }
+
+    // Only constant 0 (original self) / 1 (second self) targets are legal.
+    int64_t idx = -1;
+    if (auto* num = dynamic_cast<NumberLiteral*>(stmt->index.get())) {
+        idx = num->value;
+    } else {
+        llvm::Value* idxVal = codegen(stmt->index.get());
+        if (idxVal) {
+            if (auto* cIdx = llvm::dyn_cast<llvm::ConstantInt>(idxVal)) {
+                idx = cIdx->getSExtValue();
+            }
+        }
+    }
+    if (idx != 0 && idx != 1) {
+        addError("[dual] \"" + stmt->name +
+                 "\" has exactly two selves: the assignment target index must "
+                 "be a constant 0 (original) or 1 (second)");
+        return nullptr;
+    }
+
+    llvm::Value* value = codegen(stmt->value.get());
+    if (!value) return nullptr;
+
+    llvm::AllocaInst* slot = (idx == 0) ? lIt->second : dIt->second;
+    storeValueNormalized(value, slot);
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// EXP `disposable`: one-shot storage + one-shot functions.
+//
+// Variable form: `disposable a = v` / `disposable[5] a = v`. Per variable a
+// runtime stack lives in `disposableVars` (capacity kDisposableMaxLayers):
+// pushing stores the new layer's leftover-read count and value; reading scans
+// the stack from the top down for the first live layer, loads its value and
+// THEN consumes it (count--). Layers that reach 0 remain in the array but are
+// skipped by the scan. When the whole stack is dead the read falls back to the
+// base variable (`locals[name]`, if it existed at the call site) or raises a
+// runtime "undefined / unavailable" error. A normal assignment to `name`
+// poisons the stack (top = -1) and re-establishes a plain value.
+// ---------------------------------------------------------------------------
+
+llvm::Value* LLVMCodegen::codegen(DisposableStatement* stmt) {
+    const std::string& name = stmt->name;
+
+    llvm::Value* value = codegen(stmt->value.get());
+    if (!value) return nullptr;
+
+    llvm::Type* elemTy = value->getType();
+    if (elemTy->isIntegerTy(1)) elemTy = builder.getInt32Ty();
+
+    auto& st = disposableVars[name];
+    if (!st.top) {
+        st.top = createAllocaInEntry(builder.getInt64Ty(), "disp." + name + ".top");
+        builder.CreateStore(createConstInt(context, builder.getInt64Ty(), -1), st.top);
+    }
+    if (!st.elemTy) {
+        st.elemTy = elemTy;
+        st.counts = createAllocaInEntry(
+            llvm::ArrayType::get(builder.getInt64Ty(), kDisposableMaxLayers),
+            ("disp." + name + ".counts").c_str());
+        st.values = createAllocaInEntry(
+            llvm::ArrayType::get(elemTy, kDisposableMaxLayers),
+            ("disp." + name + ".values").c_str());
+    } else if (st.elemTy != elemTy) {
+        addError("[disposable] \"" + name +
+                 "\" already holds a different type: a new disposable layer "
+                 "must keep the same base type");
+        return nullptr;
+    }
+
+    // Runtime push: newTop = min(top + 1, capacity - 1).
+    llvm::Value* topLoad = builder.CreateLoad(builder.getInt64Ty(), st.top, "disp.push.top");
+    llvm::Value* newTop = builder.CreateAdd(topLoad, builder.getInt64(1), "disp.push.ntop");
+    llvm::Value* cap = builder.getInt64(kDisposableMaxLayers - 1);
+    llvm::Value* capped = builder.CreateSelect(
+        builder.CreateICmpSGT(newTop, cap), cap, newTop, "disp.push.capped");
+    builder.CreateStore(capped, st.top);
+
+    // Store the leftover-read count for this layer.
+    llvm::Value* countVal = createConstInt(context, builder.getInt64Ty(), stmt->count);
+    llvm::Value* cntPtr = builder.CreateGEP(builder.getInt64Ty(), st.counts, capped, "disp.push.cnt.ptr");
+    builder.CreateStore(countVal, cntPtr);
+
+    // Store the layer value (mirrors storeValueNormalized's int conversions).
+    llvm::Value* storeVal = value;
+    if (value->getType()->isIntegerTy(1) && elemTy->isIntegerTy(32)) {
+        storeVal = builder.CreateZExt(value, elemTy, "disp.zext");
+    } else if (value->getType()->isIntegerTy(32) && elemTy->isIntegerTy(64)) {
+        storeVal = builder.CreateSExt(value, elemTy, "disp.sext");
+    } else if (value->getType()->isIntegerTy(64) && elemTy->isIntegerTy(32)) {
+        storeVal = builder.CreateTrunc(value, elemTy, "disp.trunc");
+    }
+    llvm::Value* valPtr = builder.CreateGEP(elemTy, st.values, capped, "disp.push.val.ptr");
+    builder.CreateStore(storeVal, valPtr);
+
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegenDisposableRead(const std::string& name,
+                                                llvm::AllocaInst* baseAlloca) {
+    auto it = disposableVars.find(name);
+    if (it == disposableVars.end() || !it->second.top) {
+        if (baseAlloca) {
+            return builder.CreateLoad(baseAlloca->getAllocatedType(), baseAlloca, name.c_str());
+        }
+        addError("Undefined variable: " + name);
+        return nullptr;
+    }
+
+    DisposableState& st = it->second;
+    llvm::Type* elemTy = st.elemTy;
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+
+    llvm::BasicBlock* savedBB = builder.GetInsertBlock();
+    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context, "dsp.cond", curFn);
+    llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(context, "dsp.body", curFn);
+    llvm::BasicBlock* foundBB = llvm::BasicBlock::Create(context, "dsp.found", curFn);
+    llvm::BasicBlock* nextBB = llvm::BasicBlock::Create(context, "dsp.next", curFn);
+    llvm::BasicBlock* outBB = llvm::BasicBlock::Create(context, "dsp.out", curFn);
+
+    llvm::Value* topVal = builder.CreateLoad(builder.getInt64Ty(), st.top, "dsp.top");
+    builder.CreateBr(condBB);
+
+    builder.SetInsertPoint(condBB);
+    llvm::PHINode* idxPhi = builder.CreatePHI(builder.getInt64Ty(), 2, "dsp.idx");
+    idxPhi->addIncoming(topVal, savedBB);
+    llvm::Value* ge0 = builder.CreateICmpSGE(idxPhi, builder.getInt64(0), "dsp.ge0");
+    builder.CreateCondBr(ge0, bodyBB, outBB);
+
+    builder.SetInsertPoint(bodyBB);
+    llvm::Value* cntPtr = builder.CreateGEP(builder.getInt64Ty(), st.counts, idxPhi, "dsp.cnt.ptr");
+    llvm::Value* cnt = builder.CreateLoad(builder.getInt64Ty(), cntPtr, "dsp.cnt");
+    llvm::Value* alive = builder.CreateICmpSGT(cnt, builder.getInt64(0), "dsp.alive");
+    builder.CreateCondBr(alive, foundBB, nextBB);
+
+    builder.SetInsertPoint(foundBB);
+    llvm::Value* valPtr = builder.CreateGEP(elemTy, st.values, idxPhi, "dsp.val.ptr");
+    llvm::Value* result = builder.CreateLoad(elemTy, valPtr, "dsp.val");
+    // Consume AFTER the value was read: the decrement must not affect the value
+    // this very expression uses.
+    llvm::Value* ncnt = builder.CreateSub(cnt, builder.getInt64(1), "dsp.dec");
+    builder.CreateStore(ncnt, cntPtr);
+    builder.CreateBr(outBB);
+
+    builder.SetInsertPoint(nextBB);
+    llvm::Value* nidx = builder.CreateSub(idxPhi, builder.getInt64(1), "dsp.idx.dec");
+    idxPhi->addIncoming(nidx, nextBB);
+    builder.CreateBr(condBB);
+
+    builder.SetInsertPoint(outBB);
+    llvm::PHINode* hitPhi = builder.CreatePHI(builder.getInt1Ty(), 2, "dsp.hit");
+    hitPhi->addIncoming(builder.getFalse(), condBB);
+    hitPhi->addIncoming(builder.getTrue(), foundBB);
+    llvm::PHINode* resPhi = builder.CreatePHI(elemTy, 2, "dsp.res");
+    resPhi->addIncoming(llvm::Constant::getNullValue(elemTy), condBB);
+    resPhi->addIncoming(result, foundBB);
+
+    if (baseAlloca) {
+        llvm::BasicBlock* fbBB = llvm::BasicBlock::Create(context, "dsp.base", curFn);
+        llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(context, "dsp.done", curFn);
+        builder.CreateCondBr(hitPhi, doneBB, fbBB);
+
+        builder.SetInsertPoint(fbBB);
+        llvm::Value* baseVal = builder.CreateLoad(baseAlloca->getAllocatedType(),
+                                                  baseAlloca, (name + ".base").c_str());
+        llvm::Value* fbN = baseVal;
+        llvm::Type* bt = baseVal->getType();
+        if (bt->isIntegerTy(1) && elemTy->isIntegerTy(32)) {
+            fbN = builder.CreateZExt(baseVal, elemTy, "dsp.base.zext");
+        } else if (bt->isIntegerTy(32) && elemTy->isIntegerTy(64)) {
+            fbN = builder.CreateSExt(baseVal, elemTy, "dsp.base.sext");
+        } else if (bt->isIntegerTy(64) && elemTy->isIntegerTy(32)) {
+            fbN = builder.CreateTrunc(baseVal, elemTy, "dsp.base.trunc");
+        }
+        builder.CreateBr(doneBB);
+
+        builder.SetInsertPoint(doneBB);
+        llvm::PHINode* finPhi = builder.CreatePHI(elemTy, 2, "dsp.fin");
+        finPhi->addIncoming(resPhi, outBB);
+        finPhi->addIncoming(fbN, fbBB);
+        return finPhi;
+    }
+
+    // No base variable: an exhausted disposable reads as undefined/unavailable.
+    llvm::BasicBlock* undefBB = llvm::BasicBlock::Create(context, "dsp.undef", curFn);
+    llvm::BasicBlock* contBB = llvm::BasicBlock::Create(context, "dsp.cont", curFn);
+    builder.CreateCondBr(hitPhi, contBB, undefBB);
+
+    builder.SetInsertPoint(undefBB);
+    emitRuntimeError("错误：变量 " + name + " 未定义/不可用（disposable 已消耗）");
+    builder.CreateRet(createConstInt(context, builder.getInt64Ty(), 0));
+
+    builder.SetInsertPoint(contBB);
+    return resPhi;
+}
+
+// EXP `interest`: birth/reuse the float storage of an interest variable and
+// append its rule. `¥` simple-interest rules freeze their per-read addend
+// (principal * rate) right now; `$` compound rules only store the rate and
+// compute the addend from the live balance at every read.
+llvm::Value* LLVMCodegen::codegen(InterestStatement* stmt) {
+    llvm::Value* value = codegen(stmt->value.get());
+    if (!value) return nullptr;
+
+    auto it = locals.find(stmt->name);
+    llvm::AllocaInst* alloca = nullptr;
+    if (it == locals.end()) {
+        alloca = createAllocaInEntry(builder.getFloatTy(), stmt->name.c_str());
+        locals[stmt->name] = alloca;
+        localTypes[stmt->name] = VarType::FLOAT;
+    } else {
+        alloca = it->second;
+        if (!alloca->getAllocatedType()->isFloatTy()) {
+            addError("[interest] \"" + stmt->name +
+                     "\" already exists as a non-float variable; an interest "
+                     "variable must stay float");
+            return nullptr;
+        }
+    }
+
+    // Promote the RHS to float (ints auto-convert, per the spec).
+    llvm::Value* fval = value;
+    if (value->getType()->isIntegerTy()) {
+        fval = builder.CreateSIToFP(value, builder.getFloatTy(), "int.to.float");
+    } else if (value->getType()->isPointerTy()) {
+        addError("[interest] variable '" + stmt->name +
+                 "' cannot be an interest variable (value is a string/array)");
+        return nullptr;
+    } else if (!value->getType()->isFloatTy()) {
+        addError("[interest] unsupported value type for '" + stmt->name + "'");
+        return nullptr;
+    }
+    builder.CreateStore(fval, alloca);
+
+    InterestState& st = interestVars[stmt->name];
+    InterestRule rule;
+    rule.isCompound = stmt->isCompound;
+    rule.rate = stmt->rate;
+    if (!stmt->isCompound) {
+        // Simple interest: the per-read addend is fixed at the rule's birth
+        // value (the loan principal * rate).
+        rule.amount = builder.CreateFMul(
+            fval, llvm::ConstantFP::get(builder.getFloatTy(), stmt->rate),
+            (stmt->name + ".amount").c_str());
+    }
+    st.rules.push_back(rule);
+    return nullptr;
+}
+
+// EXP `interest`: load the current float balance, return it to the expression,
+// then apply every rule (in definition order) and store the grown balance back
+// — so the NEXT read of the same variable (even inside the same expression)
+// sees a bigger value. Straight-line IR keeps the read granularity at one per
+// VariableExpression.
+llvm::Value* LLVMCodegen::codegenInterestRead(const std::string& name,
+                                              llvm::AllocaInst* baseAlloca) {
+    if (!baseAlloca) {
+        addError("Undefined variable: " + name);
+        return nullptr;
+    }
+    llvm::Type* ft = builder.getFloatTy();
+    llvm::Value* v = builder.CreateLoad(ft, baseAlloca, (name + ".iv").c_str());
+
+    auto it = interestVars.find(name);
+    llvm::Value* work = v;
+    if (it != interestVars.end()) {
+        for (const auto& rule : it->second.rules) {
+            if (rule.isCompound) {
+                llvm::Value* gain = builder.CreateFMul(
+                    work, llvm::ConstantFP::get(ft, rule.rate), "iv.comp.gain");
+                work = builder.CreateFAdd(work, gain, "iv.comp");
+            } else if (rule.amount) {
+                work = builder.CreateFAdd(work, rule.amount, "iv.simple");
+            }
+        }
+    }
+    builder.CreateStore(work, baseAlloca);
+    return v;
+}
+
+// Print a runtime error message (matching the `boom` output plumbing) and
+// return; the caller is responsible for terminating control flow (createRet).
+void LLVMCodegen::emitRuntimeError(const std::string& message) {
+    llvm::Function* printfFunc = module->getFunction("printf");
+    if (!printfFunc) return;
+    llvm::Value* fmt = builder.CreateGlobalStringPtr(message + "\n", "xfaw_err_fmt");
+    builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {fmt}, "xfaw_err_printf");
+    llvm::Function* fflushFunc = module->getFunction("fflush");
+    llvm::Function* iobFunc = module->getFunction("__acrt_iob_func");
+    if (fflushFunc && iobFunc) {
+        llvm::Value* stdoutPtr = builder.CreateCall(iobFunc, {builder.getInt32(1)}, "stdout");
+        builder.CreateCall(fflushFunc, {stdoutPtr}, "fflush_stdout");
+    }
+}
+
+// One-shot function guard. Emitted at the top of a `disposable fn` body: a
+// module-global flag starts at 0; the first call sets it to 1, every later
+// call prints "undefined / unavailable" and terminates.
+void LLVMCodegen::emitDisposableGuard(const std::string& funcName) {
+    std::string gName = "__xfawa_disp_" + funcName;
+    llvm::GlobalVariable* g = module->getNamedGlobal(gName);
+    if (!g) {
+        g = new llvm::GlobalVariable(
+            *module, builder.getInt64Ty(), false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(builder.getInt64Ty(), 0), gName);
+    }
+
+    llvm::Value* flag = builder.CreateLoad(builder.getInt64Ty(), g, "dsp.fn.flag");
+    llvm::Value* used = builder.CreateICmpNE(flag, builder.getInt64(0), "dsp.fn.used");
+
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock* errBB = llvm::BasicBlock::Create(context, "dsp.fn.err", curFn);
+    llvm::BasicBlock* contBB = llvm::BasicBlock::Create(context, "dsp.fn.cont", curFn);
+    builder.CreateCondBr(used, errBB, contBB);
+
+    builder.SetInsertPoint(errBB);
+    emitRuntimeError("错误：函数 " + funcName + " 不可用（disposable 只能调用一次）");
+    builder.CreateRet(createConstInt(context, builder.getInt64Ty(), 0));
+
+    builder.SetInsertPoint(contBB);
+    builder.CreateStore(builder.getInt64(1), g);
+}
+
+// ---------------------------------------------------------------------------
 // EXP `pinocchio`: a self-referential proposition (Pinocchio paradox).
 //
 // `pinocchio (P) { THEN } else { ELSE } limit: N` treats P as a proposition
@@ -3703,6 +4708,34 @@ llvm::Value* LLVMCodegen::codegen(ComeStatement* stmt) {
     return nullptr;
 }
 
+// EXP `kill[x]`: set the runtime flag that will skip the statement at line x.
+llvm::Value* LLVMCodegen::codegen(KillStatement* stmt) {
+    if (stmt->targetLine <= 0 || stmt->targetLine > 1000000) return nullptr;
+    llvm::Value* flags = getKillFlagsGlobal();
+    llvm::Value* idx = createConstInt(context, llvm::Type::getInt64Ty(context), stmt->targetLine);
+    llvm::Value* ptr = builder.CreateGEP(builder.getInt8Ty(), flags, idx, "kill.ptr");
+    builder.CreateStore(builder.getInt8(1), ptr);
+    return nullptr;
+}
+
+// EXP `censer[x]`: record the text that will trigger immediate exit if printed.
+llvm::Value* LLVMCodegen::codegen(CenserStatement* stmt) {
+    if (!stmt->text.empty())
+        censoredTexts.push_back(stmt->text);
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::getKillFlagsGlobal() {
+    if (killFlags) return killFlags;
+    llvm::ArrayType* ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 1000001);
+    killFlags = new llvm::GlobalVariable(
+        *module, ty, false,
+        llvm::GlobalValue::PrivateLinkage,
+        llvm::Constant::getNullValue(ty),
+        "__xfawa_kill_flags");
+    return killFlags;
+}
+
 void LLVMCodegen::maybeEmitComeJump(Statement* stmt) {
     if (comeTargetPick.empty()) return;
 
@@ -4119,6 +5152,8 @@ VarType LLVMCodegen::getExpressionType(Expression* expr) {
             return VarType::LONG;
         }
         return VarType::INT;
+    } else if (auto* valueExpr = dynamic_cast<ValueExpression*>(expr)) {
+        return getExpressionType(valueExpr->inner.get());
     }
     return VarType::UNKNOWN;
 }
@@ -4231,6 +5266,8 @@ void LLVMCodegen::collectCallArgTypes(Expression* expr) {
         collectCallArgTypes(binOp->right.get());
     } else if (auto* unaryOp = dynamic_cast<UnaryOp*>(expr)) {
         collectCallArgTypes(unaryOp->expr.get());
+    } else if (auto* valueExpr = dynamic_cast<ValueExpression*>(expr)) {
+        collectCallArgTypes(valueExpr->inner.get());
     } else if (auto* arrLit = dynamic_cast<ArrayLiteral*>(expr)) {
         for (auto& elem : arrLit->elements) {
             collectCallArgTypes(elem.get());
@@ -4252,6 +5289,8 @@ void LLVMCodegen::collectCallArgTypes(Statement* stmt) {
         collectCallArgTypes(exprStmt->expr.get());
     } else if (auto* assignStmt = dynamic_cast<AssignmentStatement*>(stmt)) {
         collectCallArgTypes(assignStmt->value.get());
+    } else if (auto* interestStmt = dynamic_cast<InterestStatement*>(stmt)) {
+        collectCallArgTypes(interestStmt->value.get());
     } else if (auto* printStmt = dynamic_cast<PrintStatement*>(stmt)) {
         collectCallArgTypes(printStmt->expr.get());
     } else if (auto* returnStmt = dynamic_cast<ReturnStatement*>(stmt)) {
@@ -4375,8 +5414,30 @@ void LLVMCodegen::collectCallArgTypes(Program* program) {
     }
 }
 
+// EXP `value`: record every user function that never returns a value (void),
+// so `a = value foo()` can reject them at compile time.
+void LLVMCodegen::collectVoidFunctions(Program* program) {
+    if (voidFuncsCollected) return;
+    voidFuncsCollected = true;
+    voidFuncNames.clear();
+    for (auto& mod : program->modules) {
+        for (auto& func : mod->functions) {
+            std::string funcName = func->name;
+            if (func->name != "main" && !func->ns.empty()) funcName = func->ns + ":" + func->name;
+            // A function is void when its body contains no return statement
+            // (checked recursively through nested blocks/branches/loops).
+            bool hasReturn = func->body && stmtHasReturn(func->body.get());
+            if (!hasReturn) {
+                voidFuncNames.insert(funcName);
+                voidFuncNames.insert(func->name);
+            }
+        }
+    }
+}
+
 bool LLVMCodegen::codegenProgram(Program* program) {
     collectCallArgTypes(program);
+    collectVoidFunctions(program);
 
     for (auto& imp : program->imports) {
         if (!codegen(imp.get())) {
@@ -4492,6 +5553,10 @@ bool LLVMCodegen::codegen(Function* func) {
     auto savedLocalTypes = localTypes;
     auto savedArrayLengths = arrayLengths;
     auto savedFateSlots = fateSlots; // EXP `fate`
+    auto savedDualEchoVars = dualEchoVars; // EXP `dual`
+    auto savedDisposableVars = disposableVars; // EXP `disposable`
+    auto savedInterestVars = interestVars; // EXP `interest`
+    auto savedBackroomVars = backroomVars; // EXP `noclip`
     std::string savedCurrentFunc = currentFuncName; // EXP `drift`: restore on exit
     llvm::BasicBlock* savedInsertBlock = builder.GetInsertBlock();
     llvm::Function* savedInsertFunction = savedInsertBlock ? savedInsertBlock->getParent() : nullptr;
@@ -4499,6 +5564,10 @@ bool LLVMCodegen::codegen(Function* func) {
     locals.clear();
     localTypes.clear();
     fateSlots.clear(); // EXP `fate`: per-function destiny/floor state
+    dualEchoVars.clear(); // EXP `dual`: a split never leaks across functions
+    disposableVars.clear(); // EXP `disposable`: layers never leak across functions
+    interestVars.clear(); // EXP `interest`: interest rules never leak across functions
+    backroomVars.clear(); // EXP `noclip`: backrooms never leak across functions
     
     bool isMain = (func->name == "main");
     
@@ -4634,6 +5703,12 @@ bool LLVMCodegen::codegen(Function* func) {
             i++;
         }
         
+        if (func->disposable) {
+            // EXP `disposable`: one-shot function guard (first call runs,
+            // every later entry reports "unavailable" and terminates).
+            emitDisposableGuard(funcName);
+        }
+
         if (func->body) {
             // EXP `come`: scan this function for `come` statements, validate the
             // target lines, and pre-create a landing block for every come so both
@@ -4762,6 +5837,10 @@ bool LLVMCodegen::codegen(Function* func) {
     localTypes = savedLocalTypes;
     arrayLengths = savedArrayLengths;
     fateSlots = savedFateSlots; // EXP `fate`
+    dualEchoVars = savedDualEchoVars; // EXP `dual`
+    disposableVars = savedDisposableVars; // EXP `disposable`
+    interestVars = savedInterestVars; // EXP `interest`
+    backroomVars = savedBackroomVars; // EXP `noclip`
     currentFuncName = savedCurrentFunc; // EXP `drift`
     
     if (savedInsertBlock && savedInsertFunction) {
@@ -4772,6 +5851,25 @@ bool LLVMCodegen::codegen(Function* func) {
 }
 
 bool LLVMCodegen::codegen(Statement* stmt) {
+    // EXP `kill[x]`: before every statement, test the kill flag for its source
+    // line; if set, skip the statement entirely (branch straight to continuation).
+    int line = stmt->location.line;
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock* skipBB = nullptr, *runBB = nullptr, *contBB = nullptr;
+    llvm::Value* wasKilled = nullptr;
+    if (line > 0 && line <= 1000000) {
+        llvm::Value* flags = getKillFlagsGlobal();
+        llvm::Value* idx = createConstInt(context, llvm::Type::getInt64Ty(context), line);
+        llvm::Value* flagPtr = builder.CreateGEP(builder.getInt8Ty(), flags, idx, "kill.ptr");
+        llvm::Value* flag = builder.CreateLoad(builder.getInt8Ty(), flagPtr, "kill.flg");
+        wasKilled = builder.CreateICmpNE(flag, builder.getInt8(0), "kill.is");
+        runBB  = llvm::BasicBlock::Create(context, "kill.run",  curFn);
+        skipBB = llvm::BasicBlock::Create(context, "kill.skip", curFn);
+        contBB = llvm::BasicBlock::Create(context, "kill.cont", curFn);
+        builder.CreateCondBr(wasKilled, skipBB, runBB);
+        builder.SetInsertPoint(runBB);
+    }
+
     // EXP-001: honour a repeat directive attached to this statement.
     int repeat = 1;
     auto it = repeatMap.find(stmt);
@@ -4783,11 +5881,15 @@ bool LLVMCodegen::codegen(Statement* stmt) {
     for (int i = 0; i < repeat; ++i) {
         result = codegenOnce(stmt);
     }
-    // EXP `come`: after every generated statement, check whether its physical
-    // line is a come target; if so, emit the jump back to the come landing.
-    // Note: statement generators return nullptr on success, so `result` cannot
-    // gate this hook; only the block-term/line checks inside decide.
     maybeEmitComeJump(stmt);
+
+    if (contBB) {
+        if (!builder.GetInsertBlock()->getTerminator())
+            builder.CreateBr(contBB);
+        builder.SetInsertPoint(skipBB);
+        builder.CreateBr(contBB);
+        builder.SetInsertPoint(contBB);
+    }
     return result;
 }
 
@@ -4814,6 +5916,14 @@ bool LLVMCodegen::codegenOnce(Statement* stmt) {
     if (dynamic_cast<ParadoxStatement*>(stmt)) return codegen(dynamic_cast<ParadoxStatement*>(stmt)) != nullptr;
     if (dynamic_cast<DejaStatement*>(stmt)) return codegen(dynamic_cast<DejaStatement*>(stmt)) != nullptr;
     if (dynamic_cast<PinocchioStatement*>(stmt)) return codegen(dynamic_cast<PinocchioStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<DualStatement*>(stmt)) return codegen(dynamic_cast<DualStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<IndexedAssignmentStatement*>(stmt)) return codegen(dynamic_cast<IndexedAssignmentStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<DisposableStatement*>(stmt)) return codegen(dynamic_cast<DisposableStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<InterestStatement*>(stmt)) return codegen(dynamic_cast<InterestStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<KillStatement*>(stmt)) return codegen(dynamic_cast<KillStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<CenserStatement*>(stmt)) return codegen(dynamic_cast<CenserStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<NoclipStatement*>(stmt)) return codegen(dynamic_cast<NoclipStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<ShufflebackStatement*>(stmt)) return codegen(dynamic_cast<ShufflebackStatement*>(stmt)) != nullptr;
     if (dynamic_cast<FateStatement*>(stmt)) return codegen(dynamic_cast<FateStatement*>(stmt)) != nullptr;
     if (dynamic_cast<EnvyStatement*>(stmt)) return codegen(dynamic_cast<EnvyStatement*>(stmt)) != nullptr;
     if (dynamic_cast<TryExpectStatement*>(stmt)) return codegen(dynamic_cast<TryExpectStatement*>(stmt)) != nullptr;
@@ -4908,6 +6018,10 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     auto savedLocalTypes = localTypes;
     auto savedArrayLengths = arrayLengths;
     auto savedFateSlots = fateSlots; // EXP `fate`
+    auto savedDualEchoVars = dualEchoVars; // EXP `dual`
+    auto savedDisposableVars = disposableVars; // EXP `disposable`
+    auto savedInterestVars = interestVars; // EXP `interest`
+    auto savedBackroomVars = backroomVars; // EXP `noclip`
     auto savedLoopEndBB = loopEndBB;
     int savedActiveWindowId = activeWindowId;
     llvm::IRBuilderBase::InsertPoint savedInsertPoint = builder.saveIP();
@@ -4916,6 +6030,10 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     localTypes.clear();
     arrayLengths.clear();
     fateSlots.clear(); // EXP `fate`: per-handler destiny/floor state
+    dualEchoVars.clear(); // EXP `dual`: per-handler split state
+    disposableVars.clear(); // EXP `disposable`: per-handler layer state
+    interestVars.clear(); // EXP `interest`: per-handler rule state
+    backroomVars.clear(); // EXP `noclip`: per-handler backroom state
     loopEndBB = nullptr;
     activeWindowId = printWindowId;
     builder.SetInsertPoint(entryBB);
@@ -4938,6 +6056,10 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     localTypes = std::move(savedLocalTypes);
     arrayLengths = std::move(savedArrayLengths);
     fateSlots = std::move(savedFateSlots); // EXP `fate`
+    dualEchoVars = std::move(savedDualEchoVars); // EXP `dual`
+    disposableVars = std::move(savedDisposableVars); // EXP `disposable`
+    interestVars = std::move(savedInterestVars); // EXP `interest`
+    backroomVars = std::move(savedBackroomVars); // EXP `noclip`
     loopEndBB = savedLoopEndBB;
     activeWindowId = savedActiveWindowId;
 
@@ -5738,6 +6860,7 @@ llvm::Value* LLVMCodegen::codegen(Expression* expr) {
     if (auto* e = dynamic_cast<ArrayRangeExpression*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<ArrayLiteral*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<ArrayIndexExpression*>(expr)) return codegen(e);
+    if (auto* e = dynamic_cast<ValueExpression*>(expr)) return codegen(e);
     return nullptr;
 }
 

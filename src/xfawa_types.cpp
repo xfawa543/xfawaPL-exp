@@ -49,6 +49,15 @@ std::string nodeTypeToString(NodeType type) {
         case NodeType::SLEEP_STATEMENT: return "sleep_statement";
         case NodeType::COME_STATEMENT: return "come_statement";
         case NodeType::PINOCCHIO_STATEMENT: return "pinocchio_statement";
+        case NodeType::DUAL_STATEMENT: return "dual_statement";
+        case NodeType::INDEXED_ASSIGNMENT_STATEMENT: return "indexed_assignment_statement";
+        case NodeType::DISPOSABLE_STATEMENT: return "disposable_statement";
+        case NodeType::INTEREST_STATEMENT: return "interest_statement";
+        case NodeType::KILL_STATEMENT: return "kill_statement";
+        case NodeType::CENSER_STATEMENT: return "censer_statement";
+        case NodeType::NOCLIP_STATEMENT: return "noclip_statement";
+        case NodeType::SHUFFLEBACK_STATEMENT: return "shuffleback_statement";
+        case NodeType::VALUE_EXPRESSION: return "value_expression";
         case NodeType::STATEMENT: return "statement";
         case NodeType::PRINT_STATEMENT: return "print_statement";
         case NodeType::EXPRESSION_STATEMENT: return "expression_statement";
@@ -103,6 +112,12 @@ std::string Token::toString() const {
         case TokenType::KEYWORD_FLOAT: typeStr = "float"; break;
         case TokenType::KEYWORD_BOOL: typeStr = "bool"; break;
         case TokenType::KEYWORD_STRING: typeStr = "string"; break;
+        case TokenType::KEYWORD_INTEREST_SIMPLE: typeStr = "¥"; break;
+        case TokenType::KEYWORD_KILL: typeStr = "kill"; break;
+        case TokenType::KEYWORD_CENSER: typeStr = "censer"; break;
+        case TokenType::KEYWORD_NOCLIP: typeStr = "noclip"; break;
+        case TokenType::KEYWORD_SHUFFLEBACK: typeStr = "shuffleback"; break;
+        case TokenType::KEYWORD_VALUE: typeStr = "value"; break;
         case TokenType::KEYWORD_FOR: typeStr = "for"; break;
         case TokenType::KEYWORD_WINDOW: typeStr = "window"; break;
         case TokenType::KEYWORD_INPUT: typeStr = "input"; break;
@@ -133,6 +148,9 @@ std::string Token::toString() const {
         case TokenType::PUNCTUATOR_DOLLAR: typeStr = "$"; break;
         case TokenType::PUNCTUATOR_COLON: typeStr = ":"; break;
         case TokenType::PUNCTUATOR_DOT_DOT_DOT: typeStr = "..."; break;
+        case TokenType::PUNCTUATOR_FU_K: typeStr = "fu*k"; break;
+        case TokenType::COLOR_LITERAL: typeStr = "color"; break;
+        case TokenType::O_LITERAL: typeStr = "o-literal"; break;
         default: typeStr = "unknown"; break;
     }
     return typeStr + " " + text + " (" + std::to_string(location.line) + ":" + std::to_string(location.column) + ")";

@@ -1,0 +1,80 @@
+#test {
+// EXP `disposable` 视频演示：一次性 —— 用过即碎，读完即耗
+// disposable x = v 给 x 盖上一层"一次性覆盖值"：每次读取消耗一次，
+//   层耗尽自动回退到上一层 / 普通值；普通赋值会清空所有一次性层。
+// disposable[N] x = v 指定该层可读 N 次。
+// disposable fn f() 让函数只能调用一次，第二次调用 → 程序报"不可用"终止。
+
+    disposable fn one_shot() {
+        print("是一次性函数：这次调用是真的，下一次就没了")
+    }
+
+    fn main() {
+        // 第 1 幕：读取即消耗，随即回退
+        print("== 1. 读一次，耗一层 ==")
+        first = 1
+        disposable first = 2
+        sum = first + 1   // 读到 2 并消耗这一层
+        print(sum)        // 3
+        print(first)      // 1（层已耗尽，回退到普通值）
+        print("--")
+
+        // 第 2 幕：同一表达式里读几次，就耗几次
+        print("== 2. 一个表达式连读三次 ==")
+        value = 1
+        disposable value = 2
+        total = value + value + value   // 2 + 1 + 1 = 4
+        print(total)      // 4
+        print("--")
+
+        // 第 3 幕：同名多层按 LIFO 栈叠加，先读新层
+        print("== 3. 多层一次性：从上往下读 ==")
+        stack = 1
+        disposable stack = 2
+        disposable stack = 3
+        disposable stack = 4
+        print(stack)      // 4
+        print(stack)      // 3
+        print(stack)      // 2
+        print(stack)      // 1（回退）
+        print(stack)      // 1
+        print("--")
+
+        // 第 4 幕：普通赋值会把一次性层全部清掉
+        print("== 4. 普通赋值清层 ==")
+        rev = 5
+        disposable rev = 6
+        disposable rev = 7
+        rev = 100
+        print(rev)        // 100
+        print(rev)        // 100
+        print("--")
+
+        // 第 5 幕：指定可读次数 disposable[3]
+        print("== 5. 限次：disposable[3] 只能读 3 次 ==")
+        ticket = 0
+        disposable[3] ticket = 42
+        print(ticket)     // 42
+        print(ticket)     // 42
+        print(ticket)     // 42
+        print(ticket)     // 0（回退到普通值）
+        print("--")
+
+        // 第 6 幕：一次性变量 + 一次性函数一起收尾
+        print("== 6. 两个一次性：一个值、一个函数 ==")
+        ghost = 0
+        disposable[2] ghost = 777
+        print(ghost)      // 777
+        print(ghost)      // 777（第二层）
+        print(ghost)      // 0（两层全耗尽 → 回退）
+        one_shot()
+        print("--")
+
+        // 第 7 幕（终幕）：用完即无 —— 层耗尽、又从未有普通值 → 未定义终止
+        print("== 7. 终幕：第二次调用一次性函数 / 读空一次性值 ==")
+        disposable gone = 9        // gone 从未有过普通值，只有这一层
+        print(gone)                // 9
+        print(gone)                // 层已读走、又没有普通值 → 运行时"未定义/不可用"终止
+        print("这一行永远不会出现")
+    }
+}

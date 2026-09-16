@@ -31,6 +31,10 @@ bool isKeywordLikeNameToken(TokenType type) {
         case TokenType::KEYWORD_WINDOW:
         case TokenType::KEYWORD_DRIFT:
         case TokenType::KEYWORD_PINOCCHIO:
+        case TokenType::KEYWORD_KILL:
+        case TokenType::KEYWORD_CENSER:
+        case TokenType::KEYWORD_NOCLIP:
+        case TokenType::KEYWORD_SHUFFLEBACK:
             return true;
         default:
             return false;
@@ -65,6 +69,10 @@ static const std::vector<std::pair<std::string, TokenType>>& autoFixCandidates()
         {"try",    TokenType::KEYWORD_TRY},
         {"expect", TokenType::KEYWORD_EXPECT},
         {"sorry",  TokenType::KEYWORD_SORRY},
+        {"kill",   TokenType::KEYWORD_KILL},
+        {"censer", TokenType::KEYWORD_CENSER},
+        {"noclip", TokenType::KEYWORD_NOCLIP},
+        {"shuffleback", TokenType::KEYWORD_SHUFFLEBACK}
     };
     return map;
 }
@@ -230,6 +238,8 @@ std::unique_ptr<Module> Parser::parseModule() {
             std::unique_ptr<Function> func;
             if (peek().is(TokenType::KEYWORD_DRIFT)) {
                 func = parseDriftFunction();
+            } else if (peek().is(TokenType::KEYWORD_DISPOSABLE)) {
+                func = parseDisposableFunction();
             } else {
                 func = parseFunction();
             }
@@ -984,6 +994,26 @@ std::unique_ptr<Function> Parser::parseDriftFunction() {
     return func;
 }
 
+std::unique_ptr<Function> Parser::parseDisposableFunction() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_DISPOSABLE)) {
+        return nullptr;
+    }
+
+    if (!peek().is(TokenType::KEYWORD_FN)) {
+        addError("Expected 'fn' after 'disposable'");
+        return nullptr;
+    }
+
+    auto func = parseFunction();
+    if (!func) {
+        return nullptr;
+    }
+    func->disposable = true;
+    return func;
+}
+
 std::unique_ptr<Function> Parser::parseFunction() {
     SourceLocation loc = peek().location;
     
@@ -1134,6 +1164,22 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         return std::make_unique<FunctionDeclarationStatement>(std::move(func), loc);
     } else if (peek().is(TokenType::KEYWORD_PINOCCHIO)) {
         return parsePinocchioStatement();
+    } else if (peek().is(TokenType::KEYWORD_DUAL)) {
+        return parseDualStatement();
+    } else if (peek().is(TokenType::KEYWORD_DISPOSABLE)) {
+        return parseDisposableStatement();
+    } else if (peek().is(TokenType::KEYWORD_INTEREST_SIMPLE)) {
+        return parseInterestStatement(false);
+    } else if (peek().is(TokenType::PUNCTUATOR_DOLLAR)) {
+        return parseInterestStatement(true);
+    } else if (peek().is(TokenType::KEYWORD_KILL)) {
+        return parseKillStatement();
+    } else if (peek().is(TokenType::KEYWORD_CENSER)) {
+        return parseCenserStatement();
+    } else if (peek().is(TokenType::KEYWORD_NOCLIP)) {
+        return parseNoclipStatement();
+    } else if (peek().is(TokenType::KEYWORD_SHUFFLEBACK)) {
+        return parseShufflebackStatement();
     } else if (peek().is(TokenType::KEYWORD_INT)) {
         advance();
         return parseTypedAssignmentStatement(VarType::INT);
@@ -1192,6 +1238,12 @@ std::unique_ptr<Statement> Parser::parseStatement() {
             auto expr = parseExpression();
             if (!expr) return nullptr;
             return std::make_unique<ExpressionStatement>(std::move(expr), loc);
+        }
+        // EXP `dual`: `x[0] = v` / `x[1] = v` writes to one of a dual
+        // variable's two selves. This used to be a parse error (array element
+        // assignment was unsupported), so it is a purely additive branch.
+        if (peek(1).is(TokenType::PUNCTUATOR_LBRACKET)) {
+            return parseIndexedAssignmentStatement();
         }
         // Note: Xraphics object definitions (name = x3d.box(...)) are only allowed
         // inside class blocks (parseClassDeclarationStatement), not in regular statements.
@@ -1254,9 +1306,24 @@ std::unique_ptr<AssignmentStatement> Parser::parseAssignmentStatement() {
         return nullptr;
     }
     
+    bool isValuePrefix = false;
+    if (peek().is(TokenType::IDENTIFIER) && peek().text == "value") {
+        TokenType nextType = peek(1).type;
+        if (nextType == TokenType::NUMBER_LITERAL || nextType == TokenType::LONG_LITERAL ||
+            nextType == TokenType::FLOAT_LITERAL || nextType == TokenType::STRING_LITERAL ||
+            nextType == TokenType::IDENTIFIER || nextType == TokenType::KEYWORD_TRUE ||
+            nextType == TokenType::KEYWORD_FALSE || nextType == TokenType::KEYWORD_INPUT ||
+            nextType == TokenType::PUNCTUATOR_LPAREN || nextType == TokenType::O_LITERAL) {
+            isValuePrefix = true;
+            advance();
+        }
+    }
+    
     auto expr = parseExpression();
-    if (!expr) {
-        return nullptr;
+    if (!expr) return nullptr;
+    
+    if (isValuePrefix) {
+        expr = std::make_unique<ValueExpression>(std::move(expr), loc);
     }
     
     bool alreadyDeclared = isVariableDeclared(name);
@@ -1285,9 +1352,26 @@ std::unique_ptr<AssignmentStatement> Parser::parseTypedAssignmentStatement(VarTy
         return nullptr;
     }
     
+    bool isValuePrefix = false;
+    if (peek().is(TokenType::IDENTIFIER) && peek().text == "value") {
+        TokenType nextType = peek(1).type;
+        if (nextType == TokenType::NUMBER_LITERAL || nextType == TokenType::LONG_LITERAL ||
+            nextType == TokenType::FLOAT_LITERAL || nextType == TokenType::STRING_LITERAL ||
+            nextType == TokenType::IDENTIFIER || nextType == TokenType::KEYWORD_TRUE ||
+            nextType == TokenType::KEYWORD_FALSE || nextType == TokenType::KEYWORD_INPUT ||
+            nextType == TokenType::PUNCTUATOR_LPAREN || nextType == TokenType::O_LITERAL) {
+            isValuePrefix = true;
+            advance();
+        }
+    }
+    
     auto expr = parseExpression();
     if (!expr) {
         return nullptr;
+    }
+    
+    if (isValuePrefix) {
+        expr = std::make_unique<ValueExpression>(std::move(expr), loc);
     }
     
     declareVariable(name);
@@ -1661,6 +1745,249 @@ std::unique_ptr<Statement> Parser::parsePinocchioStatement() {
                                                 std::move(elseBlock), limit, loc);
 }
 
+std::unique_ptr<Statement> Parser::parseDualStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_DUAL)) return nullptr;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after 'dual'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    std::unique_ptr<Expression> value = nullptr;
+    if (consume(TokenType::PUNCTUATOR_EQUAL)) {
+        value = parseExpression();
+        if (!value) return nullptr;
+        // `dual x = ...` births the variable: later plain assignments to x
+        // reuse the same storage instead of declaring it again.
+        if (!isVariableDeclared(name)) {
+            declareVariable(name);
+        }
+    } else if (!isVariableDeclared(name)) {
+        addError("dual: variable '" + name +
+                 "' has no existence to split yet (use 'dual " + name +
+                 " = ...' to split a fresh value, or assign " + name +
+                 " first)");
+        return nullptr;
+    }
+
+    return std::make_unique<DualStatement>(name, std::move(value), loc);
+}
+
+// EXP `dual`: `x[0] = v` / `x[1] = v` writes to one of a dual variable's two
+// selves. Only parsed for dual variables at codegen time (a plain array
+// element assignment remains unsupported, so existing programs are untouched).
+std::unique_ptr<Statement> Parser::parseIndexedAssignmentStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::IDENTIFIER)) return nullptr;
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_LBRACKET)) {
+        addError("Expected '[' after variable name");
+        return nullptr;
+    }
+    auto index = parseExpression();
+    if (!index) return nullptr;
+
+    if (!consume(TokenType::PUNCTUATOR_RBRACKET)) {
+        addError("Expected ']' after the dual self index");
+        return nullptr;
+    }
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after the index in '" + name + "[...] = ' statement");
+        return nullptr;
+    }
+    auto value = parseExpression();
+    if (!value) return nullptr;
+
+    return std::make_unique<IndexedAssignmentStatement>(name, std::move(index),
+                                                        std::move(value), loc);
+}
+
+// EXP `disposable`: three forms handled here --
+//   * `disposable a = v`          one read, then undefined (or base fallback)
+//   * `disposable[5] a = v`       up to 5 reads
+//   * `disposable fn f() {...}`   one-shot function (returns a function decl)
+// NOTE: do not declareVariable() -- a disposed layer is not a plain variable
+// and must not force later `a = ...` to be treated as a reassignment.
+std::unique_ptr<Statement> Parser::parseDisposableStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_DISPOSABLE)) return nullptr;
+
+    if (peek().is(TokenType::KEYWORD_FN)) {
+        auto func = parseFunction();
+        if (!func) return nullptr;
+        func->disposable = true;
+        return std::make_unique<FunctionDeclarationStatement>(std::move(func), loc);
+    }
+
+    int64_t dispoCount = 1;
+    bool hasCount = false;
+    if (peek().is(TokenType::PUNCTUATOR_LBRACKET)) {
+        advance();
+        if (!peek().is(TokenType::NUMBER_LITERAL)) {
+            addError("Expected a read-count number in 'disposable[n]'");
+            return nullptr;
+        }
+        long long n = std::stoll(peek().text);
+        if (n < 1) {
+            addError("disposable read count must be >= 1");
+            return nullptr;
+        }
+        dispoCount = n;
+        hasCount = true;
+        advance();
+        if (!consume(TokenType::PUNCTUATOR_RBRACKET)) {
+            addError("Expected ']' after the read-count in 'disposable[n]'");
+            return nullptr;
+        }
+    }
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after 'disposable'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after the disposable variable name");
+        return nullptr;
+    }
+    auto value = parseExpression();
+    if (!value) return nullptr;
+
+    return std::make_unique<DisposableStatement>(name, dispoCount, hasCount,
+                                                 std::move(value), loc);
+}
+
+// EXP `interest`: `¥[r] a = v` (simple interest) and `$[r] a = v` (compound
+// interest). The prefix token (`KEYWORD_INTEREST_SIMPLE` for ¥, already
+// consumed via `advance()`) is the current token; `compound` tells which kind
+// this is. Without `[r]` the rate defaults to 0.0001. Declares the variable so
+// later plain `a = ...` assignments keep reassigning the same float storage.
+std::unique_ptr<Statement> Parser::parseInterestStatement(bool compound) {
+    SourceLocation loc = peek().location;
+    advance(); // consume the '¥' or '$' prefix token
+
+    double rate = 0.0001;
+    bool hasRate = false;
+    if (peek().is(TokenType::PUNCTUATOR_LBRACKET)) {
+        advance();
+        if (!peek().is(TokenType::NUMBER_LITERAL) && !peek().is(TokenType::FLOAT_LITERAL)) {
+            addError("Expected an interest rate number in '[' ... ']'");
+            return nullptr;
+        }
+        try {
+            rate = std::stod(peek().text);
+        } catch (...) {
+            rate = 0.0001;
+        }
+        hasRate = true;
+        advance();
+        if (!consume(TokenType::PUNCTUATOR_RBRACKET)) {
+            addError("Expected ']' after the interest rate");
+            return nullptr;
+        }
+    }
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name after the interest prefix ('¥' or '$')");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after the interest variable name");
+        return nullptr;
+    }
+    auto value = parseExpression();
+    if (!value) return nullptr;
+
+    if (!isVariableDeclared(name)) {
+        declareVariable(name);
+    }
+
+    return std::make_unique<InterestStatement>(compound, hasRate, rate, name,
+                                               std::move(value), loc);
+}
+
+// EXP `kill[x]`: invalidate the statement at source line x at runtime.
+std::unique_ptr<Statement> Parser::parseKillStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_KILL)) return nullptr;
+
+    if (!consume(TokenType::PUNCTUATOR_LBRACKET)) {
+        addError("Expected '[' after 'kill'");
+        return nullptr;
+    }
+    if (!peek().is(TokenType::NUMBER_LITERAL) && !peek().is(TokenType::LONG_LITERAL)) {
+        addError("Expected a line number in 'kill[...]'");
+        return nullptr;
+    }
+    int64_t targetLine = 0;
+    try {
+        targetLine = std::stoll(peek().text);
+    } catch (...) {
+        addError("Invalid line number in 'kill[...]'");
+        return nullptr;
+    }
+    advance();
+    if (!consume(TokenType::PUNCTUATOR_RBRACKET)) {
+        addError("Expected ']' after the line number in 'kill[...]'");
+        return nullptr;
+    }
+    return std::make_unique<KillStatement>(targetLine, loc);
+}
+
+// EXP `noclip a`: variable `a` falls into the backrooms — reads become unstable.
+std::unique_ptr<Statement> Parser::parseNoclipStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_NOCLIP)) return nullptr;
+    if (!peek().is(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name after 'noclip'");
+        return nullptr;
+    }
+    std::string name = peek().text;
+    advance();
+    return std::make_unique<NoclipStatement>(name, loc);
+}
+
+// EXP `shuffleback`: reshuffle the values of all backroom variables.
+std::unique_ptr<Statement> Parser::parseShufflebackStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_SHUFFLEBACK)) return nullptr;
+    return std::make_unique<ShufflebackStatement>(loc);
+}
+
+// EXP `censer[x]`: terminate the program the moment its output equals text x.
+std::unique_ptr<Statement> Parser::parseCenserStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_CENSER)) return nullptr;
+
+    if (!consume(TokenType::PUNCTUATOR_LBRACKET)) {
+        addError("Expected '[' after 'censer'");
+        return nullptr;
+    }
+    std::string text;
+    if (peek().is(TokenType::NUMBER_LITERAL) || peek().is(TokenType::LONG_LITERAL) ||
+        peek().is(TokenType::FLOAT_LITERAL)) {
+        text = peek().text;
+        advance();
+    } else if (peek().is(TokenType::STRING_LITERAL)) {
+        text = peek().text;
+        advance();
+    } else {
+        addError("Expected a number or a string literal in 'censer[...]'");
+        return nullptr;
+    }
+    if (!consume(TokenType::PUNCTUATOR_RBRACKET)) {
+        addError("Expected ']' after the censored text in 'censer[...]'");
+        return nullptr;
+    }
+    return std::make_unique<CenserStatement>(text, loc);
+}
+
 std::unique_ptr<Statement> Parser::parseFateStatement() {
     SourceLocation loc = peek().location;
     if (!consume(TokenType::KEYWORD_FATE)) return nullptr;
@@ -1950,6 +2277,13 @@ std::unique_ptr<IfStatement> Parser::parseIfStatement() {
 
 std::unique_ptr<Expression> Parser::parseExpression() {
     auto left = parseLogicalOr();
+    
+    while (!isAtEnd() && peek().is(TokenType::PUNCTUATOR_FU_K)) {
+        BinaryOpType op = BinaryOpType::FU_K;
+        advance();
+        auto right = parseLogicalOr();
+        left = std::make_unique<BinaryOp>(op, std::move(left), std::move(right), peek().location);
+    }
     
     while (!isAtEnd() && peek().is(TokenType::PUNCTUATOR_BANG_QUESTION)) {
         BinaryOpType op = BinaryOpType::BANG_QUESTION;

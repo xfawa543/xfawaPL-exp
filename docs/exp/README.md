@@ -31,10 +31,18 @@
 | `paradox x` | 改变过去：下游因果链重新验证失败，受影响变量保留原值并成为 GHOST（重合论→幽灵论） | [paradox.md](paradox.md) |
 | `pinocchio (P) { } else { } limit: N` | 自指命题：反复"用当前状态求值 P → 执行 then/else → 比对 P 引用的变量"；状态不再变化 → 稳定（stable true/false）、真值连续交替 → 振荡、超过 limit 轮 → 无解，三种结果必终止输出 | [pinocchio.md](pinocchio.md) |
 | `deja x` | 偷未来：把 `x` 的第一个常量未来赋值提前可见；非常量/控制流内/跨函数时保持常规语义 + 警告 | [deja.md](deja.md) |
+| `dual x` / `dual x = v` | 双生：把一个存在的变量/值分裂成两个独立存在的自身——原身 `x[0]`（=裸 `x`）与分身 `x[1]` 同值出生，之后各自独立读写演化；仅限数值/布尔基类型 | [dual.md](dual.md) |
+| `disposable fn f() { ... }` / `disposable x = v` / `disposable[N] x = v` | 一次性：函数只能调用一次（再次调用报"不可用"）；变量的赋值是一层一次性覆盖值——每次读取都消耗一次（一个表达式里的多次读取各消耗一次），同名层按 LIFO 栈叠加、耗尽后回退到旧层/普通值；普通赋值清掉全部一次性层；`N` 指定可读次数 | [disposable.md](disposable.md) |
+| `¥[r] x = v` / `$[r] x = v` | 利息变量：只在读取时结算——先返回当前值再结算；同一表达式读几次就结算几次；`¥` 单利（每次固定 + 本金×利率）、`$` 复利（每次 x = x + x×利率）、默认利率 0.0001；同名规则按声明顺序叠加；整数初值自动转浮点 | [interest.md](interest.md) |
 | `drift fn f/...` | 递归随机参数：drift 修饰的函数，其递归自调用在运行时按参数类型与范围现算随机实参（外部调用仍传原值）；内置 1000 层深度上限保证终止，可 `drift(depth: N)` 覆盖；字符串/类型不可推导参数 → 编译错误 | [drift.md](drift.md) |
 | `fate x = v` | 设定命运值：反抗后被以"中点折半"的方式不完美拉回（永不直接等于命运值）；恢复史上最高结果成为持久底数，之后不可低于 | [fate.md](fate.md) |
 | `envy a b` | 嫉妒比自己更好的变量：按差距强度选择 超越(+1)/成为(复制目标)/摧毁(目标被拉低)；自身不弱于目标则完全不动；不可比较维度 → warning + 原样 | [envy.md](envy.md) |
 | `a ?! b` | 随机二元运算符：运行时从对 a、b 类型都合法且结果类型一致的一组运算（`+ - * / % && \|\|`，按类型分组）中随机挑一个真算；比较类因结果类型不同被排除；字符串等无候选组合 → `[?!]` warning + 退化为左操作数 | [randop.md](randop.md) |
+| `value <expr>` | 保护前缀/void 守卫：照常求值 RHS 表达式；`value` 后跟无返回值函数调用 → 编译报错；`value` 同时保留为普通变量名，按下一记号自动区分 | [value.md](value.md) |
+| `A fu*k B` | 列表合并：两边各取 floor(长度/2) 个互不重复随机元素拼成新列表（长度/类型编译期已知；int/long/string，float与非列表报错） | [fuk.md](fuk.md) |
+| `kill[N]` | 行级杀手：杀掉源码第 N 行，之后该行的所有执行（跨函数、循环迭代）永远跳过；越界行号无害忽略；无法撤销 | [kill.md](kill.md) |
+| `censer["文本"]` / `censer[666]` | 内容熔断：之后控制台打印若与登记文本完全相等（strcmp），打印完立即 exit(0)；子串/前后缀不触发 | [censer.md](censer.md) |
+| `noclip a` / `shuffleback` | 后室变量：`a` 跌出正常执行空间，存储值不变但每次读取不稳定——60% 正常 / 20% 引用失败（数值 0、字符串空）/ 20% 漂移（读到同类型其它后室变量的值）；`shuffleback` 让后室全体归位并两两 50% 交换重排；数值/布尔/标量字符串 | [noclip.md](noclip.md) |
 | `try { } expect { }` | 编译器错误拦截：编译期捕获语义错误，执行 expect 块 | [try_expect.md](try_expect.md) |
 | `sorry` | 向编译器道歉，使 rage 随机下降 delta∈[0,rage]（最低 0） | [rage.md](rage.md) |
 | 编译器红温机制 | rage 持久化状态（0–5）+ 成功捕获升温 + sorry 随机降温；红温时的"每五行"强制规则见 try_expect.md；`xfawac rage` / `rage reset` | [rage.md](rage.md) |

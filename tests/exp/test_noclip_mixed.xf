@@ -1,0 +1,24 @@
+#test {
+    fn main() {
+        int base = 5
+        int sum = 0
+        noclip base
+        sum = base + 10
+        print(base)
+        print(sum)
+        sum = base + 20
+        print(sum)
+        sum = base + 30
+        print(sum)
+        int k = 1
+        k = k + base
+        print(k)
+        string msg = "ok"
+        noclip msg
+        print(msg)
+        print(msg)
+        print(msg)
+        print(msg)
+        print(msg)
+    }
+}

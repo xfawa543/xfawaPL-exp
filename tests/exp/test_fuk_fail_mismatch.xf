@@ -1,0 +1,6 @@
+#test {
+    fn main() {
+        a = [1,2] fu*k ["x","y"]
+        print(a[0])
+    }
+}

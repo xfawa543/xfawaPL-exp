@@ -1,0 +1,6 @@
+#test {
+    fn main() {
+        ¥[0.1]sztext = "hi"
+        print(sztext)
+    }
+}

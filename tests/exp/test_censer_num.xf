@@ -1,0 +1,9 @@
+#test {
+    fn main() {
+        // c2 数字内容：打印 666 立即退出
+        censer[666]
+        print("c2a")
+        print(666)
+        print("c2never")
+    }
+}

@@ -1,0 +1,7 @@
+#test {
+// EXP `disposable` error: a disposable layer needs a value (`a = ...`).
+
+    fn main() {
+        disposable r
+    }
+}

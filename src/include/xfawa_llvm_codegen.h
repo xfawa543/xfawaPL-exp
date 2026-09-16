@@ -47,6 +47,81 @@ private:
     std::map<std::string, FateSlot> fateSlots;
     llvm::Function* fateRecoverFn = nullptr; // shared i64 fate recovery helper
     llvm::Function* getFateRecoverFunction();
+
+    // EXP `dual`: names of variables whose existence was split into two selves,
+    // mapped to the SECOND self's storage slot. The original self keeps living
+    // in `locals[name]` (and is what a plain read of `x` sees). `x[0]` reads
+    // the original self, `x[1]` the second. Cleared together with `locals`
+    // per function so a split from one function never leaks into another.
+    std::map<std::string, llvm::AllocaInst*> dualEchoVars;
+
+    // EXP `disposable`: per-variable runtime layer stack. `disposable a = v`
+    // pushes a layer (its remaining reads stored in `counts`, its value in
+    // `values`); a plain read of `a` scans the stack from the top down for the
+    // first live layer and consumes it AFTER the value was read. Once the stack
+    // is empty the read falls back to the base alloca (`locals[name]`) if one
+    // exists, otherwise it is a runtime "undefined / unavailable" error. A
+    // normal assignment stores -1 into `top` to clear every layer.
+    enum { kDisposableMaxLayers = 64 };
+    struct DisposableState {
+        llvm::AllocaInst* top = nullptr;          // i64 stack pointer, -1 = empty
+        llvm::AllocaInst* counts = nullptr;       // [kDisposableMaxLayers x i64]
+        llvm::AllocaInst* values = nullptr;       // [kDisposableMaxLayers x elemTy]
+        llvm::Type* elemTy = nullptr;             // uniform layer value type
+    };
+    std::map<std::string, DisposableState> disposableVars;
+    llvm::Value* codegenDisposableRead(const std::string& name, llvm::AllocaInst* baseAlloca);
+    void emitRuntimeError(const std::string& message);
+    void emitDisposableGuard(const std::string& funcName);
+
+    // EXP `interest`: per-variable interest rules. Each `¥`/`$` statement births
+    // the variable as a FLOAT alloca in `locals` and appends one rule. Every
+    // read loads the current float value, returns it to the expression, then
+    // applies all rules in definition order and stores the grown value back.
+    //   - simple (¥) rules carry a fixed per-read amount = value * rate,
+    //     computed (in IR, at runtime) when the rule was created.
+    //   - compound ($) rules carry only the rate; each read does a += a * rate.
+    struct InterestRule {
+        bool isCompound = false;
+        double rate = 0.0;
+        llvm::Value* amount = nullptr; // simple-interest only: fixed per-read addend
+    };
+    struct InterestState {
+        std::vector<InterestRule> rules;
+    };
+    std::map<std::string, InterestState> interestVars;
+    llvm::Value* codegenInterestRead(const std::string& name, llvm::AllocaInst* baseAlloca);
+
+    // EXP `kill[x]`: runtime invalidation of a source line. Each killed line's
+    // statement is skipped on every later execution. Backing store is a single
+    // byte-per-line table (internal global) indexed by 1-based source line.
+    llvm::GlobalVariable* killFlags = nullptr;
+    llvm::Value* getKillFlagsGlobal();
+
+    // EXP `censer[x]`: texts whose exact print output terminates the program
+    // (compared against the console output of each print statement).
+    std::vector<std::string> censoredTexts;
+
+    // EXP `noclip`: names of variables that have fallen into the backrooms.
+    // A variable keeps its value but its reads become non-deterministic until
+    // it returns to reality. `shuffleback` reshuffles their values.
+    std::set<std::string> backroomVars;
+    llvm::Value* codegenBackroomRead(const std::string& name, llvm::AllocaInst* alloca);
+
+    llvm::Value* codegen(NoclipStatement* stmt);
+    llvm::Value* codegen(ShufflebackStatement* stmt);
+
+    // EXP `value`: functions known to have no return statement (void). Used to
+    // reject `a = value foo()` at compile time. Collected lazily.
+    std::unordered_set<std::string> voidFuncNames;
+    bool voidFuncsCollected = false;
+    void collectVoidFunctions(Program* program);
+
+    llvm::Value* codegen(KillStatement* stmt);
+    llvm::Value* codegen(CenserStatement* stmt);
+    llvm::Value* codegen(ValueExpression* expr);
+    llvm::Value* codegenFuK(xfawa::BinaryOp* expr);
+
     llvm::AllocaInst* createAllocaInEntry(llvm::Type* type, const std::string& name);
     llvm::AllocaInst* birthLocalAlloca(const std::string& name, llvm::Value* value);
     void storeValueNormalized(llvm::Value* value, llvm::AllocaInst* alloca);
@@ -251,6 +326,10 @@ private:
     llvm::Value* codegen(ParadoxStatement* stmt);
     llvm::Value* codegen(DejaStatement* stmt);
     llvm::Value* codegen(PinocchioStatement* stmt);
+    llvm::Value* codegen(DualStatement* stmt);
+    llvm::Value* codegen(IndexedAssignmentStatement* stmt);
+    llvm::Value* codegen(DisposableStatement* stmt);
+    llvm::Value* codegen(InterestStatement* stmt);
     llvm::Value* codegen(TryExpectStatement* stmt);
     llvm::Value* codegen(SorryStatement* stmt);
     llvm::Value* codegen(ComeStatement* stmt);
