@@ -23,6 +23,11 @@ enum class NodeType {
     UNARY_OP,
     CALL_EXPRESSION,
     ARRAY_RANGE_EXPRESSION,
+    // EXP `valuable`: first-class uncompiled code. These sit inside the
+    // EXPRESSION..ARRAY_RANGE_EXPRESSION span so isExpression() stays true.
+    VALUABLE_FRAGMENT_EXPRESSION,
+    VALUABLE_CALL_EXPRESSION,
+    VALUABLE_INJECT_EXPRESSION,
     ARRAY_LITERAL,
     ARRAY_INDEX_EXPRESSION,
     O_LITERAL_EXPRESSION,
@@ -79,6 +84,31 @@ enum class NodeType {
     CENSER_STATEMENT,
     NOCLIP_STATEMENT,
     SHUFFLEBACK_STATEMENT,
+    WRONG_STATEMENT,
+    // EXP `zombie x`: infect every arithmetic operand with x's value.
+    ZOMBIE_STATEMENT,
+    // EXP `valuable`: `A B { ... }` splices code values into one fragment.
+    VALUABLE_USE_STATEMENT,
+    // EXP `deny x = 41`: keep the value, refuse to acknowledge the fact.
+    DENY_STATEMENT,
+    // EXP `regret "1+1=3"` / `regret all`: take back what was believed.
+    REGRET_STATEMENT,
+    // EXP `doubt x`: break the lie that is currently covering x.
+    DOUBT_STATEMENT,
+    // EXP `env 类型 参数名 { f, g }`: f and g silently carry one extra value.
+    ENV_BLOCK_STATEMENT,
+    // EXP `env 发出者 = 承受者`: re-point the carried value.
+    ENV_ASSIGN_STATEMENT,
+    // EXP `a <->[K] b`: one step of a reversible reaction toward b/a = K.
+    REACTION_STATEMENT,
+    // EXP structs: `type 名字 { 类型 字段, ... }` at module level.
+    STRUCT_DECLARATION,
+    // EXP `变量 = { 值, ... }`: create a struct value.
+    STRUCT_CREATION_STATEMENT,
+    // EXP member access: `expr.字段` (the carried object's fields).
+    MEMBER_EXPRESSION,
+    // EXP member assignment: `expr.字段 op= 值`.
+    MEMBER_ASSIGNMENT_STATEMENT,
 
     VALUE_EXPRESSION,
 
@@ -97,11 +127,24 @@ enum class VarType {
     FLOAT,
     BOOL,
     STRING,
+    // EXP structs: a named struct value (`type 角色 { int 行动点, int 血量 }`).
+    // The struct's name lives beside the type map (localStructOf / callArgStructs).
+    STRUCT,
     ARRAY_INT,
     ARRAY_LONG,
     ARRAY_FLOAT,
     ARRAY_BOOL,
     ARRAY_STRING
+};
+
+// EXP compound assignment: the operator of `x -= 1` / `a.b += v`.
+enum class AssignOp {
+    EQ,
+    PLUS_EQ,
+    MINUS_EQ,
+    STAR_EQ,
+    SLASH_EQ,
+    PERCENT_EQ
 };
 
 std::string varTypeToString(VarType type);
@@ -227,6 +270,20 @@ enum class TokenType {
     KEYWORD_VALUE,
     KEYWORD_NOCLIP,
     KEYWORD_SHUFFLEBACK,
+    KEYWORD_WRONG,
+    KEYWORD_VALUABLE,
+    KEYWORD_CALL,
+    KEYWORD_INJECT,
+    KEYWORD_ZOMBIE,
+    // EXP `deny`: the value stays, the program refuses to acknowledge it.
+    KEYWORD_DENY,
+    // EXP `regret` / `doubt`: take back a `believe` rule / break a `lie`.
+    KEYWORD_REGRET,
+    KEYWORD_DOUBT,
+    // EXP `env`: a set of functions that silently carry one extra value.
+    KEYWORD_ENV,
+    // EXP structs: module-level `type 名字 { 类型 字段, ... }` declaration.
+    KEYWORD_TYPE,
 
     PUNCTUATOR_LPAREN,
     PUNCTUATOR_RPAREN,
@@ -260,8 +317,16 @@ enum class TokenType {
     PUNCTUATOR_DOLLAR,
     PUNCTUATOR_COLON,
     PUNCTUATOR_DOT,
+    // EXP compound assignment: `-=` `+=` `*=` `/=` `%=` (submission's `env` uses them).
+    PUNCTUATOR_MINUS_EQUAL,
+    PUNCTUATOR_PLUS_EQUAL,
+    PUNCTUATOR_STAR_EQUAL,
+    PUNCTUATOR_SLASH_EQUAL,
+    PUNCTUATOR_PERCENT_EQUAL,
     PUNCTUATOR_DOT_DOT_DOT,
     PUNCTUATOR_FU_K,
+    // EXP `<->[K]`: reversible reaction between two numeric variables.
+    PUNCTUATOR_REACTION,
 
     COMMENT,
     WHITESPACE

@@ -1,0 +1,17 @@
+#test {
+    // v5 `call valuable A for x` compiles the fragment here and hands back an
+    //    ordinary value, for a name that exists and for one that does not
+    fn main() {
+        x = 0
+        A = valuable { x = 3 }
+        y = call valuable A for x
+        print(y)
+        B = valuable { w = 12 }
+        z = call valuable B for w
+        print(z)
+        c = valuable { w = w + 1 }
+        w = 1
+        d = call valuable c for w
+        print(d)
+    }
+}

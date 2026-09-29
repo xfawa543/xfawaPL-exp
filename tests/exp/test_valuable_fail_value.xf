@@ -1,0 +1,9 @@
+#test {
+    // v13 error: an ordinary value is not code
+    fn main() {
+        x = 3
+        A = valuable { x = 1 }
+        y = x * 2
+        B = A + y
+    }
+}

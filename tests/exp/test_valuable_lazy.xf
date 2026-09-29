@@ -1,0 +1,10 @@
+#test {
+    // v2 creating a code value runs nothing; only a use point runs it
+    fn main() {
+        x = 0
+        A = valuable { x = 7 }
+        print(x)
+        A
+        print(x)
+    }
+}

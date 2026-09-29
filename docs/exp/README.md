@@ -28,6 +28,7 @@
 | 自动修复 | 拼错的关键字会被检测出来，询问确认后自动修正 | [auto-fix.md](auto-fix.md) |
 | `O` / `OO` / `1O` 等 | O 十进制位字面量（一种另类数字写法） | [O_LITERAL_EXP.md](O_LITERAL_EXP.md) |
 | `wrath x = v` | 修改已经发生的历史，重算依赖状态 | [wrath.md](wrath.md) |
+| `wrong <cond>` | 反事实守卫：条件为真时把参与值最小扰动到假（整数 +1 起、浮点 1% 步长、bool 翻转、关系边界直跳；派生链重算），8 次失败打印「无处可逃」并 exit(1)；守卫在赋值后持久复查 | [wrong.md](wrong.md) |
 | `paradox x` | 改变过去：下游因果链重新验证失败，受影响变量保留原值并成为 GHOST（重合论→幽灵论） | [paradox.md](paradox.md) |
 | `pinocchio (P) { } else { } limit: N` | 自指命题：反复"用当前状态求值 P → 执行 then/else → 比对 P 引用的变量"；状态不再变化 → 稳定（stable true/false）、真值连续交替 → 振荡、超过 limit 轮 → 无解，三种结果必终止输出 | [pinocchio.md](pinocchio.md) |
 | `deja x` | 偷未来：把 `x` 的第一个常量未来赋值提前可见；非常量/控制流内/跨函数时保持常规语义 + 警告 | [deja.md](deja.md) |
@@ -40,12 +41,24 @@
 | `a ?! b` | 随机二元运算符：运行时从对 a、b 类型都合法且结果类型一致的一组运算（`+ - * / % && \|\|`，按类型分组）中随机挑一个真算；比较类因结果类型不同被排除；字符串等无候选组合 → `[?!]` warning + 退化为左操作数 | [randop.md](randop.md) |
 | `value <expr>` | 保护前缀/void 守卫：照常求值 RHS 表达式；`value` 后跟无返回值函数调用 → 编译报错；`value` 同时保留为普通变量名，按下一记号自动区分 | [value.md](value.md) |
 | `A fu*k B` | 列表合并：两边各取 floor(长度/2) 个互不重复随机元素拼成新列表（长度/类型编译期已知；int/long/string，float与非列表报错） | [fuk.md](fuk.md) |
+| `valuable { }` / `A + B` / `A * n` | 代码即值：记下还没执行的代码；`+` 编译期拼接、`* n` 编译期重复；语句位置 `A` / `A B { }` 在**使用点**编译并运行；自由变量在使用点解析，创建处不捕获 | [valuable.md](valuable.md) |
+| `call valuable A for x` | 把代码值 A 在这里编译运行一次，把 x 的最终值作为**普通值**交出来（使用点原来的 x 不被写回） | [valuable.md](valuable.md) |
+| `inject v valuable A for x` | 记号级替换：把片段里的自由变量 x 换成 v，拼出新代码 | [valuable.md](valuable.md) |
+| `fn f(A) { A }` + `f(valuable { ... })` | 代码值当参数：调用处静态特化出函数副本，代码操作的变量属于调用点（传入副本、返回写回）；代码参数不可赋值，且同一参数必须处处传代码 | [valuable.md](valuable.md) |
+| `fn make() { return valuable { ... } }` | 代码工厂：函数体只构造代码、以 `return <代码值>` 结束，调用它得到代码而不是运行期结果；普通参数不能被返回的代码引用，工厂不可递归 | [valuable.md](valuable.md) |
+| `zombie x` | 算术瘟疫：x 参与的 `+ - * / %` / 一元 `-` 结果取**最左感染变量**的当前值，表达式里每个变量永久变为感染者（值不变）；比较/逻辑不传染；不跨函数；感染值不能进列表 | [zombie.md](zombie.md) |
 | `kill[N]` | 行级杀手：杀掉源码第 N 行，之后该行的所有执行（跨函数、循环迭代）永远跳过；越界行号无害忽略；无法撤销 | [kill.md](kill.md) |
 | `censer["文本"]` / `censer[666]` | 内容熔断：之后控制台打印若与登记文本完全相等（strcmp），打印完立即 exit(0)；子串/前后缀不触发 | [censer.md](censer.md) |
 | `noclip a` / `shuffleback` | 后室变量：`a` 跌出正常执行空间，存储值不变但每次读取不稳定——60% 正常 / 20% 引用失败（数值 0、字符串空）/ 20% 漂移（读到同类型其它后室变量的值）；`shuffleback` 让后室全体归位并两两 50% 交换重排；数值/布尔/标量字符串 | [noclip.md](noclip.md) |
 | `try { } expect { }` | 编译器错误拦截：编译期捕获语义错误，执行 expect 块 | [try_expect.md](try_expect.md) |
 | `sorry` | 向编译器道歉，使 rage 随机下降 delta∈[0,rage]（最低 0） | [rage.md](rage.md) |
 | 编译器红温机制 | rage 持久化状态（0–5）+ 成功捕获升温 + sorry 随机降温；红温时的"每五行"强制规则见 try_expect.md；`xfawac rage` / `rage reset` | [rage.md](rage.md) |
+| `deny x = v` / `deny "x + y = z"` | 不认账：变量形式不改写值，只让"承认"失效——之后 `x == v` 为假、`x != v` 为真（其它比较照常）；字符串形式收回一句 believe（该运算恢复按数学算）；没有对应 belief → 编译报错 | [deny.md](deny.md) |
+| `regret "x + y = z"` / `regret all` | 后悔：收回一句 believe（恢复按数学算）/ 一次收回全部 believe；没有可后悔的 → 编译报错 | [regret.md](regret.md) |
+| `doubt x` | 怀疑：只能写在 lie 块里，当场拆穿谎言——块内剩余读取恢复真实值；没有正在生效的谎言 → 编译报错 | [regret.md](regret.md) |
+| `a <->[K] b` | 可逆反应：把差额/K 从一边拨到另一边，a + b 永远守恒（目标 = a 拿 T/(1+K)、余数留在 b）；平衡附近随机游走；仅限 int/long，同一变量两次报错 | [reaction.md](reaction.md) |
+| `env 类型 参数名 { f, g }` / `env X = v` | 随身携带：给一组函数都加上携带参数（可同时出现在多个块里，携带多个值，按块顺序排在参数列表前面），组内互传时自动带上同名值、外部调用需显式交出；`env X = v` 把携带的值重新指向（只能写在携带它的函数里）；配合 `type` 声明的结构体可写 `发出者.行动点 -= 1` 与 `血量 -= 实际伤害`（无同名局部变量时的隐式 this）；函数不存在/类型冲突/参数位置不对/字段歧义 → 编译报错 | [env.md](env.md) |
+| `type 名字 { int 字段, ... }` / `名字 变量 = { 值, ... }` | 结构体：程序或模块级声明字段（int/long/float/bool/string），按字段顺序创建；变量是引用语义，成员写入对外部可见，`a = b` 为重新指向 | [env.md](env.md) |
 
 ## 使用注意
 

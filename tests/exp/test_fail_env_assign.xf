@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        int who = 1
+        env who = 2
+        print(who)
+    }
+}

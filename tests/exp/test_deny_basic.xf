@@ -1,0 +1,12 @@
+#test {
+    fn main() {
+        int answer = 41
+        print(answer == 41)
+        deny answer = 41
+        print(answer)
+        print(answer == 41)
+        print(answer != 41)
+        print(answer == 40)
+        print(answer > 40)
+    }
+}

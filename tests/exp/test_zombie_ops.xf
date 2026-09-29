@@ -1,0 +1,23 @@
+#test {
+    // t2 every arithmetic operator takes the plague: the result is the leftmost
+    //    infected operand, no matter what the operator asks for
+    fn main() {
+        a = 10
+        b = 2
+        zombie a
+        c = a + b
+        print(c)
+        c = a - b
+        print(c)
+        c = a * b
+        print(c)
+        c = a / b
+        print(c)
+        c = a % b
+        print(c)
+        c = -a
+        print(c)
+        print(a)
+        print(b)
+    }
+}

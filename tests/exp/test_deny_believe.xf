@@ -1,0 +1,10 @@
+#test {
+    fn main() {
+        believe "2 + 2 = 5"
+        believe "10 - 4 = 6"
+        print(2 + 2)
+        deny "2 + 2 = 5"
+        print(2 + 2)
+        print(10 - 4)
+    }
+}

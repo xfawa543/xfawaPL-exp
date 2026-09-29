@@ -1,0 +1,11 @@
+#test {
+    // v26 a drift function rewrites its arguments with random values at run time,
+    //     which a static copy of its body has no place to put
+    drift(-5, 5) fn wander(A) {
+        A
+    }
+    fn main() {
+        x = 0
+        wander(valuable { x = x + 1 })
+    }
+}

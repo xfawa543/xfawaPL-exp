@@ -1,0 +1,23 @@
+#test {
+    // t4 comparison and logic never catch: with a infected, a == b is still a
+    //    plain comparison, and only the arithmetic line spreads the plague
+    fn main() {
+        a = 3
+        b = 3
+        zombie a
+        c = a == b
+        print(c)
+        print(b)
+        d = a > b
+        print(d)
+        e = a < b
+        print(e)
+        if a {
+            print(1)
+        }
+        g = 7
+        h = a + g
+        print(h)
+        print(g)
+    }
+}

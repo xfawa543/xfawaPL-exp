@@ -317,6 +317,8 @@ public:
     VarType declaredType;
     bool hasExplicitType;
     bool isReassignment;
+    // EXP compound assignment: the operator of `x -= 1`; ASSIGN_EQ for plain `=`.
+    AssignOp op = AssignOp::EQ;
     
     AssignmentStatement(const std::string& n, std::unique_ptr<Expression> v,
                        const SourceLocation& loc = SourceLocation())
@@ -329,10 +331,12 @@ public:
           declaredType(t), hasExplicitType(true), isReassignment(false) {}
     
     std::string toString() const override {
+        static const char* ops[] = {"=", "+=", "-=", "*=", "/=", "%="};
+        std::string sign = std::string(" ") + ops[(int)op] + " ";
         if (hasExplicitType) {
-            return varTypeToString(declaredType) + " " + name + " = " + value->toString();
+            return varTypeToString(declaredType) + " " + name + sign + value->toString();
         }
-        return name + " = " + value->toString();
+        return name + sign + value->toString();
     }
 };
 
@@ -399,6 +403,221 @@ public:
 
     std::string toString() const override {
         return "lie " + name + " = " + (value ? value->toString() : "") + " { ... }";
+    }
+};
+
+// EXP `deny`: the fact stays true in storage but the program stops acknowledging
+// it. `deny answer = 41` makes every later `answer == 41` come out false while
+// `print(answer)` still prints 41. The string form denies a `believe` rule:
+// `deny "2 + 2 = 5"` takes the belief back, so `2 + 2` is 4 again.
+class DenyStatement : public Statement {
+public:
+    std::string name;      // the denied variable (identifier form)
+    int64_t value = 0;     // the denied value (identifier form)
+    std::string raw;       // the raw proposition text (string form, believe)
+
+    DenyStatement(const std::string& n, int64_t v, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::DENY_STATEMENT, loc), name(n), value(v) {}
+
+    DenyStatement(const std::string& r, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::DENY_STATEMENT, loc), raw(r) {}
+
+    std::string toString() const override {
+        if (!raw.empty()) return "deny \"" + raw + "\"";
+        return "deny " + name + " = " + std::to_string(value);
+    }
+};
+
+// EXP `regret`: take back a belief. `regret "1+1=3"` removes that one rule,
+// `regret all` removes every rule the program currently believes.
+class RegretStatement : public Statement {
+public:
+    std::string raw;    // the raw proposition text
+    bool all = false;   // `regret all`
+
+    RegretStatement(const std::string& r, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::REGRET_STATEMENT, loc), raw(r) {}
+
+    explicit RegretStatement(bool everything, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::REGRET_STATEMENT, loc), all(everything) {}
+
+    std::string toString() const override {
+        return all ? "regret all" : "regret \"" + raw + "\"";
+    }
+};
+
+// EXP `doubt x`: inside a `lie` block, stop believing the lie that covers `x`.
+// The rest of the block reads the real value again; a `doubt` on a variable
+// that no lie is covering is a compile error. The lie pass sets `broken` when it
+// really did break a lie, so codegen can tell the two cases apart.
+class DoubtStatement : public Statement {
+public:
+    std::string name;
+    bool broken = false;
+
+    explicit DoubtStatement(const std::string& n, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::DOUBT_STATEMENT, loc), name(n) {}
+
+    std::string toString() const override { return "doubt " + name; }
+};
+
+// EXP `env`: `env 类型 参数名 { f, g, h }` gives every listed function one extra
+// parameter (`参数名`) that nobody has to pass: a call from one of these functions
+// to another carries it along by itself.
+class EnvBlockStatement : public Statement {
+public:
+    std::string typeName;                     // declared type, e.g. 角色
+    std::string paramName;                    // the carried value's name, e.g. 发出者
+    std::vector<std::string> functions;       // the functions that carry it
+    // Set by the env pass when the block cannot be carried out. Kept as a
+    // message rather than a diagnostic so it can fail the build at codegen,
+    // where an error actually stops compilation.
+    std::string error;
+
+    EnvBlockStatement(const std::string& t, const std::string& p,
+                      std::vector<std::string> fns, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::ENV_BLOCK_STATEMENT, loc), typeName(t), paramName(p),
+          functions(std::move(fns)) {}
+
+    std::string toString() const override {
+        std::string s = "env " + typeName + " " + paramName + " { ";
+        for (size_t i = 0; i < functions.size(); i++) {
+            if (i) s += ", ";
+            s += functions[i];
+        }
+        return s + " }";
+    }
+};
+
+// EXP `env 发出者 = 承受者`: re-point the carried value at something else.
+class EnvAssignStatement : public Statement {
+public:
+    std::string name;
+    std::unique_ptr<Expression> value;
+
+    EnvAssignStatement(const std::string& n, std::unique_ptr<Expression> v,
+                       const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::ENV_ASSIGN_STATEMENT, loc), name(n), value(std::move(v)) {}
+
+    std::string toString() const override {
+        return "env " + name + " = " + (value ? value->toString() : "");
+    }
+};
+
+// EXP `a <->[K] b`: one step of a reversible reaction. Each execution moves `a`
+// and `b` toward the balance where b/a = K, keeping a + b constant; the closer
+// it gets, the smaller the step, and at the balance it floats at random.
+class ReactionStatement : public Statement {
+public:
+    std::string leftName;
+    std::string rightName;
+    int64_t k = 1;                 // the equilibrium ratio b/a
+
+    ReactionStatement(const std::string& l, const std::string& r, int64_t ratio,
+                      const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::REACTION_STATEMENT, loc), leftName(l), rightName(r), k(ratio) {}
+
+    std::string toString() const override {
+        return leftName + " <->[" + std::to_string(k) + "] " + rightName;
+    }
+};
+
+// EXP structs: module-level `type 名字 { 类型 字段, ... }`. Fields are basic
+// types only; the struct's values are created with `类型名 变量 = { 值, ... }`
+// and every struct variable reads as a pointer, so member writes persist.
+class StructDeclaration : public Statement {
+public:
+    std::string name;
+    std::vector<std::pair<std::string, VarType>> fields; // (fieldName, type) in order
+
+    StructDeclaration(const std::string& n,
+                      std::vector<std::pair<std::string, VarType>> f,
+                      const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::STRUCT_DECLARATION, loc), name(n), fields(std::move(f)) {}
+
+    std::string toString() const override {
+        std::string s = "type " + name + " { ";
+        for (size_t i = 0; i < fields.size(); i++) {
+            if (i) s += ", ";
+            s += varTypeToString(fields[i].second) + " " + fields[i].first;
+        }
+        return s + " }";
+    }
+};
+
+// EXP member access: `expr.字段`. The base must be a struct variable (read as a
+// pointer); the result is the field's value.
+class MemberExpression : public Expression {
+public:
+    std::unique_ptr<Expression> base;
+    std::string field;
+
+    MemberExpression(std::unique_ptr<Expression> b, const std::string& f,
+                     const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::MEMBER_EXPRESSION, loc), base(std::move(b)), field(f) {}
+
+    std::string toString() const override {
+        return (base ? base->toString() : "?") + "." + field;
+    }
+};
+
+// EXP member assignment: `expr.字段 op= 值` (op is ASSIGN_EQ for plain `=`).
+class MemberAssignmentStatement : public Statement {
+public:
+    std::unique_ptr<Expression> base;
+    std::string field;
+    AssignOp op;
+    std::unique_ptr<Expression> value;
+
+    MemberAssignmentStatement(std::unique_ptr<Expression> b, const std::string& f, AssignOp o,
+                              std::unique_ptr<Expression> v,
+                              const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::MEMBER_ASSIGNMENT_STATEMENT, loc), base(std::move(b)), field(f),
+          op(o), value(std::move(v)) {}
+
+    std::string toString() const override {
+        static const char* ops[] = {"=", "+=", "-=", "*=", "/=", "%="};
+        return (base ? base->toString() : "?") + "." + field + " " + ops[(int)op] + " " +
+               (value ? value->toString() : "");
+    }
+};
+
+// EXP struct creation: `类型名 变量 = { 值, ... }` (positional, in field order).
+class StructCreationStatement : public Statement {
+public:
+    std::string varName;
+    std::string structName;
+    std::vector<std::unique_ptr<Expression>> values;
+
+    StructCreationStatement(const std::string& v, const std::string& s,
+                            std::vector<std::unique_ptr<Expression>> vals,
+                            const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::STRUCT_CREATION_STATEMENT, loc), varName(v), structName(s),
+          values(std::move(vals)) {}
+
+    std::string toString() const override {
+        std::string s = structName + " " + varName + " = { ";
+        for (size_t i = 0; i < values.size(); i++) {
+            if (i) s += ", ";
+            s += values[i]->toString();
+        }
+        return s + " }";
+    }
+};
+
+
+// EXP `wrong <condition>`: a result that should not exist is forbidden. When the
+// condition evaluates true at runtime, the program recomputes the result by
+// minimally perturbing the participant variables until it is no longer true.
+class WrongStatement : public Statement {
+public:
+    std::unique_ptr<Expression> condition;
+
+    WrongStatement(std::unique_ptr<Expression> c, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::WRONG_STATEMENT, loc), condition(std::move(c)) {}
+
+    std::string toString() const override {
+        return "wrong " + (condition ? condition->toString() : "<null>");
     }
 };
 
@@ -984,7 +1203,17 @@ public:
     std::string blockName;  // Alpha17: Block name for block.function syntax
     std::vector<std::unique_ptr<VariableDeclaration>> params;
     std::unique_ptr<BlockStatement> body;
+    // EXP `valuable`: the raw `{ ... }` tokens of the body. A code value passed
+    // as an argument is substituted into these tokens and the result is compiled
+    // as a fresh function, so a function has to be able to re-emit its own source.
+    std::vector<Token> bodyTokens;
     SourceLocation location;
+
+    // EXP `env`: the values this function silently carries, filled in by the
+    // env pass (empty when the function is in no carrying set), in block order.
+    // Each is the function's parameter of that type (structs read as pointers),
+    // and `env <name> = v` re-points it. A function may sit in several blocks.
+    std::vector<std::pair<std::string, std::string>> envCarried; // (paramName, typeName)
     
     // EXP `drift`: random recursive parameters. When enabled, every self call
     // inside the body substitutes its written argument values with runtime
@@ -1034,6 +1263,8 @@ public:
     std::string name;
     std::vector<std::unique_ptr<Function>> functions;
     std::vector<std::unique_ptr<ImportStatement>> imports;
+    // EXP structs: module-level `type 名字 { ... }` declarations.
+    std::vector<std::unique_ptr<StructDeclaration>> structs;
     SourceLocation location;
 
     Module(const std::string& n, std::vector<std::unique_ptr<Function>> f,
@@ -1250,10 +1481,95 @@ public:
     }
 };
 
+// EXP `zombie a`: variable a becomes a plague. Any arithmetic operation that
+// touches it (or touches another variable in the same operation) collapses to
+// a's value instead of the real result, and every participating variable is
+// overwritten with that value and infected in turn. Permanent, no cure.
+class ZombieStatement : public Statement {
+public:
+    std::string variableName;
+
+    ZombieStatement(const std::string& name, const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::ZOMBIE_STATEMENT, loc), variableName(name) {}
+
+    std::string toString() const override {
+        return "zombie " + variableName;
+    }
+};
+
+// EXP `valuable { ... }`: a first-class code value. The braces hold a raw,
+// uncompiled token slice which may be syntactically INCOMPLETE (`{ for item }`,
+// `{ in arr }`); it only has to parse once it is spliced into a whole program.
+class ValuableFragmentExpression : public Expression {
+public:
+    std::vector<Token> tokens; // inner tokens, without the enclosing braces
+
+    ValuableFragmentExpression(std::vector<Token> t, const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::VALUABLE_FRAGMENT_EXPRESSION, loc), tokens(std::move(t)) {}
+
+    std::string toString() const override {
+        return "valuable { ... }";
+    }
+};
+
+// EXP `call valuable A for x`: run A once at the current point and hand back
+// the value x ended with. Parsed and compiled fresh at every use point.
+class ValuableCallExpression : public Expression {
+public:
+    std::unique_ptr<Expression> base; // code-valued expression
+    std::string targetName;           // the variable read back after the run
+
+    ValuableCallExpression(std::unique_ptr<Expression> b, const std::string& t,
+                           const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::VALUABLE_CALL_EXPRESSION, loc),
+          base(std::move(b)), targetName(t) {}
+
+    std::string toString() const override {
+        return "call valuable " + (base ? base->toString() : "<null>") + " for " + targetName;
+    }
+};
+
+// EXP `inject y valuable A for x`: bind A's free variable x to y and hand back
+// the resulting code value. Purely a template/token substitution: nothing runs.
+class ValuableInjectExpression : public Expression {
+public:
+    std::unique_ptr<Expression> target; // y: a variable or a literal
+    std::unique_ptr<Expression> base;   // code-valued expression
+    std::string freeName;                // x: must be a free name of the fragment
+
+    ValuableInjectExpression(std::unique_ptr<Expression> t, std::unique_ptr<Expression> b,
+                             const std::string& f, const SourceLocation& loc = SourceLocation())
+        : Expression(NodeType::VALUABLE_INJECT_EXPRESSION, loc),
+          target(std::move(t)), base(std::move(b)), freeName(f) {}
+
+    std::string toString() const override {
+        return "inject " + (target ? target->toString() : "<null>") + " valuable " +
+               (base ? base->toString() : "<null>") + " for " + freeName;
+    }
+};
+
+// EXP `valuable` in statement position: `A B { ... }` juxtaposes code values
+// and splices them, left to right, with the raw `{ ... }` block appended. The
+// merged fragment executes as one piece of code.
+class ValuableUseStatement : public Statement {
+public:
+    std::vector<std::unique_ptr<Expression>> parts; // code values, source order
+    std::vector<Token> blockTokens;                 // raw `{ ... }` tokens (with braces)
+
+    ValuableUseStatement(const SourceLocation& loc = SourceLocation())
+        : Statement(NodeType::VALUABLE_USE_STATEMENT, loc) {}
+
+    std::string toString() const override {
+        return "valuable-use(" + std::to_string(parts.size()) + " parts)";
+    }
+};
+
 class Program {
 public:
     std::vector<std::unique_ptr<Module>> modules;
     std::vector<std::unique_ptr<ImportStatement>> imports;
+    // EXP structs: program-level `type 名字 { ... }` declarations.
+    std::vector<std::unique_ptr<StructDeclaration>> structs;
     
     void addModule(std::unique_ptr<Module> mod) {
         modules.push_back(std::move(mod));
@@ -1261,6 +1577,10 @@ public:
     
     void addImport(std::unique_ptr<ImportStatement> imp) {
         imports.push_back(std::move(imp));
+    }
+
+    void addStruct(std::unique_ptr<StructDeclaration> sd) {
+        structs.push_back(std::move(sd));
     }
     
     std::string toString() const {

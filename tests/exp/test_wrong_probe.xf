@@ -1,0 +1,11 @@
+#test {
+	fn main() {
+	x = 10
+    y = 20
+    wrong x + y == 30
+    print(x > 10)
+    print(x < 16)
+    print(y)
+
+	}
+}

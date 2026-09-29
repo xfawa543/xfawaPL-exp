@@ -1,0 +1,52 @@
+#test {
+// EXP `deny` / `regret` / `doubt` 视频演示：不认账
+// deny x = v 让 x 记住自己的值，但从此不再承认这件事。
+// regret 收回一句 believe；doubt 在 lie 块里当场拆穿谎言。
+
+    fn main() {
+        print("== 1. deny：值还是那个值，只是不认账 ==")
+        int answer = 41
+        print(answer == 41)     // 1：还没 deny，老实承认
+        print(answer)           // 41
+        deny answer = 41
+        print(answer)           // 41：deny 不改写任何东西
+        print(answer == 41)     // 0：它不承认自己是 41
+        print(answer != 41)     // 1：顺带地，它也说不出"我不是 41"
+        print(answer == 40)     // 0：别的判断照常
+        print(answer > 40)      // 1：大小比较和 deny 无关
+        print("--")
+
+        print("== 2. deny 也可以收回一句 believe ==")
+        believe "2 + 2 = 5"
+        believe "10 - 4 = 6"
+        print(2 + 2)            // 5：相信自己
+        deny "2 + 2 = 5"
+        print(2 + 2)            // 4：这句不相信了
+        print(10 - 4)           // 6：另一句还相信着
+        print("--")
+
+        print("== 3. regret：一次收回一句 ==")
+        believe "1 + 1 = 3"
+        believe "2 * 3 = 7"
+        print(1 + 1)            // 3
+        regret "1 + 1 = 3"
+        print(1 + 1)            // 2：这一句撤回了
+        print(2 * 3)            // 7：还相信别的
+        print("--")
+
+        print("== 4. regret all：一次全撤回 ==")
+        regret all
+        print(2 * 3)            // 6：全都撤回了
+        print("--")
+
+        print("== 5. doubt：在 lie 里当场拆穿 ==")
+        int real = 41
+        lie real = 42 {
+            print(real)         // 42：此刻在撒谎
+            doubt real
+            print(real)         // 41：拆穿之后，块里剩下的都是真话
+        }
+        print(real)             // 41：谎言从来没有离开过这个块
+        print("== done ==")
+    }
+}

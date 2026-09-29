@@ -1,0 +1,17 @@
+#test {
+    // v18 a factory may build the code in pieces, and a factory may take a code
+    //    value and hand it back, twice over
+    fn twice(A) {
+        return A + A
+    }
+    fn make() {
+        B = valuable { print("b") }
+        return B + twice(valuable { print("t") })
+    }
+    fn main() {
+        A = make()
+        A
+        C = twice(valuable { print("d") })
+        C
+    }
+}

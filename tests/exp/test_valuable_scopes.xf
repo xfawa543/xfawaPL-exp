@@ -1,0 +1,20 @@
+#test {
+    // v14 the same code value name in two functions resolves against each scope,
+    //    and a run is isolated from the caller's other EXP state
+    fn up() {
+        int v = 1
+        A = valuable { v = v + 10 }
+        A
+        print(v)
+    }
+    fn down() {
+        int v = 100
+        A = valuable { v = v + 1 }
+        A
+        print(v)
+    }
+    fn main() {
+        up()
+        down()
+    }
+}

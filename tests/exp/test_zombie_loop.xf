@@ -1,0 +1,17 @@
+#test {
+    // t9 the plague lives in a loop body: once infected, the variable is a fixed
+    //    point of its own arithmetic
+    fn main() {
+        a = 7
+        count = 0
+        while (count < 3) {
+            zombie a
+            a = a + 5
+            count = count + 1
+        }
+        print(count)
+        print(a)
+        b = a + 1
+        print(b)
+    }
+}

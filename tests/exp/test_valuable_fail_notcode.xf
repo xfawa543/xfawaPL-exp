@@ -1,0 +1,8 @@
+#test {
+    // v11 error: only code values may be juxtaposed
+    fn main() {
+        x = 5
+        A = valuable { x = 1 }
+        x A
+    }
+}

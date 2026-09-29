@@ -1,0 +1,12 @@
+#test {
+    // v7 juxtaposed code values run left to right, an optional raw block is
+    //    spliced at the end, and print renders a code value as `code`
+    fn main() {
+        x = 0
+        A = valuable { print("one") }
+        B = valuable { print("two") }
+        A B { print("three") }
+        A B
+        print(A)
+    }
+}

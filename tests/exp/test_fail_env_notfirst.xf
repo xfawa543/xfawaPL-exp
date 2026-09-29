@@ -1,0 +1,10 @@
+#test {
+    fn main() {
+        env int who { attack }
+        attack(1)
+    }
+
+    fn attack(victim, who) {
+        print(who)
+    }
+}

@@ -1,0 +1,11 @@
+#test {
+    // t9 a clean expression of two healthy variables never catches
+    fn main() {
+        a = 2
+        b = 3
+        c = a + b
+        print(a)
+        print(b)
+        print(c)
+    }
+}

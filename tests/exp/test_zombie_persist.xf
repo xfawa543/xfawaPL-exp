@@ -1,0 +1,21 @@
+#test {
+    // t3 the plague is permanent and only the flag travels: a variable that
+    //    catches keeps its own value, and the leftmost patient is picked anew
+    //    every time an expression is annihilated
+    fn main() {
+        a = 1
+        b = 2
+        zombie a
+        c = a + b      // a is the leftmost patient -> 1, and b catches
+        print(c)       // 1
+        print(b)       // 2: catching the plague is not the same as being rewritten
+        d = 100
+        e = d + 1      // healthy arithmetic, d stays healthy
+        print(e)       // 101
+        print(d)       // 100
+        k = c + d      // c is the patient -> 1, and now d catches as well
+        print(k)       // 1
+        m = d + c      // d is the leftmost patient now
+        print(m)       // 100
+    }
+}

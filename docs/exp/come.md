@@ -105,6 +105,5 @@ print("--")
 
 ## 测试
 
-- `tests/exp/demo_come.xf` — 视频演示：无条件 `come 15` + `boom` 叫停的"倒计时循环"（3 2 1 0 BOOM!!），一行代码讲清楚 come=循环。
-- `tests/exp/demo_come_if.xf` — 视频演示：`come if` 条件变假循环自然退出（2 2 3 3 4 4）+ 恒假条件直接放行。
+- `tests/exp/demo_come.xf` — 视频演示：`come if` 条件变假自然退出（2 2 3 3 4 4）+ `come 27` + `boom` 叫停的"倒计时循环"（3 2 1 0 BOOM!!），两个场景各讲清一个用法。
 - 行为回归样例（已存在）：`test_come_basic.xf`、`test_come_multi.xf`、`test_come_offset.xf`（注释/空行间的行号照样准）、`test_come_multi_block.xf`（`if` 块与 come 组合）、`test_come_in_while.xf`、`test_come_multi_function.xf`（跨函数调用点的布局）；编译失败样例 `test_come_err_*.xf` 覆盖上表各条。

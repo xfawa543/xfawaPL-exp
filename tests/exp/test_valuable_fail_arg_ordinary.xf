@@ -1,0 +1,13 @@
+#test {
+    // v20 a parameter that one call site fills with code is a code value at every
+    //     call site, so a call that passes a number instead is rejected
+    fn run(A, n) {
+        A
+        print(n)
+    }
+    fn main() {
+        x = 0
+        run(valuable { x = x + 1 }, 4)
+        run(5, 7)
+    }
+}

@@ -1,0 +1,15 @@
+#test {
+    // t6 float arithmetic carries the plague too
+    fn main() {
+        a = 1.5
+        b = 2.5
+        zombie a
+        c = a + b
+        print(c)
+        print(a)
+        d = 10.0
+        e = d / 4.0
+        print(e)
+        print(d)
+    }
+}

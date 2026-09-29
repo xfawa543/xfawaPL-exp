@@ -1,0 +1,47 @@
+// EXP `env` 视频演示：投稿原文的完整语义
+// 三个 env 块把 伤害/发出者/承受者 三个值同时塞给 攻击(attack)。
+// 攻击先把 发出者.行动点 -= 1，再用 env 发出者 = 承受者 把"发出者"改指到对方，
+// 随后调用 接受伤害(takeDamage) —— 内部不写任何参数。
+// 接受伤害 里只写 血量 -= 实际伤害：变量名不冲突即可省略 发出者.。
+
+type Role { int action, int health }
+
+#test {
+    fn main() {
+        print("== 1. 攻击：行动点 -1，血量由承受者承担 ==")
+        Role hero = { 3, 100 }
+        Role enemy = { 2, 80 }
+        env int dmg { attack, takeDamage, defense }
+        env Role sender { attack, defense, takeDamage }
+        env Role receiver { attack }
+        attack(5, hero, enemy)
+        print("--")
+
+        print("== 2. 再打一次，行动点继续 -1 ==")
+        attack(5, hero, enemy)
+        print("--")
+
+        print("== 3. 只看结果 ==")
+        print(hero.action)       // 3 - 1 - 1 = 1
+        print(hero.health)       // 100：挨打的不是 hero
+        print(enemy.health)      // 80 - 2 - 2 = 76
+        print("== done ==")
+    }
+
+    // 攻击：三个携带值全是空的，参数由 env 决定
+    fn attack() {
+        sender.action -= 1     // 发出者.行动点 -= 1
+        env sender = receiver  // 重新指向：从自己改成对方
+        takeDamage()           // 接受伤害()：组内调用不带参数
+    }
+
+    // 接受伤害：只带着 伤害 和 发出者（此时发出者已是承受者）
+    fn takeDamage() {
+        int actual = defense()
+        health -= actual       // 省略 发出者. 的隐式 this
+    }
+
+    fn defense() {
+        return 2
+    }
+}

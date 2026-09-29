@@ -1,0 +1,9 @@
+#test {
+	fn main() {
+	x = 10
+    y = 50
+    wrong x + y > 20
+    print(x)
+
+	}
+}

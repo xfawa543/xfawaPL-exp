@@ -1,0 +1,11 @@
+// 负例：env 块里的类型必须是基础类型或已用 type 声明的名字。
+#test {
+    fn main() {
+        env Ghost who { hit }
+        hit(1)
+    }
+
+    fn hit() {
+        print(who)
+    }
+}

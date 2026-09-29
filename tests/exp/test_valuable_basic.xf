@@ -1,0 +1,13 @@
+#test {
+    // v1 the flagship: for item / in arr / x + item are code, the block splices
+    //    them together and one run walks the list
+    fn main() {
+        x = 0
+        arr = [1, 2, 3, 4]
+        A = valuable { for item }
+        B = valuable { in arr }
+        C = valuable { x + item }
+        A B { x = C }
+        print(x)
+    }
+}

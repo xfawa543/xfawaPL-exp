@@ -1,0 +1,29 @@
+type Role { int action, int health }
+
+#test {
+    fn main() {
+        Role hero = { 3, 100 }
+        Role enemy = { 2, 80 }
+        env int dmg { attack, takeDamage, defense }
+        env Role sender { attack, defense, takeDamage }
+        env Role receiver { attack }
+        attack(5, hero, enemy)
+        print(hero.action)
+        print(enemy.health)
+    }
+
+    fn attack() {
+        sender.action -= 1
+        env sender = receiver
+        takeDamage()
+    }
+
+    fn takeDamage() {
+        int actual = defense()
+        health -= actual
+    }
+
+    fn defense() {
+        return 2
+    }
+}

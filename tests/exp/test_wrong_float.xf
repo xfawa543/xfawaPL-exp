@@ -1,0 +1,8 @@
+#test {
+	fn main() {
+	v = 10.0
+    wrong v == 10.0
+    print(v)
+
+	}
+}

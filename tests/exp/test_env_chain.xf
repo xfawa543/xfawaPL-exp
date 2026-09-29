@@ -1,0 +1,18 @@
+#test {
+    fn main() {
+        env int who { outer, inner, deepest }
+        outer(7)
+    }
+
+    fn outer() {
+        inner()
+    }
+
+    fn inner() {
+        deepest()
+    }
+
+    fn deepest(who) {
+        print(who)
+    }
+}

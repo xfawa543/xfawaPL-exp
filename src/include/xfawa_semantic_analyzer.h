@@ -365,6 +365,12 @@ private:
                 if (lieStmt && lieStmt->body) return analyzeBlock(lieStmt->body.get());
                 return true;
             }
+            case NodeType::WRONG_STATEMENT: {
+                auto* wrongStmt = dynamic_cast<WrongStatement*>(stmt);
+                return wrongStmt && wrongStmt->condition
+                           ? analyzeExpression(wrongStmt->condition.get())
+                           : true;
+            }
             case NodeType::WHILE_STATEMENT: {
                 auto* whileStmt = dynamic_cast<WhileStatement*>(stmt);
                 if (!analyzeExpression(whileStmt->condition.get())) return false;

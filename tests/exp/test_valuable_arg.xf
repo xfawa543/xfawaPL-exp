@@ -1,0 +1,14 @@
+#test {
+    // v14 a code value as an argument: the callee is compiled again with the code
+    //    spliced in, so the code runs inside the function and its variable is the
+    //    one of the use point
+    fn run(A) {
+        A
+        A
+    }
+    fn main() {
+        x = 0
+        run(valuable { x = x + 5 })
+        print(x)
+    }
+}

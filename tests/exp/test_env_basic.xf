@@ -1,0 +1,17 @@
+#test {
+    fn main() {
+        env int who { attack, take }
+        attack(1, 2)
+        attack(3, 4)
+    }
+
+    fn attack(who, victim) {
+        print(who)
+        env who = victim
+        take()
+    }
+
+    fn take(who) {
+        print(who)
+    }
+}

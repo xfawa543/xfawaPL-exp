@@ -1,0 +1,17 @@
+#test {
+    // t1 basic contagion: the result takes the leftmost infected value, and
+    //    every variable in the expression catches
+    fn main() {
+        a = 5
+        b = 7
+        zombie a
+        c = a + b
+        print(a)
+        print(b)
+        print(c)
+        d = b - a
+        print(d)
+        e = a * a
+        print(e)
+    }
+}

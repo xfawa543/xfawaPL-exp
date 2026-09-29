@@ -1,0 +1,7 @@
+#test {
+	fn main() {
+	wrong 1 + 1 == 2
+    print(0)
+
+	}
+}

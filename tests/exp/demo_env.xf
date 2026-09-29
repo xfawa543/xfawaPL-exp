@@ -1,0 +1,44 @@
+#test {
+// EXP `env` 视频演示：随身携带
+// env 角色 who { 攻击, 取走 } 让这一组函数都揣着一个叫 who 的值。
+// 这个值是每个函数的第一个参数：组内互传时自动带上，不用谁操心。
+
+    fn main() {
+        print("== 1. 第一次交出携带的值 ==")
+        env int who { attack, take }
+        attack(1, 2)
+        print("--")
+
+        print("== 2. 再来一次，这次是 3 和 4 ==")
+        attack(3, 4)
+        print("--")
+
+        print("== 3. 链条：谁也不用手动往下传 ==")
+        env int carrier { hop1, hop2, hop3 }
+        hop1(99)
+        print("== done ==")
+    }
+
+    // 谁 07：攻击的人自己带着 who，函数体里就能直接用
+    fn attack(who, victim) {
+        print(who)              // 1：这就是携带的值
+        env who = victim        // 重新指向：改掉携带的内容
+        take()                  // 内部调用不用写 who
+    }
+
+    fn take(who) {
+        print(who)              // 2：已经被重新指向了
+    }
+
+    fn hop1() {
+        hop2()                  // 携带的值自己跟上
+    }
+
+    fn hop2() {
+        hop3()
+    }
+
+    fn hop3(carrier) {
+        print(carrier)          // 99：跳了三层，还是同一个值
+    }
+}

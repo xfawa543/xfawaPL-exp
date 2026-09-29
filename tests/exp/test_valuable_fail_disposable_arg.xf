@@ -1,0 +1,11 @@
+#test {
+    // v25 a disposable function may only run once, so a copy of it per call site
+    //     would not be disposable any more
+    disposable fn once(A) {
+        A
+    }
+    fn main() {
+        x = 0
+        once(valuable { x = x + 1 })
+    }
+}

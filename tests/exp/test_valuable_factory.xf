@@ -1,0 +1,17 @@
+#test {
+    // v17 a code factory: a function whose body only builds code and ends with
+    //    `return <code>`. Calling it produces the code, and the code runs where it
+    //    is used, over the variables of that place. An ordinary parameter is fine
+    //    as long as the code it returns never mentions it.
+    fn make(unused) {
+        return valuable { x = x + 1 y = y + 2 }
+    }
+    fn main() {
+        x = 0
+        y = 0
+        A = make(10)
+        A
+        print(x)
+        print(y)
+    }
+}

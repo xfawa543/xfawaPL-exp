@@ -1,0 +1,15 @@
+#test {
+    // v15 the same code value passed to the same function from two use points:
+    //    each use point gets its own copy, over its own variable
+    fn run(A) {
+        A
+    }
+    fn main() {
+        x = 0
+        y = 100
+        run(valuable { x = x + 1 })
+        run(valuable { y = y + 1 })
+        print(x)
+        print(y)
+    }
+}

@@ -1,0 +1,17 @@
+#test {
+    // t5 the plague never leaks across a call: the callee receives a plain value
+    fn spread(v) {
+        w = v + 1
+        return w
+    }
+    fn main() {
+        a = 5
+        zombie a
+        res = spread(a)
+        print(res)
+        print(a)
+        res2 = spread(res)
+        print(res2)
+        print(a)
+    }
+}

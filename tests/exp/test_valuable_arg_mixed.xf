@@ -1,0 +1,18 @@
+#test {
+    // v16 a code argument next to ordinary ones, and a code argument that works
+    //    on a list of the use point
+    fn run(A, n) {
+        k = n * 2
+        A
+        print(k)
+    }
+    fn main() {
+        x = 0
+        run(valuable { x = x + 1 }, 4)
+        print(x)
+        arr = [1, 2, 3]
+        t = 0
+        run(valuable { for q in arr { t = arr[0] + q } }, 0)
+        print(t)
+    }
+}

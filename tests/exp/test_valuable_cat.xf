@@ -1,0 +1,16 @@
+#test {
+    // v3 `+` joins code at compile time, `* n` repeats it, both nest
+    fn main() {
+        x = 0
+        y = 0
+        A = valuable { x = 1 } + valuable { y = 2 }
+        A
+        print(x)
+        print(y)
+        B = valuable { print("hi") } * 3
+        B
+        C = A + valuable { x = x + 10 }
+        C
+        print(x)
+    }
+}

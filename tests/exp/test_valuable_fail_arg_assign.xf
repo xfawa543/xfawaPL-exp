@@ -1,0 +1,9 @@
+#test {
+    // v19 a code value parameter has no storage, so it cannot be assigned to
+    fn run(A) {
+        A = 5
+    }
+    fn main() {
+        run(valuable { print("x") })
+    }
+}

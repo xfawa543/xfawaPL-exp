@@ -58,7 +58,21 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::keywords = {
     {"kill", TokenType::KEYWORD_KILL},
     {"censer", TokenType::KEYWORD_CENSER},
     {"noclip", TokenType::KEYWORD_NOCLIP},
-    {"shuffleback", TokenType::KEYWORD_SHUFFLEBACK}
+    {"shuffleback", TokenType::KEYWORD_SHUFFLEBACK},
+    {"wrong", TokenType::KEYWORD_WRONG},
+    // EXP `valuable`: first-class uncompiled code values.
+    {"valuable", TokenType::KEYWORD_VALUABLE},
+    {"call", TokenType::KEYWORD_CALL},
+    {"inject", TokenType::KEYWORD_INJECT},
+    // EXP `zombie`: a numeric variable that infects every arithmetic operand.
+    {"zombie", TokenType::KEYWORD_ZOMBIE},
+    // EXP `deny` / `regret` / `doubt` / `env`.
+    {"deny", TokenType::KEYWORD_DENY},
+    {"regret", TokenType::KEYWORD_REGRET},
+    {"doubt", TokenType::KEYWORD_DOUBT},
+    {"env", TokenType::KEYWORD_ENV},
+    // EXP structs: module-level `type 名字 { ... }`.
+    {"type", TokenType::KEYWORD_TYPE}
 };
 
 const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
@@ -72,10 +86,15 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
     {",", TokenType::PUNCTUATOR_COMMA},
     {":", TokenType::PUNCTUATOR_COLON},
     {"+", TokenType::PUNCTUATOR_PLUS},
+    {"+=", TokenType::PUNCTUATOR_PLUS_EQUAL},
     {"-", TokenType::PUNCTUATOR_MINUS},
+    {"-=", TokenType::PUNCTUATOR_MINUS_EQUAL},
     {"*", TokenType::PUNCTUATOR_STAR},
+    {"*=", TokenType::PUNCTUATOR_STAR_EQUAL},
     {"/", TokenType::PUNCTUATOR_SLASH},
+    {"/=", TokenType::PUNCTUATOR_SLASH_EQUAL},
     {"%", TokenType::PUNCTUATOR_PERCENT},
+    {"%=", TokenType::PUNCTUATOR_PERCENT_EQUAL},
     {"=", TokenType::PUNCTUATOR_EQUAL},
     {"==", TokenType::PUNCTUATOR_EQUAL_EQUAL},
     {"!", TokenType::PUNCTUATOR_EXCLAIM},
@@ -92,7 +111,10 @@ const std::vector<std::pair<std::string, TokenType>> Lexer::punctuatuators = {
     {"￥", TokenType::KEYWORD_INTEREST_SIMPLE}, // U+FFE5 FULLWIDTH YEN SIGN
     {"$", TokenType::PUNCTUATOR_DOLLAR},
     {".", TokenType::PUNCTUATOR_DOT},
-    {"...", TokenType::PUNCTUATOR_DOT_DOT_DOT}
+    {"...", TokenType::PUNCTUATOR_DOT_DOT_DOT},
+    // EXP `<->[K]`: reversible reaction (maximal munch tries 3 chars first, so
+    // `a <- b` still lexes as `<` then `-`).
+    {"<->", TokenType::PUNCTUATOR_REACTION}
 };
 
 std::string Lexer::tokenTypeToString(TokenType type) {
@@ -155,7 +177,16 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_CENSER: return "censer";
         case TokenType::KEYWORD_NOCLIP: return "noclip";
         case TokenType::KEYWORD_SHUFFLEBACK: return "shuffleback";
+        case TokenType::KEYWORD_WRONG: return "wrong";
         case TokenType::KEYWORD_VALUE: return "value";
+        case TokenType::KEYWORD_VALUABLE: return "valuable";
+        case TokenType::KEYWORD_CALL: return "call";
+        case TokenType::KEYWORD_INJECT: return "inject";
+        case TokenType::KEYWORD_ZOMBIE: return "zombie";
+    case TokenType::KEYWORD_DENY: return "deny";
+    case TokenType::KEYWORD_REGRET: return "regret";
+    case TokenType::KEYWORD_DOUBT: return "doubt";
+    case TokenType::KEYWORD_ENV: return "env";
         case TokenType::PUNCTUATOR_LPAREN: return "(";
         case TokenType::PUNCTUATOR_RPAREN: return ")";
         case TokenType::PUNCTUATOR_LBRACE: return "{";
@@ -184,8 +215,15 @@ std::string Lexer::tokenTypeToString(TokenType type) {
         case TokenType::PUNCTUATOR_DOLLAR: return "$";
         case TokenType::PUNCTUATOR_COLON: return ":";
         case TokenType::PUNCTUATOR_DOT: return ".";
+        case TokenType::PUNCTUATOR_MINUS_EQUAL: return "-=";
+        case TokenType::PUNCTUATOR_PLUS_EQUAL: return "+=";
+        case TokenType::PUNCTUATOR_STAR_EQUAL: return "*=";
+        case TokenType::PUNCTUATOR_SLASH_EQUAL: return "/=";
+        case TokenType::PUNCTUATOR_PERCENT_EQUAL: return "%=";
+        case TokenType::KEYWORD_TYPE: return "type";
         case TokenType::PUNCTUATOR_DOT_DOT_DOT: return "...";
         case TokenType::PUNCTUATOR_FU_K: return "fu*k";
+    case TokenType::PUNCTUATOR_REACTION: return "<->";
         default: return "unknown";
     }
 }

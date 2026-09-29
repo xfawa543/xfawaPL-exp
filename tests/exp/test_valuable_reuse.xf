@@ -1,0 +1,16 @@
+#test {
+    // v8 the same code value may run many times, inside a loop, and the free
+    //    variables are the ones of that use point
+    fn main() {
+        x = 0
+        arr = [1, 2, 3]
+        A = valuable { x = x + 1 }
+        for item in arr {
+            A
+        }
+        print(x)
+        B = valuable { for item in arr } + valuable { x = x + item }
+        B
+        print(x)
+    }
+}

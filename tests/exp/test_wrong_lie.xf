@@ -1,0 +1,10 @@
+#test {
+	fn main() {
+	x = 3
+    lie x = 9 {
+        wrong x == 9
+    }
+    print(x)
+
+	}
+}

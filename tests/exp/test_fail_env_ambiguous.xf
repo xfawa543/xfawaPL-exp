@@ -1,0 +1,17 @@
+// 负例：两个携带类型都有 hp 字段时，裸写 hp 无法确定指向谁，必须写全。
+type Actor { int hp }
+type Weapon { int hp }
+
+#test {
+    fn main() {
+        Actor a = { 10 }
+        Weapon w = { 3 }
+        env Actor actor { hit }
+        env Weapon weapon { hit }
+        hit(a, w)
+    }
+
+    fn hit() {
+        hp = 0
+    }
+}

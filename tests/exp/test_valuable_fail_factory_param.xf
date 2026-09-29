@@ -1,0 +1,12 @@
+#test {
+    // v21 a factory's code is compiled at the use point, so it cannot mention a
+    //     runtime value of the factory
+    fn make(step) {
+        return valuable { x = x + step }
+    }
+    fn main() {
+        A = make(3)
+        A
+        print(x)
+    }
+}

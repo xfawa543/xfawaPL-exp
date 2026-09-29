@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        int a = 1
+        a <->[1] nosuch
+        print(a)
+    }
+}

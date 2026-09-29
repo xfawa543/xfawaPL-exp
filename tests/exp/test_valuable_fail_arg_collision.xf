@@ -1,0 +1,12 @@
+#test {
+    // v24 the code and the function it is passed to share one name space, so a
+    //     variable the function owns cannot also be a variable of the code
+    fn run(A) {
+        t = 1
+        A
+    }
+    fn main() {
+        t = 0
+        run(valuable { t = t + 1 })
+    }
+}

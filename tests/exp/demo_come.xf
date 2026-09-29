@@ -1,0 +1,36 @@
+#test {
+// EXP `come` 视频演示：把执行线"拎起来丢回去"
+// come N 是跳转语句：执行线每次走到第 N 行时，不往前进，而是回到 come 所在的位置，
+// 把 come 之后到第 N 行之间的语句再跑一遍（第 N 行本身每次都执行）。
+// 所以 come + 目标行 = 一条循环：come 之前的代码只跑一次。
+// 注意：行号是源码里的物理行号，改源码就要同步改行号。
+
+    fn come_if_demo() {
+        // 第一幕：come if —— 条件为假就放行，循环自然结束
+        print("== 1. come if：问一句再决定跳不跳 ==")
+        int counter = 1
+        come if(counter < 4) 15
+        counter = counter + 1
+        print(counter)     // 2、3、4：每次跳回来都加一
+        print(counter)     // 15：到达这一行先问"还没到 4 吗"
+        print("--")
+    }
+
+    fn countdown() {
+        // 第二幕：come + boom —— 一行代码写出一条倒计时循环
+        print("== 2. come 27：跳回第 27 行 ==")
+        int t = 3
+        print(t)            // 3：come 之前的代码只跑这一次
+        come 27             // ← 执行线想继续往前？先回去重跑
+        t = t - 1
+        if t < 0 { boom }   // ← 叫停点：负数就爆炸退出
+        print(t)            // 27 ← 每次跳到这里，t 少一
+        print("永远到不了这一行")
+    }
+
+    fn main() {
+        come_if_demo()
+        countdown()
+        print("== done ==")
+    }
+}

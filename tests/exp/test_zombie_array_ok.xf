@@ -1,0 +1,11 @@
+#test {
+    // t8 a list of healthy numbers is untouched by the feature
+    fn main() {
+        a = 4
+        b = 6
+        arr = [a, b, 7]
+        print(arr[0])
+        print(arr[1])
+        print(arr[2])
+    }
+}

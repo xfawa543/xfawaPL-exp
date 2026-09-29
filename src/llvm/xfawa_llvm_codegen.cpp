@@ -1,9 +1,15 @@
 #include "xfawa_llvm_codegen.h"
 #include "xfawa_error.h"
+#include "xfawa_lexer.h"
+#include "xfawa_parser.h"
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
+#include <deque>
 #include <filesystem>
+#include <functional>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #if defined(_WIN32)
@@ -521,6 +527,37 @@ llvm::Value* LLVMCodegen::codegen(VariableExpression* expr) {
         return builder.CreateLoad(globalIt->second->getValueType(), globalIt->second, expr->name.c_str());
     }
     
+    // EXP structs / env implicit this: a bare field name inside a function that
+    // carries a struct (血量 for 发出者.血量) resolves to that carried field
+    // when no local variable conflicts. Exactly one carried type may have the
+    // field; ambiguity is a compile error.
+    if (!currentEnvCarried.empty()) {
+        const std::pair<std::string, std::string>* hit = nullptr;
+        int matches = 0;
+        for (const auto& c : currentEnvCarried) {
+            auto fit = structFields.find(c.second);
+            if (fit == structFields.end()) continue;
+            for (const auto& f : fit->second) {
+                if (f.first == expr->name) { hit = &c; matches++; break; }
+            }
+        }
+        if (matches > 1) {
+            addError("[env] 字段 '" + expr->name + "' 在多个携带的类型里都存在，不能省略");
+            return nullptr;
+        }
+        if (matches == 1 && hit) {
+            auto ait = locals.find(hit->first);
+            if (ait != locals.end()) {
+                llvm::Value* basePtr = builder.CreateLoad(ait->second->getAllocatedType(),
+                                                          ait->second, hit->first.c_str());
+                llvm::Type* fieldTy = nullptr;
+                llvm::Value* fp = codegenFieldPtr(hit->second, basePtr, expr->name, &fieldTy);
+                if (!fp) return nullptr;
+                return builder.CreateLoad(fieldTy, fp, expr->name.c_str());
+            }
+        }
+    }
+    
     addError("Undefined variable: " + expr->name);
     return nullptr;
 }
@@ -749,7 +786,1511 @@ llvm::Value* LLVMCodegen::codegen(GhostExpression* expr) {
     return nullptr;
 }
 
+// ============================================================================
+// EXP `zombie`: the arithmetic plague
+// ============================================================================
+
+// Defined further down with the `wrong` machinery; declared here because the
+// valuable writer-back reuses the same integer/float conversions.
+static llvm::Value* wrongCastTo(llvm::IRBuilder<>& builder, llvm::Value* value,
+                                llvm::Type* type, const std::string& tag);
+
+// Map raw storage back to a recorded variable type (used when a dummy slot in a
+// valuable inner function has no recorded type, e.g. a function parameter).
+static VarType varTypeOfStorage(llvm::Type* ty) {
+    if (!ty) return VarType::UNKNOWN;
+    if (ty->isFloatTy()) return VarType::FLOAT;
+    if (ty->isIntegerTy(1)) return VarType::BOOL;
+    if (ty->isIntegerTy(64)) return VarType::LONG;
+    if (ty->isIntegerTy()) return VarType::INT;
+    if (ty->isPointerTy()) return VarType::STRING;
+    return VarType::UNKNOWN;
+}
+
+// A variable can hold a plague only in plain numeric storage.
+static bool zombieNumericOk(VarType vt) {
+    return vt == VarType::INT || vt == VarType::LONG || vt == VarType::FLOAT;
+}
+
+// The plague value of an arithmetic step is the value of its leftmost zombie
+// operand. Returns "" when the step is not annihilated (no zombie operand, or a
+// non-numeric variable on the other side, e.g. string concatenation).
+std::string LLVMCodegen::zombieSourceName(Expression* expr) {
+    auto numericVar = [&](const std::string& n) {
+        auto tIt = localTypes.find(n);
+        if (tIt == localTypes.end() || !zombieNumericOk(tIt->second)) return false;
+        return !arrayLengths.count(n);
+    };
+
+    auto* bin = dynamic_cast<BinaryOp*>(expr);
+    if (!bin) return "";
+    bool arith = bin->op == BinaryOpType::ADD || bin->op == BinaryOpType::SUB ||
+                 bin->op == BinaryOpType::MUL || bin->op == BinaryOpType::DIV ||
+                 bin->op == BinaryOpType::MOD;
+    if (!arith) return "";
+
+    auto* left = dynamic_cast<VariableExpression*>(bin->left.get());
+    auto* right = dynamic_cast<VariableExpression*>(bin->right.get());
+
+    // A non-numeric variable operand makes this a string/array operation, which
+    // the plague does not touch.
+    if (left && !numericVar(left->name)) return "";
+    if (right && !numericVar(right->name)) return "";
+
+    if (left && zombieVars.count(left->name) && numericVar(left->name)) return left->name;
+    if (right && zombieVars.count(right->name) && numericVar(right->name)) return right->name;
+    return "";
+}
+
+bool LLVMCodegen::zombieAnnihilates(Expression* expr) {
+    return !zombieSourceName(expr).empty();
+}
+
+llvm::Value* LLVMCodegen::codegen(ZombieStatement* stmt) {
+    const std::string& name = stmt->variableName;
+    auto lIt = locals.find(name);
+    if (lIt == locals.end()) {
+        addError("zombie: 变量 '" + name + "' 不存在（只能标记已声明的数值变量）");
+        return nullptr;
+    }
+    if (arrayLengths.count(name)) {
+        addError("zombie: '" + name + "' 是列表，瘟疫无法在列表里传播");
+        return nullptr;
+    }
+    auto tIt = localTypes.find(name);
+    VarType vt = (tIt != localTypes.end()) ? tIt->second : VarType::UNKNOWN;
+    if (vt == VarType::UNKNOWN) {
+        // Function parameters may carry no recorded type; fall back to the storage.
+        if (lIt->second->getAllocatedType()->isFloatTy()) vt = VarType::FLOAT;
+        else if (lIt->second->getAllocatedType()->isIntegerTy(64)) vt = VarType::LONG;
+        else if (lIt->second->getAllocatedType()->isIntegerTy()) vt = VarType::INT;
+    }
+    if (!zombieNumericOk(vt)) {
+        addError("zombie: '" + name + "' 不是数值变量（只有 int/long/float 能被感染）");
+        return nullptr;
+    }
+    zombieVars.insert(name);
+    return createConstInt(context, builder.getInt32Ty(), 0);
+}
+
+// ============================================================================
+// EXP `valuable`: first-class uncompiled code
+// ============================================================================
+
+int LLVMCodegen::internFragment(std::vector<Token> toks) {
+    fragmentStore.push_back(std::move(toks));
+    return static_cast<int>(fragmentStore.size()) - 1;
+}
+
+static Function* lookupFunctionAst(const std::map<std::string, Function*>& asts,
+                                   const std::string& ns, const std::string& name);
+
+bool LLVMCodegen::isCodeExpr(Expression* expr) {
+    if (!expr) return false;
+    if (dynamic_cast<ValuableFragmentExpression*>(expr)) return true;
+    if (dynamic_cast<ValuableInjectExpression*>(expr)) return true;
+    // `call valuable A for x` hands back the ordinary value of x, never code
+    if (auto* v = dynamic_cast<VariableExpression*>(expr))
+        return codeVarFragments.count(v->name) > 0;
+    if (auto* call = dynamic_cast<CallExpression*>(expr)) {
+        // a code factory produces code, so calling it in a code position yields code
+        Function* target = lookupFunctionAst(funcAsts, call->ns, call->name);
+        return target && isCodeFactoryFunction(target);
+    }
+    if (auto* b = dynamic_cast<BinaryOp*>(expr)) {
+        if (b->op == BinaryOpType::ADD) return isCodeExpr(b->left.get()) && isCodeExpr(b->right.get());
+        if (b->op == BinaryOpType::MUL) {
+            // code * constant count
+            return (isCodeExpr(b->left.get()) && isCodeExpr(b->right.get())) ||
+                   (isCodeExpr(b->left.get()) && dynamic_cast<NumberLiteral*>(b->right.get()) != nullptr) ||
+                   (isCodeExpr(b->right.get()) && dynamic_cast<NumberLiteral*>(b->left.get()) != nullptr);
+        }
+    }
+    return false;
+}
+
+// `+` / `*` with one code side and one ordinary side is still an attempt to work
+// with code, so it has to reach the code path in order to be diagnosed.
+bool LLVMCodegen::looksLikeCodeExpr(Expression* expr) {
+    if (isCodeExpr(expr)) return true;
+    if (auto* b = dynamic_cast<BinaryOp*>(expr)) {
+        if (b->op != BinaryOpType::ADD && b->op != BinaryOpType::MUL) return false;
+        return isCodeExpr(b->left.get()) || isCodeExpr(b->right.get());
+    }
+    return false;
+}
+
+// Token helpers used by the template substitution of `inject`.
+static Token makeIdentToken(const std::string& text, const SourceLocation& loc) {
+    return Token(TokenType::IDENTIFIER, text, loc);
+}
+
+// Re-lex a piece of source text so literals keep their exact token shape.
+static std::vector<Token> relexText(const std::string& text, const SourceLocation& loc) {
+    std::vector<Token> lexed;
+    try {
+        Lexer lex(text);
+        lexed = lex.tokenize();
+    } catch (...) {
+        lexed.clear();
+    }
+    std::vector<Token> out;
+    for (Token& t : lexed) {
+        // this piece gets spliced into other code, so its end of file is not
+        // the end of the fragment
+        if (t.type == TokenType::END_OF_FILE) break;
+        t.location = loc;
+        out.push_back(t);
+    }
+    return out;
+}
+
+std::vector<Token> LLVMCodegen::expressionToTokens(Expression* expr) {
+    if (auto* v = dynamic_cast<VariableExpression*>(expr)) {
+        return {makeIdentToken(v->name, v->location)};
+    }
+    if (auto* n = dynamic_cast<NumberLiteral*>(expr)) {
+        return relexText(std::to_string(n->value), n->location);
+    }
+    if (auto* f = dynamic_cast<FloatLiteral*>(expr)) {
+        std::ostringstream oss;
+        oss << f->value;
+        return relexText(oss.str(), f->location);
+    }
+    if (auto* b = dynamic_cast<BooleanLiteral*>(expr)) {
+        return {Token(TokenType::KEYWORD_TRUE, "true", b->location)};
+    }
+    if (auto* s = dynamic_cast<StringLiteral*>(expr)) {
+        return relexText("\"" + s->value + "\"", s->location);
+    }
+    if (auto* o = dynamic_cast<OLiteralExpression*>(expr)) {
+        return relexText(o->raw, o->location);
+    }
+    return {};
+}
+
+// EXP `valuable`: inside a code value every name that holds code is the code
+// itself, so it is spliced in place (deeply, and recursively for chains). The
+// left side of a plain `name = ...` is a binding, not a reference, so it is left
+// alone.
+std::vector<Token> LLVMCodegen::expandCodeRefs(const std::vector<Token>& toks, int depth) {
+    if (depth > 32) return toks; // pathological nesting guard
+    std::vector<Token> out;
+    out.reserve(toks.size());
+    for (size_t i = 0; i < toks.size(); i++) {
+        const Token& t = toks[i];
+        if (t.is(TokenType::IDENTIFIER) && codeVarFragments.count(t.text)) {
+            bool isBinding = false;
+            if (i + 1 < toks.size() && toks[i + 1].is(TokenType::PUNCTUATOR_EQUAL)) {
+                isBinding = true; // `C = ...` rebinds, it does not splice
+            }
+            if (i > 0 && (toks[i - 1].is(TokenType::PUNCTUATOR_LBRACKET) ||
+                          toks[i - 1].is(TokenType::PUNCTUATOR_DOT))) {
+                isBinding = true; // `arr[name]` / `obj.name` is a member, not code
+            }
+            if (!isBinding) {
+                int sub = codeVarFragments[t.text];
+                std::vector<Token> inner = expandCodeRefs(fragmentStore[sub], depth + 1);
+                out.insert(out.end(), inner.begin(), inner.end());
+                continue;
+            }
+        }
+        out.push_back(t);
+    }
+    return out;
+}
+
+// Every name a fragment mentions. A name the fragment introduces itself
+// (`for item in`, `fn f(`, `class C`) is its own; a name used as an array index
+// or a member is a member, not a variable. `isWrite` marks the left side of a
+// plain `name = ...`, which is the fragment's only way to declare a local.
+std::vector<std::pair<std::string, bool>> LLVMCodegen::collectFragmentRefs(
+    const std::vector<Token>& toks) {
+    std::set<std::string> introduced;
+    for (size_t i = 1; i < toks.size(); i++) {
+        if (!toks[i].is(TokenType::IDENTIFIER)) continue;
+        const Token& prev = toks[i - 1];
+        if (prev.is(TokenType::KEYWORD_FOR) || prev.is(TokenType::KEYWORD_FN) ||
+            prev.is(TokenType::KEYWORD_CLASS) || prev.is(TokenType::KEYWORD_DRIFT) ||
+            prev.is(TokenType::KEYWORD_DISPOSABLE)) {
+            introduced.insert(toks[i].text);
+        }
+    }
+    std::vector<std::pair<std::string, bool>> out;
+    for (size_t i = 0; i < toks.size(); i++) {
+        const Token& t = toks[i];
+        if (!t.is(TokenType::IDENTIFIER)) continue;
+        if (t.text == "in") continue;                  // soft keyword of `for x in y`
+        if (introduced.count(t.text)) continue;        // the fragment brings it along
+        if (i > 0) {
+            const Token& prev = toks[i - 1];
+            if (prev.is(TokenType::PUNCTUATOR_LBRACKET) || prev.is(TokenType::PUNCTUATOR_DOT) ||
+                prev.is(TokenType::PUNCTUATOR_COLON) || prev.is(TokenType::KEYWORD_WINDOW) ||
+                prev.is(TokenType::KEYWORD_DUAL)) {
+                continue;                              // a member, a name or a window id
+            }
+        }
+        if (i + 1 < toks.size() && toks[i + 1].is(TokenType::PUNCTUATOR_LPAREN)) continue; // callee
+        if (i + 1 < toks.size() && toks[i + 1].is(TokenType::PUNCTUATOR_COLON)) continue;   // `x: int =`
+        // a known function name is called, never bound
+        if (funcReturnTypes.count(t.text) || voidFuncNames.count(t.text)) continue;
+        bool isWrite = i + 1 < toks.size() && toks[i + 1].is(TokenType::PUNCTUATOR_EQUAL);
+        out.push_back({t.text, isWrite});
+    }
+    return out;
+}
+
+// `x = <expr>` inside a fragment: used only to learn the type of a `call ... for x`
+// target that does not exist at the use point.
+static Expression* findFragmentAssignment(const std::vector<std::unique_ptr<Statement>>& stmts,
+                                          const std::string& name) {
+    Expression* found = nullptr;
+    for (const auto& s : stmts) {
+        if (auto* a = dynamic_cast<AssignmentStatement*>(s.get())) {
+            if (a->name == name && a->value) found = a->value.get();
+        }
+    }
+    return found;
+}
+
+VarType LLVMCodegen::inferFragmentTargetType(const std::vector<std::unique_ptr<Statement>>& stmts,
+                                             const std::string& name) {
+    Expression* rhs = findFragmentAssignment(stmts, name);
+    if (!rhs) return VarType::UNKNOWN;
+    if (dynamic_cast<NumberLiteral*>(rhs)) {
+        auto* n = static_cast<NumberLiteral*>(rhs);
+        constexpr int64_t INT32_MAX_VAL = 2147483647LL;
+        return (n->value > INT32_MAX_VAL || n->value < -INT32_MAX_VAL - 1) ? VarType::LONG
+                                                                         : VarType::INT;
+    }
+    if (dynamic_cast<FloatLiteral*>(rhs)) return VarType::FLOAT;
+    if (dynamic_cast<StringLiteral*>(rhs)) return VarType::STRING;
+    if (dynamic_cast<BooleanLiteral*>(rhs)) return VarType::BOOL;
+    if (auto* v = dynamic_cast<VariableExpression*>(rhs)) {
+        auto tIt = localTypes.find(v->name);
+        if (tIt != localTypes.end()) return tIt->second;
+    }
+    return VarType::UNKNOWN;
+}
+
+// Parse a stored fragment at this use point. Returns null and reports the first
+// parse error when the spliced code is not a valid program.
+std::unique_ptr<Statement> LLVMCodegen::parseFragment(const std::vector<Token>& toks, int& fragId) {
+    fragId = -1;
+    std::vector<Token> all = toks;
+    all.push_back(Token(TokenType::END_OF_FILE, "", SourceLocation()));
+    Parser sub(all);
+    auto stmts = sub.parseFragmentStatements();
+    if (sub.hasErrors()) {
+        std::string msg = "valuable: 代码片段无法解析（";
+        const auto& errs = sub.getErrors();
+        msg += errs.empty() ? "未知错误" : errs.front();
+        if (errs.size() > 1) msg += " 等 " + std::to_string(errs.size()) + " 处";
+        msg += "）";
+        addError(msg);
+        return nullptr;
+    }
+    auto block = std::make_unique<BlockStatement>(SourceLocation());
+    for (auto& s : stmts) block->statements.push_back(std::move(s));
+    return block;
+}
+
+// EXP `valuable`: run a code value at the current point. Each use point compiles
+// its own inner function, so bindings are resolved here and now. When
+// `wantResult` is set, the target name is tracked through the run and its final
+// value is handed back as an ordinary value.
+llvm::Value* LLVMCodegen::emitValuableRun(int fragId, const std::string& targetName,
+                                          bool wantResult) {
+    if (fragId < 0 || fragId >= static_cast<int>(fragmentStore.size())) return nullptr;
+    std::vector<Token> toks = expandCodeRefs(fragmentStore[fragId], 0);
+    if (toks.empty()) {
+        // An empty code value is a valid no-op (e.g. `A * 0`).
+        return wantResult ? createConstInt(context, builder.getInt32Ty(), 0) : nullptr;
+    }
+
+    int parsedFrag = -1;
+    auto parsed = parseFragment(toks, parsedFrag);
+    if (!parsed) return nullptr;
+
+    // The names a fragment mentions are resolved HERE, at the use point: a name
+    // the use point has is passed in by address (so writes are visible), a name
+    // nobody has is the fragment's own storage, and a name the fragment only ever
+    // READS without owning it can never resolve — code captures nothing.
+    std::vector<std::string> freeNames;
+    std::set<std::string> freeSeen;
+    std::set<std::string> ownNames; // already bound by the fragment itself
+    for (const auto& ref : collectFragmentRefs(toks)) {
+        const std::string& fn2 = ref.first;
+        bool isWrite = ref.second;
+        if (fn2 == targetName && wantResult) continue; // the target is tracked separately
+        bool exists = locals.count(fn2) || windowInputGlobals.count(fn2) ||
+                      funcReturnTypes.count(fn2);
+        if (exists) {
+            if (freeSeen.insert(fn2).second) freeNames.push_back(fn2);
+            if (isWrite) ownNames.insert(fn2);
+            continue;
+        }
+        if (isWrite) { ownNames.insert(fn2); continue; }        // fragment-local
+        if (ownNames.count(fn2)) continue;                     // reads its own local
+        addError("valuable: 代码片段读取的自由变量 '" + fn2 +
+                 "' 在使用点不存在（代码不捕获创建处的变量）");
+        return nullptr;
+    }
+
+    // Result storage lives in the CALLER, so its type must be known up front.
+    llvm::AllocaInst* resultAlloca = nullptr;
+    llvm::Type* resultTy = nullptr;
+    if (wantResult) {
+        auto lit = locals.find(targetName);
+        if (lit != locals.end()) {
+            resultTy = lit->second->getAllocatedType();
+        } else {
+            VarType vt = inferFragmentTargetType(static_cast<BlockStatement*>(parsed.get())->statements,
+                                                 targetName);
+            if (vt == VarType::UNKNOWN) {
+                addError("valuable: call 的目标变量 '" + targetName +
+                         "' 在使用点不存在，且无法从代码片段推断它的类型");
+                return nullptr;
+            }
+            resultTy = getLLVMType(vt);
+        }
+        resultAlloca = createAllocaInEntry(resultTy, ("val.res." + targetName).c_str());
+        // `for x` hands the fragment x's current value as its starting point, so a
+        // fragment may read the target before writing it.
+        if (wantResult) {
+            auto lit = locals.find(targetName);
+            if (lit != locals.end()) {
+                builder.CreateStore(builder.CreateLoad(resultTy, lit->second,
+                                                       "val.res.seed"),
+                                    resultAlloca);
+            }
+        }
+    }
+
+    const std::string fnName = "__xfawa_val_" + std::to_string(valuableCounter++);
+    llvm::Type* ptrTy = llvm::PointerType::get(context, 0);
+    std::vector<llvm::Type*> paramTypes;
+    if (wantResult) paramTypes.push_back(ptrTy);
+    for (size_t i = 0; i < freeNames.size(); i++) paramTypes.push_back(ptrTy);
+    llvm::FunctionType* fnTy = llvm::FunctionType::get(builder.getVoidTy(), paramTypes, false);
+    llvm::Function* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, 0,
+                                                fnName, module);
+
+    llvm::IRBuilderBase::InsertPoint savedIP = builder.saveIP();
+    llvm::BasicBlock* entryBB = llvm::BasicBlock::Create(context, "v.entry", fn);
+    builder.SetInsertPoint(entryBB);
+
+    // The run gets its own scope: every per-function EXP state is isolated the
+    // same way `codegen(Function*)` isolates it, so a fragment cannot reach the
+    // caller's guards, destiny, plague or code bindings (and vice versa).
+    auto savedLocals = locals;
+    auto savedTypes = localTypes;
+    auto savedArrayLengths = arrayLengths;
+    auto savedFateSlots = fateSlots;
+    auto savedDualEchoVars = dualEchoVars;
+    auto savedDisposableVars = disposableVars;
+    auto savedInterestVars = interestVars;
+    auto savedBackroomVars = backroomVars;
+    auto savedZombieVars = zombieVars;
+    auto savedCodeVarFragments = codeVarFragments;
+    auto savedWrongSlots = wrongSlots;
+    auto savedWrongWatched = wrongWatchedNames;
+    auto savedProducers = functionProducers;
+    auto savedParams = currentFuncParams;
+    std::string savedCurrentFunc = currentFuncName;
+    // Array shape knowledge has to travel with the value: a `for item in arr`
+    // inside the fragment still needs the length of the caller's list.
+    for (const std::string& fn2 : freeNames) {
+        auto lenIt = savedArrayLengths.find(fn2);
+        if (lenIt != savedArrayLengths.end()) arrayLengths[fn2] = lenIt->second;
+    }
+    fateSlots.clear();
+    dualEchoVars.clear();
+    disposableVars.clear();
+    interestVars.clear();
+    backroomVars.clear();
+    zombieVars.clear();
+    codeVarFragments.clear();
+    wrongSlots.clear();
+    wrongWatchedNames.clear();
+    functionProducers.clear();
+    currentFuncParams.clear();
+
+    std::map<std::string, llvm::AllocaInst*> innerLocals;
+    std::map<std::string, VarType> innerTypes;
+
+    size_t argBase = wantResult ? 1 : 0;
+    if (wantResult) {
+        // The target is forced into the inner scope, so a fragment that binds it
+        // locally still ends up in the storage the caller reads back. The caller's
+        // slot arrives as a pointer: an inner function may not name it directly.
+        llvm::AllocaInst* tAlloca = builder.CreateAlloca(resultTy, nullptr,
+                                                         ("v.t." + targetName).c_str());
+        builder.CreateStore(builder.CreateLoad(resultTy, fn->getArg(0), "v.t.init"), tAlloca);
+        innerLocals[targetName] = tAlloca;
+        VarType tv = localTypes.count(targetName) ? localTypes[targetName] : VarType::UNKNOWN;
+        if (tv == VarType::UNKNOWN) tv = varTypeOfStorage(resultTy);
+        innerTypes[targetName] = tv;
+    }
+    for (size_t i = 0; i < freeNames.size(); i++) {
+        const std::string& fn2 = freeNames[i];
+        llvm::Type* ty = builder.getInt32Ty();
+        auto lit = savedLocals.find(fn2);
+        if (lit != savedLocals.end()) ty = lit->second->getAllocatedType();
+        else if (savedTypes.count(fn2) && savedTypes[fn2] != VarType::UNKNOWN)
+            ty = getLLVMType(savedTypes[fn2]);
+        llvm::AllocaInst* dummy = builder.CreateAlloca(ty, nullptr, ("v.d." + fn2).c_str());
+        llvm::Value* cur = builder.CreateLoad(ty, fn->getArg(argBase + i), ("v.cur." + fn2).c_str());
+        builder.CreateStore(cur, dummy);
+        innerLocals[fn2] = dummy;
+        VarType vt = savedTypes.count(fn2) ? savedTypes[fn2] : VarType::UNKNOWN;
+        if (vt == VarType::UNKNOWN) vt = varTypeOfStorage(ty);
+        innerTypes[fn2] = vt;
+    }
+    locals = innerLocals;
+    localTypes = innerTypes;
+
+    auto* block = static_cast<BlockStatement*>(parsed.get());
+    for (auto& s : block->statements) {
+        if (builder.GetInsertBlock()->getTerminator()) break; // a `return` ended the run
+        codegen(s.get());
+    }
+
+    // Write the closure back. The inner function may not name the caller's
+    // variables, so every write-back goes through a pointer argument.
+    bool openBlock = !builder.GetInsertBlock()->getTerminator();
+    if (openBlock) {
+        for (size_t i = 0; i < freeNames.size(); i++) {
+            const std::string& fn2 = freeNames[i];
+            auto lit = savedLocals.find(fn2);
+            if (lit == savedLocals.end()) continue; // window input: read-only
+            llvm::Type* ty = innerLocals[fn2]->getAllocatedType();
+            llvm::Value* v = builder.CreateLoad(ty, innerLocals[fn2], ("v.back." + fn2).c_str());
+            llvm::Value* dst = fn->getArg(argBase + i);
+            if (lit->second->getAllocatedType() != ty) {
+                v = wrongCastTo(builder, v, lit->second->getAllocatedType(), "v.back.cast");
+            }
+            builder.CreateStore(v, dst);
+        }
+        if (wantResult) {
+            llvm::AllocaInst* tAlloca = innerLocals[targetName];
+            llvm::Type* ty = tAlloca->getAllocatedType();
+            llvm::Value* v = builder.CreateLoad(ty, tAlloca, ("v.res.get." + targetName).c_str());
+            builder.CreateStore(v, fn->getArg(0));
+        }
+        builder.CreateRetVoid();
+    }
+
+    locals = savedLocals;
+    localTypes = savedTypes;
+    arrayLengths = savedArrayLengths;
+    fateSlots = savedFateSlots;
+    dualEchoVars = savedDualEchoVars;
+    disposableVars = savedDisposableVars;
+    interestVars = savedInterestVars;
+    backroomVars = savedBackroomVars;
+    zombieVars = savedZombieVars;
+    codeVarFragments = savedCodeVarFragments;
+    wrongSlots = savedWrongSlots;
+    wrongWatchedNames = savedWrongWatched;
+    functionProducers = savedProducers;
+    currentFuncParams = savedParams;
+    currentFuncName = savedCurrentFunc;
+    builder.restoreIP(savedIP);
+
+    // Call it from the use point.
+    std::vector<llvm::Value*> args;
+    if (wantResult) args.push_back(resultAlloca);
+    for (const std::string& fn2 : freeNames) {
+        auto lit = savedLocals.find(fn2);
+        if (lit != savedLocals.end()) {
+            args.push_back(lit->second);
+        } else {
+            // window input boxes: pass a scratch slot of the right type
+            auto wIt = windowInputGlobals.find(fn2);
+            llvm::Type* ty = wIt != windowInputGlobals.end() ? wIt->second->getValueType()
+                                                             : builder.getInt32Ty();
+            llvm::AllocaInst* scratch = createAllocaInEntry(ty, ("val.in." + fn2).c_str());
+            args.push_back(scratch);
+        }
+    }
+    builder.CreateCall(fnTy, fn, args);
+    if (!wantResult) return createConstInt(context, builder.getInt32Ty(), 0);
+    return builder.CreateLoad(resultAlloca->getAllocatedType(), resultAlloca,
+                              ("val.result." + targetName).c_str());
+}
+
+// Resolve any code-valued expression to its fragment id, folding `+` and `*` on
+// code values (compile time, nothing runs).
+int LLVMCodegen::resolveCodeFragment(Expression* expr, bool& ok) {
+    ok = true;
+    if (!expr) { ok = false; return -1; }
+    if (auto* frag = dynamic_cast<ValuableFragmentExpression*>(expr)) {
+        return internFragment(frag->tokens);
+    }
+    if (auto* inj = dynamic_cast<ValuableInjectExpression*>(expr)) {
+        return buildInjectFragment(inj, ok);
+    }
+    if (auto* callExpr = dynamic_cast<ValuableCallExpression*>(expr)) {
+        addError("call valuable ... for x 的结果是普通值，不能再当作代码使用");
+        ok = false;
+        return -1;
+    }
+    if (auto* v = dynamic_cast<VariableExpression*>(expr)) {
+        auto it = codeVarFragments.find(v->name);
+        if (it == codeVarFragments.end()) {
+            addError("valuable: '" + v->name + "' 不是代码值");
+            ok = false;
+            return -1;
+        }
+        return it->second;
+    }
+    if (auto* call = dynamic_cast<CallExpression*>(expr)) {
+        return resolveFactoryCall(call, ok);
+    }
+    if (auto* b = dynamic_cast<BinaryOp*>(expr)) {
+        if (b->op == BinaryOpType::ADD) {
+            if (!isCodeExpr(b->left.get()) || !isCodeExpr(b->right.get())) {
+                addError("valuable: '+' 连接的两个值必须都是代码值");
+                ok = false;
+                return -1;
+            }
+            bool okL = true, okR = true;
+            int l = resolveCodeFragment(b->left.get(), okL);
+            int r = resolveCodeFragment(b->right.get(), okR);
+            if (!okL || !okR) { ok = false; return -1; }
+            std::vector<Token> merged = fragmentStore[l];
+            const std::vector<Token>& rhsToks = fragmentStore[r];
+            merged.insert(merged.end(), rhsToks.begin(), rhsToks.end());
+            return internFragment(std::move(merged));
+        }
+        if (b->op == BinaryOpType::MUL) {
+            Expression* codeSide = nullptr;
+            Expression* countSide = nullptr;
+            if (isCodeExpr(b->left.get())) { codeSide = b->left.get(); countSide = b->right.get(); }
+            else if (isCodeExpr(b->right.get())) { codeSide = b->right.get(); countSide = b->left.get(); }
+            if (!codeSide) {
+                addError("valuable: '*' 至少有一侧必须是代码值");
+                ok = false;
+                return -1;
+            }
+            auto* num = dynamic_cast<NumberLiteral*>(countSide);
+            if (!num && isCodeExpr(countSide)) {
+                // code * code is not defined: fall through to the count check below
+                num = nullptr;
+            }
+            if (!num) {
+                addError("valuable: '*' 的重复次数必须是整型常量");
+                ok = false;
+                return -1;
+            }
+            bool okC = true;
+            int c = resolveCodeFragment(codeSide, okC);
+            if (!okC) { ok = false; return -1; }
+            if (num->value <= 0) return internFragment({});
+            const std::vector<Token>& unit = fragmentStore[c];
+            if (static_cast<size_t>(num->value) > 4096 || unit.size() * static_cast<size_t>(num->value) > 200000) {
+                addError("valuable: 重复次数过大");
+                ok = false;
+                return -1;
+            }
+            std::vector<Token> many;
+            many.reserve(unit.size() * static_cast<size_t>(num->value));
+            for (int64_t i = 0; i < num->value; i++)
+                many.insert(many.end(), unit.begin(), unit.end());
+            return internFragment(std::move(many));
+        }
+    }
+    addError("valuable: 这个表达式不是代码值");
+    ok = false;
+    return -1;
+}
+
+// EXP `inject y valuable A for x`: bind the free name x and return new code.
+int LLVMCodegen::buildInjectFragment(ValuableInjectExpression* expr, bool& ok) {
+    ok = true;
+    if (!isCodeExpr(expr->base.get())) {
+        addError("valuable: inject 的对象必须是代码值");
+        ok = false;
+        return -1;
+    }
+    std::vector<Token> targetToks = expressionToTokens(expr->target.get());
+    if (targetToks.empty()) {
+        addError("valuable: inject 的目标只能是变量或字面量");
+        ok = false;
+        return -1;
+    }
+    bool okB = true;
+    int base = resolveCodeFragment(expr->base.get(), okB);
+    if (!okB) { ok = false; return -1; }
+    std::vector<Token> src = fragmentStore[base];
+
+    // The free name must really be mentioned by the fragment.
+    bool mentioned = false;
+    for (const auto& ref : collectFragmentRefs(src)) {
+        if (ref.first == expr->freeName) { mentioned = true; break; }
+    }
+    if (!mentioned) {
+        addError("valuable: inject 只能绑定自由变量 '" + expr->freeName +
+                 "'（该代码片段里没有引用它）");
+        ok = false;
+        return -1;
+    }
+
+    std::vector<Token> merged;
+    for (size_t i = 0; i < src.size(); i++) {
+        if (src[i].is(TokenType::IDENTIFIER) && src[i].text == expr->freeName) {
+            // `x = ...` on the left is this fragment's own binding, not a use of
+            // the free name, so the target does not go there.
+            bool isBinding = i + 1 < src.size() && src[i + 1].is(TokenType::PUNCTUATOR_EQUAL);
+            if (!isBinding) {
+                merged.insert(merged.end(), targetToks.begin(), targetToks.end());
+                continue;
+            }
+        }
+        merged.push_back(src[i]);
+    }
+    return internFragment(std::move(merged));
+}
+
+llvm::Value* LLVMCodegen::codegen(ValuableCallExpression* expr) {
+    bool ok = true;
+    int fid = resolveCodeFragment(expr->base.get(), ok);
+    if (!ok) return nullptr;
+    return emitValuableRun(fid, expr->targetName, true);
+}
+
+// EXP `valuable` in statement position: juxtapose the code values, splice the
+// raw block at the end, and run the merged fragment once.
+llvm::Value* LLVMCodegen::codegen(ValuableUseStatement* stmt) {
+    std::vector<Token> merged;
+    for (const auto& part : stmt->parts) {
+        if (!isCodeExpr(part.get())) {
+            addError("valuable: 拼接中只能使用代码值");
+            return nullptr;
+        }
+        bool ok = true;
+        int fid = resolveCodeFragment(part.get(), ok);
+        if (!ok) return nullptr;
+        const std::vector<Token>& t = fragmentStore[fid];
+        merged.insert(merged.end(), t.begin(), t.end());
+    }
+    merged.insert(merged.end(), stmt->blockTokens.begin(), stmt->blockTokens.end());
+    int fid = internFragment(std::move(merged));
+    return emitValuableRun(fid, "", false);
+}
+
+// ============================================================================
+// EXP `valuable`: code values across a function boundary
+// ============================================================================
+// A code value has no runtime form, so it cannot be handed to a callee the way
+// a number is. It travels by being COMPILED into the callee at the call site:
+//   - as an argument, the body tokens of the callee are copied with the code
+//     spliced in place of the parameter, and that copy is compiled as its own
+//     function (like a template instantiated per call shape);
+//   - as a result, a function whose whole body is code values plus a single
+//     `return <code>` is a "code factory": calling it inlines the code instead
+//     of emitting a call, because the code is the value it produces.
+
+std::string LLVMCodegen::functionQualifiedName(Function* func) {
+    if (!func) return "";
+    if (func->name == "main") return func->name;
+    if (!func->ns.empty()) return func->ns + ":" + func->name;
+    if (!func->blockName.empty()) return func->blockName + ":" + func->name;
+    return func->name;
+}
+
+// Is this function ever handed a code value as an argument?
+bool LLVMCodegen::functionTakesCode(Function* func) {
+    if (!func) return false;
+    auto it = codeParamIndices.find(functionQualifiedName(func));
+    if (it == codeParamIndices.end()) it = codeParamIndices.find(func->name);
+    return it != codeParamIndices.end() && !it->second.empty();
+}
+
+void LLVMCodegen::collectFunctionAsts(Program* program) {
+    for (auto& mod : program->modules) {
+        for (auto& func : mod->functions) {
+            std::string qualified = functionQualifiedName(func.get());
+            if (!qualified.empty()) funcAsts[qualified] = func.get();
+            if (!funcAsts.count(func->name)) funcAsts[func->name] = func.get();
+        }
+    }
+    collectCodeParamIndices(program);
+}
+
+static Function* lookupFunctionAst(const std::map<std::string, Function*>& asts,
+                                   const std::string& ns, const std::string& name) {
+    if (!ns.empty()) {
+        auto it = asts.find(ns + ":" + name);
+        if (it != asts.end()) return it->second;
+    }
+    auto bare = asts.find(name);
+    if (bare != asts.end()) return bare->second;
+    auto qualified = asts.find(ns + ":" + name);
+    if (qualified != asts.end()) return qualified->second;
+    return nullptr;
+}
+
+// EXP `valuable`: a function that is ever handed a code value can only be called
+// with code, so it is never emitted as a runnable function at all - every call
+// site compiles a specialized copy instead. This finds those parameters up front,
+// because whether a call passes code is only visible at the call site, while the
+// callee's own body is compiled earlier and would reject the bare parameter.
+void LLVMCodegen::collectCodeParamIndices(Program* program) {
+    for (auto& mod : program->modules) {
+        for (auto& func : mod->functions) {
+            std::set<std::string> codeNames;
+            scanStmtsForCodeParams(func->body.get(), codeNames);
+        }
+    }
+}
+
+void LLVMCodegen::scanStmtsForCodeParams(Statement* stmt, std::set<std::string>& codeNames) {
+    if (!stmt) return;
+    if (auto* block = dynamic_cast<BlockStatement*>(stmt)) {
+        for (auto& s : block->statements) scanStmtsForCodeParams(s.get(), codeNames);
+        return;
+    }
+    if (auto* as = dynamic_cast<AssignmentStatement*>(stmt)) {
+        if (staticIsCodeValue(as->value.get(), codeNames, 1)) codeNames.insert(as->name);
+        else codeNames.erase(as->name);
+        scanExprForCodeParams(as->value.get(), codeNames);
+        return;
+    }
+    if (auto* indexed = dynamic_cast<IndexedAssignmentStatement*>(stmt)) {
+        scanExprForCodeParams(indexed->index.get(), codeNames);
+        scanExprForCodeParams(indexed->value.get(), codeNames);
+        return;
+    }
+    if (auto* es = dynamic_cast<ExpressionStatement*>(stmt)) {
+        scanExprForCodeParams(es->expr.get(), codeNames);
+        return;
+    }
+    if (auto* ps = dynamic_cast<PrintStatement*>(stmt)) {
+        scanExprForCodeParams(ps->expr.get(), codeNames);
+        return;
+    }
+    if (auto* rs = dynamic_cast<ReturnStatement*>(stmt)) {
+        scanExprForCodeParams(rs->value.get(), codeNames);
+        return;
+    }
+    if (auto* use = dynamic_cast<ValuableUseStatement*>(stmt)) {
+        for (auto& p : use->parts) scanExprForCodeParams(p.get(), codeNames);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<IfStatement*>(stmt)) {
+        scanExprForCodeParams(ifs->condition.get(), codeNames);
+        scanStmtsForCodeParams(ifs->thenBranch.get(), codeNames);
+        for (auto& branch : ifs->elseIfBranches) {
+            scanExprForCodeParams(branch.first.get(), codeNames);
+            scanStmtsForCodeParams(branch.second.get(), codeNames);
+        }
+        scanStmtsForCodeParams(ifs->elseBranch.get(), codeNames);
+        return;
+    }
+    if (auto* ws = dynamic_cast<WhileStatement*>(stmt)) {
+        scanExprForCodeParams(ws->condition.get(), codeNames);
+        scanStmtsForCodeParams(ws->body.get(), codeNames);
+        return;
+    }
+    if (auto* fs = dynamic_cast<ForInStatement*>(stmt)) {
+        scanExprForCodeParams(fs->iterable.get(), codeNames);
+        scanStmtsForCodeParams(fs->body.get(), codeNames);
+        return;
+    }
+    if (auto* ls = dynamic_cast<LoopStatement*>(stmt)) {
+        for (auto& s : ls->body) scanStmtsForCodeParams(s.get(), codeNames);
+        return;
+    }
+}
+
+void LLVMCodegen::scanExprForCodeParams(Expression* expr, std::set<std::string>& codeNames) {
+    if (!expr) return;
+    if (auto* call = dynamic_cast<CallExpression*>(expr)) {
+        Function* target = lookupFunctionAst(funcAsts, call->ns, call->name);
+        for (size_t i = 0; i < call->args.size(); i++) {
+            Expression* arg = call->args[i].get();
+            if (target && !isCodeFactoryFunction(target) && i < target->params.size() &&
+                staticIsCodeValue(arg, codeNames, 1)) {
+                codeParamIndices[functionQualifiedName(target)].insert((int)i);
+                codeParamIndices[target->name].insert((int)i);
+            }
+            scanExprForCodeParams(arg, codeNames);
+        }
+        return;
+    }
+    if (auto* b = dynamic_cast<BinaryOp*>(expr)) {
+        scanExprForCodeParams(b->left.get(), codeNames);
+        scanExprForCodeParams(b->right.get(), codeNames);
+        return;
+    }
+    if (auto* u = dynamic_cast<UnaryOp*>(expr)) {
+        scanExprForCodeParams(u->expr.get(), codeNames);
+        return;
+    }
+    if (auto* idx = dynamic_cast<ArrayIndexExpression*>(expr)) {
+        scanExprForCodeParams(idx->array.get(), codeNames);
+        scanExprForCodeParams(idx->index.get(), codeNames);
+        return;
+    }
+    if (auto* vc = dynamic_cast<ValuableCallExpression*>(expr)) {
+        scanExprForCodeParams(vc->base.get(), codeNames);
+        return;
+    }
+    if (auto* vi = dynamic_cast<ValuableInjectExpression*>(expr)) {
+        scanExprForCodeParams(vi->target.get(), codeNames);
+        scanExprForCodeParams(vi->base.get(), codeNames);
+        return;
+    }
+    if (auto* al = dynamic_cast<ArrayLiteral*>(expr)) {
+        for (auto& e : al->elements) scanExprForCodeParams(e.get(), codeNames);
+        return;
+    }
+}
+
+// Is this expression a code value, judged from source alone (no interning yet)?
+// `codeNames` holds the code variables assigned earlier in the same body.
+bool LLVMCodegen::staticIsCodeValue(Expression* expr, const std::set<std::string>& codeNames,
+                                    int depth) {
+    if (!expr || depth > 8) return false;
+    if (dynamic_cast<ValuableFragmentExpression*>(expr)) return true;
+    if (dynamic_cast<ValuableInjectExpression*>(expr)) return true;
+    if (auto* v = dynamic_cast<VariableExpression*>(expr)) return codeNames.count(v->name) > 0;
+    if (auto* call = dynamic_cast<CallExpression*>(expr)) {
+        Function* target = lookupFunctionAst(funcAsts, call->ns, call->name);
+        return target && isCodeFactoryFunction(target);
+    }
+    if (auto* b = dynamic_cast<BinaryOp*>(expr)) {
+        if (b->op == BinaryOpType::ADD) {
+            return staticIsCodeValue(b->left.get(), codeNames, depth + 1) &&
+                   staticIsCodeValue(b->right.get(), codeNames, depth + 1);
+        }
+        if (b->op == BinaryOpType::MUL) {
+            // code * count (or code * code)
+            return staticIsCodeValue(b->left.get(), codeNames, depth + 1) ||
+                   staticIsCodeValue(b->right.get(), codeNames, depth + 1);
+        }
+    }
+    return false;
+}
+
+// Like staticIsCodeValue, but a call to `selfName` counts as code. A factory
+// that reaches itself is a factory in every other respect, so it deserves its
+// own message instead of "this is not a factory".
+bool LLVMCodegen::codeishCountingSelfCall(Expression* expr,
+                                          const std::set<std::string>& codeNames,
+                                          int depth, const std::string& selfName,
+                                          bool* sawSelfCall) {
+    if (!expr || depth > 8) return false;
+    if (dynamic_cast<ValuableFragmentExpression*>(expr)) return true;
+    if (dynamic_cast<ValuableInjectExpression*>(expr)) return true;
+    if (auto* v = dynamic_cast<VariableExpression*>(expr)) return codeNames.count(v->name) > 0;
+    if (auto* call = dynamic_cast<CallExpression*>(expr)) {
+        Function* target = lookupFunctionAst(funcAsts, call->ns, call->name);
+        if (!target) return false;
+        if (functionQualifiedName(target) == selfName || target->name == selfName) {
+            if (sawSelfCall) *sawSelfCall = true;
+            return true;
+        }
+        return isCodeFactoryFunction(target);
+    }
+    if (auto* b = dynamic_cast<BinaryOp*>(expr)) {
+        if (b->op != BinaryOpType::ADD && b->op != BinaryOpType::MUL) return false;
+        // both sides are scanned: the left one may answer "yes it is code" while
+        // the self call that makes the body illegal hides on the right
+        bool left = codeishCountingSelfCall(b->left.get(), codeNames, depth + 1, selfName, sawSelfCall);
+        bool right = codeishCountingSelfCall(b->right.get(), codeNames, depth + 1, selfName, sawSelfCall);
+        return left || right;
+    }
+    return false;
+}
+
+bool LLVMCodegen::isSelfRecursiveFactoryCandidate(Function* func) {
+    if (!func || !func->body) return false;
+    if (func->disposable || func->drift.enabled) return false;
+    if (isCodeFactoryFunction(func)) return false;  // it is a factory: fine
+    auto* block = dynamic_cast<BlockStatement*>(func->body.get());
+    if (!block || block->statements.empty()) return false;
+    std::string self = functionQualifiedName(func);
+    std::set<std::string> codeNames;
+    auto codeIt = codeParamIndices.find(self);
+    if (codeIt == codeParamIndices.end()) codeIt = codeParamIndices.find(func->name);
+    if (codeIt != codeParamIndices.end()) {
+        for (int idx : codeIt->second) {
+            if (idx >= 0 && idx < (int)func->params.size() && func->params[idx])
+                codeNames.insert(func->params[idx]->name);
+        }
+    }
+    for (size_t i = 0; i < block->statements.size(); i++) {
+        Statement* st = block->statements[i].get();
+        bool isLast = (i + 1 == block->statements.size());
+        if (auto* ret = dynamic_cast<ReturnStatement*>(st)) {
+            if (!isLast || !ret->value) return false;
+            bool sawSelfCall = false;
+            if (!codeishCountingSelfCall(ret->value.get(), codeNames, 1, self, &sawSelfCall)) {
+                return false;
+            }
+            return sawSelfCall;
+        }
+        auto* as = dynamic_cast<AssignmentStatement*>(st);
+        if (!as || !as->value) return false;
+        if (staticIsCodeValue(as->value.get(), codeNames, 1)) {
+            codeNames.insert(as->name);
+        } else if (!codeishCountingSelfCall(as->value.get(), codeNames, 1, self, nullptr)) {
+            return false;  // a runtime statement: not a factory at all
+        }
+    }
+    return false;
+}
+
+bool LLVMCodegen::isCodeFactoryFunction(Function* func) {
+    if (!func || !func->body) return false;
+    if (func->disposable || func->drift.enabled) return false;
+    // Whether a call is a factory call is decided by looking at that function's
+    // own body, so a factory that reaches itself would ask forever. The re-entrant
+    // answer is "not a factory": the recursion is then reported where it happens.
+    std::string self = functionQualifiedName(func);
+    if (!codeFactoryAnalysisInProgress.insert(self).second) {
+        return false;
+    }
+    auto* block = dynamic_cast<BlockStatement*>(func->body.get());
+    if (!block || block->statements.empty()) {
+        codeFactoryAnalysisInProgress.erase(self);
+        return false;
+    }
+    std::set<std::string> codeNames;
+    // A parameter that some call site fills with code is a code value here too, so
+    // a factory may hand such a parameter straight back.
+    auto codeIt = codeParamIndices.find(functionQualifiedName(func));
+    if (codeIt == codeParamIndices.end()) codeIt = codeParamIndices.find(func->name);
+    if (codeIt != codeParamIndices.end()) {
+        for (int idx : codeIt->second) {
+            if (idx >= 0 && idx < (int)func->params.size() && func->params[idx])
+                codeNames.insert(func->params[idx]->name);
+        }
+    }
+    for (size_t i = 0; i < block->statements.size(); i++) {
+        Statement* st = block->statements[i].get();
+        bool isLast = (i + 1 == block->statements.size());
+        if (auto* ret = dynamic_cast<ReturnStatement*>(st)) {
+            bool isCode = isLast && ret->value && staticIsCodeValue(ret->value.get(), codeNames, 1);
+            codeFactoryAnalysisInProgress.erase(self);
+            return isCode;
+        }
+        auto* as = dynamic_cast<AssignmentStatement*>(st);
+        // a factory may only build code values; any runtime statement would have
+        // to run at a moment where the code does not exist yet
+        if (!as || !as->value || !staticIsCodeValue(as->value.get(), codeNames, 1)) {
+            codeFactoryAnalysisInProgress.erase(self);
+            return false;
+        }
+        codeNames.insert(as->name);
+    }
+    codeFactoryAnalysisInProgress.erase(self);
+    return false;
+}
+
+// A captured function body is `{ stmt; ... }`; a statement list has no braces.
+static std::vector<Token> stripOuterBraces(const std::vector<Token>& body) {
+    if (body.size() >= 2 && body.front().is(TokenType::PUNCTUATOR_LBRACE) &&
+        body.back().is(TokenType::PUNCTUATOR_RBRACE)) {
+        return std::vector<Token>(body.begin() + 1, body.end() - 1);
+    }
+    return body;
+}
+
+// Does the function body mention this parameter by name (not as `obj.p`)?
+static bool bodyMentionsParam(const Function* func, const std::string& name) {
+    if (!func) return false;
+    for (size_t i = 0; i < func->bodyTokens.size(); i++) {
+        const Token& t = func->bodyTokens[i];
+        if (!t.is(TokenType::IDENTIFIER) || t.text != name) continue;
+        if (i > 0 && func->bodyTokens[i - 1].is(TokenType::PUNCTUATOR_DOT)) continue;
+        return true;
+    }
+    return false;
+}
+
+// Does the function own a variable of this name (a parameter, an assignment, a
+// loop variable, or a declaration of an EXP state)? Code passed in works on the
+// variables of the use point, so such a name would be ambiguous inside the copy.
+static bool functionOwnsName(const Function* func, const std::string& name) {
+    if (!func) return false;
+    for (const auto& p : func->params) {
+        if (p && p->name == name) return true;
+    }
+    const std::vector<Token>& body = func->bodyTokens;
+    for (size_t i = 0; i < body.size(); i++) {
+        const Token& t = body[i];
+        if (!t.is(TokenType::IDENTIFIER) || t.text != name) continue;
+        if (i > 0 && body[i - 1].is(TokenType::PUNCTUATOR_DOT)) continue;
+        if (i + 1 < body.size()) {
+            const Token& next = body[i + 1];
+            if (next.is(TokenType::PUNCTUATOR_EQUAL)) return true;  // name = ...
+            if (next.is(TokenType::PUNCTUATOR_COLON)) return true;  // name: int = ...
+            if (next.text == "in") return true;                    // for name in ...
+        }
+    }
+    return false;
+}
+
+bool LLVMCodegen::substituteCodeParams(Function* func, const std::vector<int>& codeArgFragments,
+                                       std::vector<Token>& outTokens, bool& ok) {
+    ok = true;
+    outTokens.clear();
+    if (!func || func->bodyTokens.empty()) {
+        addError("valuable: 函数 '" + (func ? func->name : std::string("?")) +
+                 "' 没有可复制的函数体，无法传入代码值");
+        ok = false;
+        return false;
+    }
+    std::vector<std::string> names;
+    std::vector<int> frags;
+    for (size_t i = 0; i < func->params.size() && i < codeArgFragments.size(); i++) {
+        if (codeArgFragments[i] < 0) continue;
+        names.push_back(func->params[i]->name);
+        frags.push_back(codeArgFragments[i]);
+    }
+    SourceLocation loc = func->location;
+    const std::vector<Token>& body = func->bodyTokens;
+    for (size_t i = 0; i < body.size(); i++) {
+        const Token& t = body[i];
+        bool substituted = false;
+        if (t.is(TokenType::IDENTIFIER)) {
+            for (size_t k = 0; k < names.size(); k++) {
+                if (t.text != names[k]) continue;
+                if (i > 0 && body[i - 1].is(TokenType::PUNCTUATOR_DOT)) break; // obj.A
+                if (i + 1 < body.size() && body[i + 1].is(TokenType::PUNCTUATOR_EQUAL)) {
+                    // `A = ...` would store a value into a code value, and a code
+                    // value has no storage to store into.
+                    addError("valuable: 代码值参数 '" + names[k] +
+                             "' 不能被赋值（代码值没有运行期存储）");
+                    ok = false;
+                    return false;
+                }
+                // The code is spliced back as a `valuable { ... }` value, which
+                // is what works in every position a code value may appear: as a
+                // statement (it runs), as an operand of `+` / `*`, as the base of
+                // `call valuable ... for x` or of an `inject`.
+                outTokens.push_back(Token(TokenType::KEYWORD_VALUABLE, "valuable", t.location));
+                outTokens.push_back(Token(TokenType::PUNCTUATOR_LBRACE, "{", t.location));
+                const std::vector<Token>& frag = fragmentStore[frags[k]];
+                outTokens.insert(outTokens.end(), frag.begin(), frag.end());
+                outTokens.push_back(Token(TokenType::PUNCTUATOR_RBRACE, "}", t.location));
+                substituted = true;
+                break;
+            }
+        }
+        if (!substituted) outTokens.push_back(t);
+    }
+    (void)loc;
+    return true;
+}
+
+// Compile `fn <mangled>(<params>, <use-point copies>) <substituted body>` and
+// return its symbol.
+llvm::Function* LLVMCodegen::specializeCodeFunction(Function* func,
+                                                    const std::vector<int>& codeArgFragments,
+                                                    const std::vector<CodeBinding>& bindings,
+                                                    bool& ok) {
+    ok = true;
+    std::string base = functionQualifiedName(func);
+    std::string key = base + "$code";
+    for (int fid : codeArgFragments) {
+        key += "$";
+        key += (fid < 0 ? std::string("v") : std::to_string(fid));
+    }
+    // The copies the code works on belong to the use point, so two call sites
+    // that pass the same code over different variables are different functions.
+    for (const CodeBinding& b : bindings) {
+        key += "$" + b.name + "$" + std::to_string((int)b.type) + "$" + std::to_string(b.arrayLen);
+    }
+    if (codeSpecializationsInProgress.count(key)) {
+        addError("valuable: 函数 '" + func->name + "' 的代码值参数特化出现递归"
+                 "（不能把代码值原样传回它自己）");
+        ok = false;
+        return nullptr;
+    }
+    if (llvm::Function* existing = module->getFunction(key)) return existing;
+
+    std::vector<Token> bodyToks;
+    if (!substituteCodeParams(func, codeArgFragments, bodyToks, ok)) return nullptr;
+
+    SourceLocation loc = func->location;
+    std::vector<Token> prog;
+    prog.push_back(Token(TokenType::KEYWORD_FN, "fn", loc));
+    prog.push_back(Token(TokenType::IDENTIFIER, key, loc));
+    prog.push_back(Token(TokenType::PUNCTUATOR_LPAREN, "(", loc));
+    for (size_t i = 0; i < func->params.size(); i++) {
+        if (i > 0) prog.push_back(Token(TokenType::PUNCTUATOR_COMMA, ",", loc));
+        prog.push_back(Token(TokenType::IDENTIFIER, func->params[i]->name, loc));
+    }
+    // A variable of the use point reaches the copy as an address. Parameters carry
+    // no type annotation; `callArgTypes` below records these as pointers, and the
+    // real type is restored from the binding table when the copy is generated.
+    for (size_t i = 0; i < bindings.size(); i++) {
+        prog.push_back(Token(TokenType::PUNCTUATOR_COMMA, ",", loc));
+        prog.push_back(Token(TokenType::IDENTIFIER, "__vf" + std::to_string(i), loc));
+    }
+    prog.push_back(Token(TokenType::PUNCTUATOR_RPAREN, ")", loc));
+    prog.insert(prog.end(), bodyToks.begin(), bodyToks.end());
+    prog.push_back(Token(TokenType::END_OF_FILE, "", SourceLocation()));
+
+    Parser sub(prog);
+    auto stmts = sub.parseFragmentStatements();
+    if (sub.hasErrors()) {
+        const auto& errs = sub.getErrors();
+        addError("valuable: 代码值参数代入后函数 '" + func->name + "' 无法解析（" +
+                 (errs.empty() ? std::string("未知错误") : errs.front()) + "）");
+        ok = false;
+        return nullptr;
+    }
+    std::unique_ptr<Function> specialized;
+    for (auto& s : stmts) {
+        if (auto* decl = dynamic_cast<FunctionDeclarationStatement*>(s.get())) {
+            if (decl->func) specialized = std::move(decl->func);
+        }
+    }
+    if (!specialized) {
+        addError("valuable: 无法为函数 '" + func->name + "' 生成代码值特化版本");
+        ok = false;
+        return nullptr;
+    }
+    // The copy keeps the signature of the original: a code argument is passed as a
+    // plain 0 because the body no longer mentions that parameter, and the extra
+    // parameters carry the use-point copies.
+    codeArgBindings[key] = bindings;
+    auto srcArgTypes = callArgTypes.find(base);
+    if (srcArgTypes == callArgTypes.end()) {
+        auto bare = callArgTypes.find(func->name);
+        if (bare != callArgTypes.end()) srcArgTypes = bare;
+    }
+    if (srcArgTypes != callArgTypes.end()) {
+        std::vector<VarType> argKinds = srcArgTypes->second;
+        for (const CodeBinding& b : bindings) argKinds.push_back(VarType::STRING);
+        callArgTypes[key] = argKinds;
+    }
+    auto srcRet = funcReturnTypes.find(base);
+    if (srcRet == funcReturnTypes.end()) srcRet = funcReturnTypes.find(func->name);
+    if (srcRet != funcReturnTypes.end()) funcReturnTypes[key] = srcRet->second;
+
+    codeSpecializationsInProgress.insert(key);
+    codegen(specialized.get());
+    codeSpecializationsInProgress.erase(key);
+
+    llvm::Function* built = module->getFunction(key);
+    if (!built) {
+        addError("valuable: 函数 '" + func->name + "' 的代码值特化版本生成失败");
+        ok = false;
+        return nullptr;
+    }
+    return built;
+}
+
+llvm::Value* LLVMCodegen::finishCallResult(llvm::CallInst* callInst, const std::string& typeKey) {
+    auto retTypeIt = funcReturnTypes.find(typeKey);
+    if (retTypeIt != funcReturnTypes.end()) {
+        if (retTypeIt->second == VarType::FLOAT) {
+            llvm::Value* bits = callInst;
+            bits = builder.CreateBitCast(bits, builder.getDoubleTy(), "float.ret.bits");
+            return builder.CreateFPTrunc(bits, builder.getFloatTy(), "float.ret");
+        } else if (retTypeIt->second == VarType::BOOL) {
+            return builder.CreateTrunc(callInst, builder.getInt1Ty(), "bool.ret");
+        } else if (retTypeIt->second == VarType::STRING) {
+            return builder.CreateIntToPtr(callInst, builder.getPtrTy(), "string.ret.ptr");
+        } else if (retTypeIt->second == VarType::INT) {
+            return builder.CreateTrunc(callInst, builder.getInt32Ty(), "int.ret");
+        }
+    }
+    return callInst;
+}
+
+llvm::Value* LLVMCodegen::codegenCodeArgumentCall(CallExpression* expr, llvm::Function* callee,
+                                                 const std::string& funcName,
+                                                 const std::vector<bool>& argIsCode) {
+    Function* fnAst = lookupFunctionAst(funcAsts, expr->ns, expr->name);
+    if (!fnAst) {
+        addError("valuable: 找不到函数 '" + funcName +
+                 "' 的源码，无法把代码值作为参数传入（内置函数只能接收普通值）");
+        return nullptr;
+    }
+    if (isCodeFactoryFunction(fnAst)) {
+        addError("valuable: '" + fnAst->name +
+                 "' 是代码工厂，它的返回值就是代码；请在代码位置调用它"
+                 "（例如 `A = " + fnAst->name + "(...)`）");
+        return nullptr;
+    }
+    if (fnAst->disposable) {
+        addError("valuable: disposable 函数 '" + fnAst->name + "' 暂不支持代码值参数");
+        return nullptr;
+    }
+    if (fnAst->drift.enabled) {
+        addError("valuable: drift 函数 '" + fnAst->name + "' 暂不支持代码值参数");
+        return nullptr;
+    }
+    if (expr->args.size() != fnAst->params.size()) {
+        addError("函数 '" + fnAst->name + "' 需要 " + std::to_string(fnAst->params.size()) +
+                 " 个参数，调用处给了 " + std::to_string(expr->args.size()) + " 个");
+        return nullptr;
+    }
+
+    std::vector<int> codeArgFragments(fnAst->params.size(), -1);
+    for (size_t i = 0; i < expr->args.size(); i++) {
+        if (argIsCode[i]) {
+            bool ok = true;
+            codeArgFragments[i] = resolveCodeFragment(expr->args[i].get(), ok);
+            if (!ok) return nullptr;
+            continue;
+        }
+        // A parameter that some call site fills with code is a code parameter for
+        // the whole function: it has no ordinary form to call.
+        auto codeIt = codeParamIndices.find(functionQualifiedName(fnAst));
+        if (codeIt == codeParamIndices.end()) codeIt = codeParamIndices.find(fnAst->name);
+        if (codeIt != codeParamIndices.end() && codeIt->second.count((int)i) &&
+            functionTakesCode(fnAst)) {
+            addError("valuable: 函数 '" + fnAst->name + "' 的参数 '" + fnAst->params[i]->name +
+                     "' 是代码值参数，所有调用都必须传入代码值");
+            return nullptr;
+        }
+    }
+
+    // The code that is passed in runs inside the copy, so a variable it mentions
+    // has to travel with the call: the use point hands over a copy of it, and
+    // stores the copy back when the call returns.
+    std::vector<CodeBinding> bindings;
+    std::vector<std::string> boundNames;
+    for (int fid : codeArgFragments) {
+        if (fid < 0) continue;
+        std::vector<Token> toks = expandCodeRefs(fragmentStore[fid], 0);
+        for (const auto& ref : collectFragmentRefs(toks)) {
+            const std::string& name = ref.first;
+            if (name.empty()) continue;
+            if (std::find(boundNames.begin(), boundNames.end(), name) != boundNames.end()) continue;
+            auto lit = locals.find(name);
+            if (lit != locals.end()) {
+                if (functionOwnsName(fnAst, name)) {
+                    addError("valuable: 传入的代码使用变量 '" + name +
+                             "'，但函数 '" + fnAst->name + "' 内部也有这个名字，"
+                             "无法确定指的是哪一个（请改掉其中一个名字）");
+                    return nullptr;
+                }
+                CodeBinding b;
+                b.name = name;
+                b.type = localTypes.count(name) ? localTypes[name] : VarType::UNKNOWN;
+                if (b.type == VarType::UNKNOWN) b.type = varTypeOfStorage(lit->second->getAllocatedType());
+                auto lenIt = arrayLengths.find(name);
+                b.arrayLen = lenIt == arrayLengths.end() ? 0 : lenIt->second;
+                bindings.push_back(b);
+                boundNames.push_back(name);
+                continue;
+            }
+            if (ref.second) continue; // the code declares it itself
+            if (windowInputGlobals.count(name) || funcReturnTypes.count(name)) continue;
+            bool shadowed = false;
+            for (auto& p : fnAst->params) {
+                if (p && p->name == name) { shadowed = true; break; }
+            }
+            if (shadowed) {
+                addError("valuable: 传入的代码引用了 '" + name +
+                         "'，它既是函数 '" + fnAst->name + "' 的参数又是使用点的局部变量，"
+                         "无法确定指的是哪一个");
+                return nullptr;
+            }
+            addError("valuable: 传入的代码读取的自由变量 '" + name +
+                     "' 在使用点不存在（代码不捕获创建处的变量）");
+            return nullptr;
+        }
+    }
+
+    bool ok = true;
+    llvm::Function* spec = specializeCodeFunction(fnAst, codeArgFragments, bindings, ok);
+    if (!ok || !spec) return nullptr;
+
+    std::string specName = spec->getName().str();
+    std::vector<llvm::Value*> args;
+    for (size_t i = 0; i < expr->args.size(); i++) {
+        llvm::Type* expected = spec->getFunctionType()->getParamType(i);
+        if (argIsCode[i]) {
+            // The body no longer mentions this parameter; keep the arity, pass 0.
+            if (!expected->isIntegerTy()) {
+                addError("valuable: 代码值参数 '" + fnAst->params[i]->name +
+                         "' 的特化签名不是整型，无法保持调用约定");
+                return nullptr;
+            }
+            args.push_back(createConstInt(context, llvm::cast<llvm::IntegerType>(expected), 0));
+            continue;
+        }
+        llvm::Value* argVal = codegen(expr->args[i].get());
+        if (!argVal) return nullptr;
+        if (expected->isIntegerTy(64)) {
+            if (argVal->getType()->isIntegerTy(1)) {
+                argVal = builder.CreateZExt(argVal, expected, "argbool");
+            } else if (argVal->getType()->isIntegerTy(32)) {
+                argVal = builder.CreateSExt(argVal, expected, "argext");
+            } else if (argVal->getType()->isPointerTy()) {
+                argVal = builder.CreatePtrToInt(argVal, expected, "argptr2int");
+            }
+        } else if (expected->isIntegerTy(32)) {
+            if (argVal->getType()->isIntegerTy(1)) {
+                argVal = builder.CreateZExt(argVal, expected, "argbool");
+            } else if (argVal->getType()->isIntegerTy(64)) {
+                argVal = builder.CreateTrunc(argVal, expected, "argtrunc");
+            } else if (argVal->getType()->isPointerTy()) {
+                argVal = builder.CreatePtrToInt(argVal, llvm::Type::getInt64Ty(context), "argptr2int");
+                argVal = builder.CreateTrunc(argVal, expected, "argtrunc");
+            }
+        } else if (expected->isPointerTy()) {
+            if (argVal->getType()->isIntegerTy(1)) {
+                argVal = builder.CreateZExt(argVal, expected, "argbool");
+                argVal = builder.CreateIntToPtr(argVal, expected, "argboolptr");
+            } else if (argVal->getType()->isIntegerTy(32)) {
+                argVal = builder.CreateSExt(argVal, expected, "argext");
+                argVal = builder.CreateIntToPtr(argVal, expected, "argextptr");
+            } else if (argVal->getType()->isIntegerTy(64)) {
+                argVal = builder.CreateIntToPtr(argVal, expected, "argptr");
+            }
+        }
+        args.push_back(argVal);
+    }
+
+    // Hand over a copy of every variable the code works on, and keep the slots so
+    // the values can be written back after the call.
+    std::vector<llvm::AllocaInst*> copies;
+    for (const CodeBinding& b : bindings) {
+        llvm::AllocaInst* src = locals[b.name];
+        llvm::Type* ty = src->getAllocatedType();
+        llvm::AllocaInst* slot = createAllocaInEntry(ty, ("code.copy." + b.name).c_str());
+        builder.CreateStore(builder.CreateLoad(ty, src, "code.copy.in"), slot);
+        copies.push_back(slot);
+        args.push_back(slot);
+    }
+
+    llvm::CallInst* callInst = builder.CreateCall(spec->getFunctionType(), spec, args);
+    for (size_t i = 0; i < bindings.size(); i++) {
+        llvm::AllocaInst* dst = locals[bindings[i].name];
+        builder.CreateStore(builder.CreateLoad(copies[i]->getAllocatedType(), copies[i],
+                                               "code.copy.out"),
+                            dst);
+    }
+    return finishCallResult(callInst, specName);
+}
+
+// `fn make() { return valuable { ... } }` called in a code position: the body
+// tokens are copied, the code arguments are spliced in, and the returned code
+// is interned as a code value of the CALLER (so its free variables resolve here).
+int LLVMCodegen::resolveFactoryCall(CallExpression* expr, bool& ok) {
+    ok = true;
+    Function* fnAst = lookupFunctionAst(funcAsts, expr->ns, expr->name);
+    if (!fnAst || !isCodeFactoryFunction(fnAst)) {
+        addError("valuable: '" + expr->name +
+                 "' 不是代码工厂（代码工厂的函数体只能是代码值的赋值加一句 return）");
+        ok = false;
+        return -1;
+    }
+    if (expr->args.size() != fnAst->params.size()) {
+        addError("代码工厂 '" + fnAst->name + "' 需要 " + std::to_string(fnAst->params.size()) +
+                 " 个参数，调用处给了 " + std::to_string(expr->args.size()) + " 个");
+        ok = false;
+        return -1;
+    }
+    for (size_t i = 0; i < expr->args.size(); i++) {
+        if (isCodeExpr(expr->args[i].get())) continue;
+        // A runtime value cannot be seen by code that is compiled at the use
+        // point, so an ordinary argument is only allowed for a parameter the
+        // returned code never mentions.
+        if (bodyMentionsParam(fnAst, fnAst->params[i]->name)) {
+            addError("代码工厂 '" + fnAst->name + "' 的参数 '" + fnAst->params[i]->name +
+                     "' 是运行期值，代码在使用点无法引用它"
+                     "（把它作为代码值传入，或让返回的代码不提它）");
+            ok = false;
+            return -1;
+        }
+    }
+
+    std::string guard = functionQualifiedName(fnAst);
+    if (std::find(codeFactoriesInProgress.begin(), codeFactoriesInProgress.end(), guard) !=
+        codeFactoriesInProgress.end()) {
+        addError("valuable: 代码工厂 '" + fnAst->name + "' 递归调用自己，无法静态展开");
+        ok = false;
+        return -1;
+    }
+
+    std::vector<int> codeArgFragments(fnAst->params.size(), -1);
+    for (size_t i = 0; i < expr->args.size(); i++) {
+        if (!isCodeExpr(expr->args[i].get())) continue;
+        bool argOk = true;
+        codeArgFragments[i] = resolveCodeFragment(expr->args[i].get(), argOk);
+        if (!argOk) { ok = false; return -1; }
+    }
+    std::vector<Token> bodyToks;
+    if (!substituteCodeParams(fnAst, codeArgFragments, bodyToks, ok)) return -1;
+
+    codeFactoriesInProgress.push_back(guard);
+    int result = -1;
+    // A factory body is a statement list, so the captured `{ ... }` of the
+    // function has to come off before the statements are parsed.
+    std::vector<Token> all = stripOuterBraces(bodyToks);
+    all.push_back(Token(TokenType::END_OF_FILE, "", SourceLocation()));
+    Parser sub(all);
+    auto stmts = sub.parseFragmentStatements();
+    if (sub.hasErrors()) {
+        const auto& errs = sub.getErrors();
+        addError("valuable: 代码工厂 '" + fnAst->name + "' 的函数体无法解析（" +
+                 (errs.empty() ? std::string("未知错误") : errs.front()) + "）");
+        codeFactoriesInProgress.pop_back();
+        ok = false;
+        return -1;
+    }
+    // Running a factory body means interning its code values, nothing else: the
+    // body may only build code. `codeVarFragments` is filled in, then handed back.
+    auto savedCodeVars = codeVarFragments;
+    codeVarFragments.clear();
+    ReturnStatement* ret = nullptr;
+    for (auto& s : stmts) {
+        if (auto* as = dynamic_cast<AssignmentStatement*>(s.get())) {
+            if (!staticIsCodeValue(as->value.get(), {}, 1)) {
+                addError("代码工厂 '" + fnAst->name + "' 的函数体只能构造代码值");
+                codeVarFragments = savedCodeVars;
+                codeFactoriesInProgress.pop_back();
+                ok = false;
+                return -1;
+            }
+            codeVarFragments[as->name] = resolveCodeFragment(as->value.get(), ok);
+            if (!ok) {
+                codeVarFragments = savedCodeVars;
+                codeFactoriesInProgress.pop_back();
+                return -1;
+            }
+            continue;
+        }
+        if (auto* r = dynamic_cast<ReturnStatement*>(s.get())) ret = r;
+    }
+    if (!ret || !ret->value) {
+        addError("代码工厂 '" + fnAst->name + "' 必须以 `return <代码值>` 结束");
+        codeVarFragments = savedCodeVars;
+        codeFactoriesInProgress.pop_back();
+        ok = false;
+        return -1;
+    }
+    result = resolveCodeFragment(ret->value.get(), ok);
+    codeVarFragments = savedCodeVars;
+    codeFactoriesInProgress.pop_back();
+    if (!ok) return -1;
+    return result;
+}
+
 llvm::Value* LLVMCodegen::codegen(UnaryOp* expr) {
+    // EXP `zombie`: unary minus on a plague variable yields the plague value;
+    // the sign is simply not applied.
+    if (expr->op == UnaryOpType::NEGATE) {
+        if (auto* v = dynamic_cast<VariableExpression*>(expr->expr.get())) {
+            if (zombieVars.count(v->name) && localTypes.count(v->name) &&
+                zombieNumericOk(localTypes[v->name]) && !arrayLengths.count(v->name)) {
+                return codegen(v);
+            }
+        }
+    }
     llvm::Value* operandVal = codegen(expr->expr.get());
     if (!operandVal) return nullptr;
     
@@ -775,6 +2316,37 @@ llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
         return codegenFuK(expr);
     }
 
+    // EXP `zombie`: an arithmetic step that touches a plague collapses to the
+    // plague value; the variables taking part only catch, their own values stay.
+    {
+        std::string source = zombieSourceName(expr);
+        if (!source.empty()) {
+            auto* bin = static_cast<BinaryOp*>(expr);
+            Expression* sourceSide = nullptr;
+            if (auto* lv = dynamic_cast<VariableExpression*>(bin->left.get())) {
+                if (lv->name == source) sourceSide = bin->left.get();
+            }
+            if (!sourceSide) {
+                if (auto* rv = dynamic_cast<VariableExpression*>(bin->right.get())) {
+                    if (rv->name == source) sourceSide = bin->right.get();
+                }
+            }
+            llvm::Value* plague = sourceSide ? codegen(sourceSide) : nullptr;
+            if (!plague) return nullptr;
+            auto infect = [&](Expression* side) {
+                auto* v = dynamic_cast<VariableExpression*>(side);
+                if (!v || v->name == source) return;
+                auto tIt = localTypes.find(v->name);
+                if (tIt != localTypes.end() && !zombieNumericOk(tIt->second)) return;
+                if (arrayLengths.count(v->name)) return;
+                if (locals.count(v->name)) zombieVars.insert(v->name);
+            };
+            infect(bin->left.get());
+            infect(bin->right.get());
+            return plague;
+        }
+    }
+
     // EXP `believe`: if both operands are constant ints, check the belief table.
     if (auto* l = dynamic_cast<NumberLiteral*>(expr->left.get())) {
         if (auto* r = dynamic_cast<NumberLiteral*>(expr->right.get())) {
@@ -786,6 +2358,33 @@ llvm::Value* LLVMCodegen::codegen(BinaryOp* expr) {
                     return createConstInt(context, llvm::Type::getInt64Ty(context), it->second);
                 }
             }
+        }
+    }
+
+    // EXP `deny x = v`: the value stays exactly as it is, but from here on the
+    // program does not acknowledge the fact. `x == v` reads false and `x != v`
+    // reads true, while `print(x)` still prints v.
+    if (expr->op == BinaryOpType::EQUAL || expr->op == BinaryOpType::NOT_EQUAL) {
+        std::string* deniedName = nullptr;
+        int64_t deniedValue = 0;
+        if (auto* lv = dynamic_cast<VariableExpression*>(expr->left.get())) {
+            if (auto* rv = dynamic_cast<NumberLiteral*>(expr->right.get())) {
+                deniedName = &lv->name;
+                deniedValue = rv->value;
+            }
+        }
+        if (!deniedName) {
+            if (auto* rv = dynamic_cast<VariableExpression*>(expr->right.get())) {
+                if (auto* lv = dynamic_cast<NumberLiteral*>(expr->left.get())) {
+                    deniedName = &rv->name;
+                    deniedValue = lv->value;
+                }
+            }
+        }
+        if (deniedName && denyFactMatches(*deniedName, deniedValue)) {
+            bool acknowledged = (expr->op == BinaryOpType::NOT_EQUAL);
+            return createConstInt(context, llvm::Type::getInt64Ty(context),
+                                  acknowledged ? 1 : 0);
         }
     }
 
@@ -1562,6 +3161,31 @@ llvm::Value* LLVMCodegen::codegen(CallExpression* expr) {
         return nullptr;
     }
 
+    // EXP `valuable`: a code value cannot be passed as a plain value, so the
+    // call is redirected to a copy of the callee that has the code compiled in.
+    {
+        Function* target = lookupFunctionAst(funcAsts, expr->ns, expr->name);
+        std::vector<bool> argIsCode;
+        bool anyCode = false;
+        for (auto& arg : expr->args) {
+            bool isCode = isCodeExpr(arg.get());
+            argIsCode.push_back(isCode);
+            anyCode = anyCode || isCode;
+        }
+        // A factory has no runtime form at all, so reaching this point means the
+        // call sits where a value is expected. A function with code parameters
+        // reaches it when a call site forgot the code value.
+        if (target && isCodeFactoryFunction(target)) {
+            addError("valuable: '" + target->name +
+                     "' 是代码工厂，它的返回值就是代码；请在代码位置调用它"
+                     "（例如 `A = " + target->name + "(...)`）");
+            return nullptr;
+        }
+        if (anyCode || (target && functionTakesCode(target))) {
+            return codegenCodeArgumentCall(expr, callee, funcName, argIsCode);
+        }
+    }
+
     // EXP `drift`: a self call inside a drift-enabled function replaces the
     // written argument values with runtime random values and enforces the
     // depth cap.  Compare the bare name after the last ':' to the call-site
@@ -1653,24 +3277,7 @@ llvm::Value* LLVMCodegen::codegen(CallExpression* expr) {
     callArgTypes[funcName] = argTypes;
     
     llvm::CallInst* callInst = builder.CreateCall(callee->getFunctionType(), callee, args);
-    
-    auto retTypeIt = funcReturnTypes.find(funcName);
-    if (retTypeIt != funcReturnTypes.end()) {
-        if (retTypeIt->second == VarType::FLOAT) {
-            llvm::Value* bits = callInst;
-            bits = builder.CreateBitCast(bits, builder.getDoubleTy(), "float.ret.bits");
-            return builder.CreateFPTrunc(bits, builder.getFloatTy(), "float.ret");
-        } else if (retTypeIt->second == VarType::BOOL) {
-            return builder.CreateTrunc(callInst, builder.getInt1Ty(), "bool.ret");
-        } else if (retTypeIt->second == VarType::STRING) {
-            // Convert int64 back to pointer for string return
-            return builder.CreateIntToPtr(callInst, builder.getPtrTy(), "string.ret.ptr");
-        } else if (retTypeIt->second == VarType::INT) {
-            return builder.CreateTrunc(callInst, builder.getInt32Ty(), "int.ret");
-        }
-    }
-    
-    return callInst;
+    return finishCallResult(callInst, funcName);
 }
 
 llvm::Value* LLVMCodegen::codegen(ArrayRangeExpression* expr) {
@@ -1782,6 +3389,17 @@ llvm::Value* LLVMCodegen::codegen(ArrayRangeExpression* expr) {
 }
 
 llvm::Value* LLVMCodegen::codegen(ArrayLiteral* expr) {
+    // EXP `zombie`: the plague has no hiding place in a list, so a plague value
+    // may not become an element.
+    for (const auto& el : expr->elements) {
+        if (auto* v = dynamic_cast<VariableExpression*>(el.get())) {
+            if (zombieVars.count(v->name)) {
+                addError("[zombie] 变量 '" + v->name +
+                         "' 已感染，瘟疫无法藏进列表");
+                return nullptr;
+            }
+        }
+    }
     if (expr->isRange) {
         llvm::Value* startVal = codegen(expr->rangeStart.get());
         if (!startVal) return nullptr;
@@ -1952,10 +3570,30 @@ llvm::Value* LLVMCodegen::codegen(ArrayIndexExpression* expr) {
 }
 
 llvm::Value* LLVMCodegen::codegen(ExpressionStatement* stmt) {
+    // EXP `valuable`: a code value in statement position runs here, once.
+    if (looksLikeCodeExpr(stmt->expr.get())) {
+        bool ok = true;
+        int fid = resolveCodeFragment(stmt->expr.get(), ok);
+        if (!ok) return nullptr;
+        return emitValuableRun(fid, "", false);
+    }
     return codegen(stmt->expr.get());
 }
 
 llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
+    // EXP `valuable`: `A = valuable { ... }`, `A = B`, `A = B + C`,
+    // `A = B * 3`, `A = inject n valuable B for x` all store CODE, not a value.
+    if (looksLikeCodeExpr(stmt->value.get())) {
+        bool ok = true;
+        int fid = resolveCodeFragment(stmt->value.get(), ok);
+        if (!ok) return nullptr;
+        codeVarFragments[stmt->name] = fid;
+        return createConstInt(context, builder.getInt32Ty(), 0);
+    }
+    if (codeVarFragments.count(stmt->name)) {
+        addError("valuable: '" + stmt->name + "' 已经是一个代码值，不能被赋成普通值");
+        return nullptr;
+    }
     int64_t arrayLen = 0;
     VarType fuKTargetKind = VarType::UNKNOWN;
     if (auto* arrLit = dynamic_cast<ArrayLiteral*>(stmt->value.get())) {
@@ -2226,6 +3864,50 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
     }
     if (!value) return nullptr;
     
+    // EXP structs / env implicit this: a bare field name inside a function that
+    // carries a struct (血量 for 发出者.血量) is a member write when no local
+    // variable conflicts ("变量名不冲突，即可省略，类似可以省略this"). The
+    // parser cannot know the fields, so the resolution happens here.
+    // An explicitly typed declaration (`int hp = 1`) always wins: the programmer
+    // said "this is a variable", so it must not be hijacked by a same-named
+    // field of a carried struct.
+    if (!stmt->hasExplicitType && locals.find(stmt->name) == locals.end() && !currentEnvCarried.empty()) {
+        const std::pair<std::string, std::string>* hit = nullptr;
+        int matches = 0;
+        for (const auto& c : currentEnvCarried) {
+            auto fit = structFields.find(c.second);
+            if (fit == structFields.end()) continue;
+            for (const auto& f : fit->second) {
+                if (f.first == stmt->name) { hit = &c; matches++; break; }
+            }
+        }
+        if (matches > 1) {
+            addError("[env] 字段 '" + stmt->name + "' 在多个携带的类型里都存在，不能省略");
+            return nullptr;
+        }
+        if (matches == 1 && hit) {
+            auto ait = locals.find(hit->first);
+            if (ait != locals.end()) {
+                llvm::Value* basePtr = builder.CreateLoad(ait->second->getAllocatedType(),
+                                                          ait->second, hit->first.c_str());
+                llvm::Value* v = value;
+                llvm::Type* fieldTy = nullptr;
+                llvm::Value* fp = codegenFieldPtr(hit->second, basePtr, stmt->name, &fieldTy);
+                if (!fp) return nullptr;
+                v = wrongCastTo(builder, v, fieldTy, "env.cast");
+                if (stmt->op == AssignOp::EQ) {
+                    builder.CreateStore(v, fp);
+                    return v;
+                }
+                llvm::Value* cur = builder.CreateLoad(fieldTy, fp, "env.cur");
+                llvm::Value* res = applyAssignOp(cur, v, fieldTy, stmt->op);
+                if (!res) return nullptr;
+                builder.CreateStore(res, fp);
+                return res;
+            }
+        }
+    }
+    
     llvm::AllocaInst* alloca = nullptr;
     auto it = locals.find(stmt->name);
     
@@ -2354,6 +4036,15 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
         storeType = storeVal->getType();
     }
 
+    // EXP compound assignment: `x -= v` loads the current value, applies the
+    // operator and stores the result (numeric scalars only).
+    if (stmt->op != AssignOp::EQ) {
+        llvm::Value* cur = builder.CreateLoad(allocaType, alloca, "ca.cur");
+        llvm::Value* res = applyAssignOp(cur, storeVal, allocaType, stmt->op);
+        if (!res) return nullptr;
+        storeVal = res;
+    }
+
     builder.CreateStore(storeVal, alloca);
 
     // EXP `disposable`: a normal assignment clears every disposable layer of
@@ -2370,6 +4061,52 @@ llvm::Value* LLVMCodegen::codegen(AssignmentStatement* stmt) {
     if (fatedIt != fateSlots.end()) {
         emitFateRecovery(fatedIt->second, alloca);
     }
+
+    // EXP `zombie`: the plague is contagious by assignment and permanent, so the
+    // target of a plain `x = <plague variable>` is plague from here on.
+    if (auto* rhsVar = dynamic_cast<VariableExpression*>(stmt->value.get())) {
+        if (zombieVars.count(rhsVar->name)) zombieVars.insert(stmt->name);
+    }
+    // EXP `zombie`: the result of an annihilated arithmetic step is plague too.
+    if (zombieAnnihilates(stmt->value.get())) zombieVars.insert(stmt->name);
+
+    // EXP `wrong`: a forbidden result is persistent. Every later assignment to
+    // any variable a wrong watches re-checks its condition; if the fresh value
+    // makes it true, the guard evades it again.
+    auto watIt = wrongWatchedNames.find(stmt->name);
+    if (watIt != wrongWatchedNames.end()) {
+        llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+        for (int slotIdx : watIt->second) {
+            WrongGuardData& slot = wrongSlots[slotIdx];
+            if (!slot.guard || !slot.condExpr) continue;
+            llvm::BasicBlock* checkCallBB = llvm::BasicBlock::Create(context, "wrong.call", curFn);
+            llvm::BasicBlock* checkContBB = llvm::BasicBlock::Create(context, "wrong.cont", curFn);
+            llvm::Value* hotVal = codegen(slot.condExpr);
+            llvm::Value* hotBool = nullptr;
+            if (hotVal->getType()->isIntegerTy(1)) {
+                hotBool = hotVal;
+            } else if (hotVal->getType()->isIntegerTy(64)) {
+                hotBool = builder.CreateICmpNE(hotVal, createConstInt(context, builder.getInt64Ty(), 0), "wrong.hot");
+            } else if (hotVal->getType()->isFloatTy()) {
+                hotBool = builder.CreateFCmpONE(hotVal, llvm::ConstantFP::get(builder.getFloatTy(), 0.0), "wrong.hot");
+            } else {
+                hotBool = builder.CreateICmpNE(hotVal, createConstInt(context, builder.getInt32Ty(), 0), "wrong.hot");
+            }
+            builder.CreateCondBr(hotBool, checkCallBB, checkContBB);
+            builder.SetInsertPoint(checkCallBB);
+            std::vector<llvm::Value*> guardArgs;
+            for (const std::string& cn : slot.closure) {
+                auto lit2 = locals.find(cn);
+                if (lit2 == locals.end()) { guardArgs.clear(); break; }
+                guardArgs.push_back(lit2->second);
+            }
+            if (!guardArgs.empty()) {
+                builder.CreateCall(slot.guard->getFunctionType(), slot.guard, guardArgs);
+            }
+            builder.CreateBr(checkContBB);
+            builder.SetInsertPoint(checkContBB);
+        }
+    }
     
     return value;
 }
@@ -2385,6 +4122,15 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
         if (printfFunc) {
             llvm::Value* formatPtr = builder.CreateGlobalStringPtr("PARADOX\n", "paradox_fmt");
             builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {formatPtr}, "paradox_printf");
+        }
+        return nullptr;
+    }
+    // EXP `valuable`: printing a code value shows what it is, never its source.
+    if (isCodeExpr(stmt->expr.get())) {
+        llvm::Function* printfFunc = module->getFunction("printf");
+        if (printfFunc) {
+            llvm::Value* formatPtr = builder.CreateGlobalStringPtr("code\n", "code_fmt");
+            builder.CreateCall(printfFunc->getFunctionType(), printfFunc, {formatPtr}, "code_printf");
         }
         return nullptr;
     }
@@ -2699,7 +4445,37 @@ llvm::Value* LLVMCodegen::codegen(PrintStatement* stmt) {
     return arg;
 }
 
+// EXP `valuable`: hand the values a specialized copy worked on back to the use
+// point. Runs on every way out of the function, so the caller's variable ends up
+// with whatever the code left in it.
+void LLVMCodegen::emitCodeBindingWriteBack(const std::string& funcName) {
+    auto it = codeArgBindings.find(funcName);
+    if (it == codeArgBindings.end()) return;
+    llvm::Function* fn = module->getFunction(funcName);
+    if (!fn) return;
+    for (size_t i = 0; i < it->second.size(); i++) {
+        const CodeBinding& b = it->second[i];
+        auto lit = locals.find(b.name);
+        if (lit == locals.end()) continue;
+        llvm::Type* ty = getLLVMType(b.type);
+        // The copies are the trailing parameters of the specialized function.
+        llvm::Argument* out = fn->getArg(fn->arg_size() - it->second.size() + i);
+        builder.CreateStore(builder.CreateLoad(ty, lit->second, "code.back"), out);
+    }
+}
+
 llvm::Value* LLVMCodegen::codegen(ReturnStatement* stmt) {
+    // EXP `valuable`: a code value has no runtime form, so only a code factory can
+    // hand one back; an ordinary function returning code has nowhere to put it.
+    if (isCodeExpr(stmt->value.get())) {
+        Function* self = lookupFunctionAst(funcAsts, currentFuncName, currentFuncName);
+        std::string who = self ? self->name : currentFuncName;
+        if (!isCodeFactoryFunction(self)) {
+            addError("valuable: 函数 '" + who + "' 不是代码工厂，不能返回代码值"
+                     "（代码工厂的函数体只能构造代码值，并以 `return <代码值>` 结束）");
+            return nullptr;
+        }
+    }
     llvm::Value* value = codegen(stmt->value.get());
     if (!value) return nullptr;
     
@@ -2721,6 +4497,9 @@ llvm::Value* LLVMCodegen::codegen(ReturnStatement* stmt) {
         value = builder.CreatePtrToInt(value, retType, "ptr_to_int64");
     }
     
+    // EXP `valuable`: leaving a specialized copy hands the values of the variables
+    // the code worked on back to the use point.
+    emitCodeBindingWriteBack(currentFuncName);
     builder.CreateRet(value);
     return value;
 }
@@ -2823,6 +4602,367 @@ llvm::Value* LLVMCodegen::codegen(BelieveStatement* stmt) {
         addError("Invalid 'believe' proposition: \"" + stmt->raw + "\" (expected: int <op> int = int)");
     }
     return nullptr;
+}
+
+// ---- EXP `deny` / `regret` / `doubt` / `env` / `<->[K]` ---------------------
+
+// Shared by `deny "a op b = r"` and `regret "a op b = r"`: turn the proposition
+// text into the belief table's key, so a rule can be taken back by name.
+static bool propositionKey(const std::string& raw, std::string& key) {
+    std::istringstream iss(raw);
+    int64_t a = 0, b = 0, r = 0;
+    char op = 0, eq = 0;
+    if (!(iss >> a >> op >> b >> eq >> r) || eq != '=') return false;
+    char opCh = binaryOpChar(
+        op == '+' ? xfawa::BinaryOpType::ADD :
+        op == '-' ? xfawa::BinaryOpType::SUB :
+        op == '*' ? xfawa::BinaryOpType::MUL :
+        op == '/' ? xfawa::BinaryOpType::DIV : xfawa::BinaryOpType::NONE);
+    if (opCh == 0) return false;
+    key = std::to_string(a) + opCh + std::to_string(b);
+    return true;
+}
+
+bool LLVMCodegen::eraseBelief(const std::string& raw, const char* keyword) {
+    std::string key;
+    if (!propositionKey(raw, key)) {
+        addError(std::string("Invalid '") + keyword + "' proposition: \"" + raw +
+                 "\" (expected: int <op> int = int, e.g. \"2 + 2 = 5\")");
+        return false;
+    }
+    auto it = beliefMap.find(key);
+    if (it == beliefMap.end()) {
+        addError(std::string("No belief to ") + keyword + ": \"" + raw + "\"");
+        return false;
+    }
+    beliefMap.erase(it);
+    return true;
+}
+
+// EXP `deny "2 + 2 = 5"`: takes the belief back, so the arithmetic is 4 again.
+llvm::Value* LLVMCodegen::codegen(DenyStatement* stmt) {
+    if (!stmt->raw.empty()) {
+        eraseBelief(stmt->raw, "deny");
+        return nullptr;
+    }
+    // EXP `deny answer = 41`: the value stays, the acknowledgement does not.
+    denyFacts.insert(stmt->name + "=" + std::to_string(stmt->value));
+    return nullptr;
+}
+
+// EXP `regret "1 + 1 = 3"` / `regret all`.
+llvm::Value* LLVMCodegen::codegen(RegretStatement* stmt) {
+    if (stmt->all) {
+        beliefMap.clear();
+        return nullptr;
+    }
+    eraseBelief(stmt->raw, "regret");
+    return nullptr;
+}
+
+// EXP `doubt answer`: the lie pass already broke the lie; a doubt that reached
+// codegen unmarked had no lie to break.
+llvm::Value* LLVMCodegen::codegen(DoubtStatement* stmt) {
+    if (!stmt->broken) {
+        addError("[doubt] 没有正在生效的谎言可以怀疑: " + stmt->name +
+                 " (doubt 只能写在 lie 块里，且该变量正被谎言覆盖)");
+    }
+    return nullptr;
+}
+
+// EXP `env`: the pass has already added the parameter and the implicit
+// arguments, so the declaration itself generates nothing. A block the pass could
+// not carry out is an error here, where it can still stop the build.
+llvm::Value* LLVMCodegen::codegen(EnvBlockStatement* stmt) {
+    if (!stmt->error.empty()) {
+        addError(stmt->error);
+    }
+    return nullptr;
+}
+
+// EXP `env 发出者 = 承受者`: after the pass the carried value is an ordinary
+// first parameter, so re-pointing it is an ordinary assignment.
+llvm::Value* LLVMCodegen::codegen(EnvAssignStatement* stmt) {
+    bool carried = false;
+    for (const auto& c : currentEnvCarried) {
+        if (c.first == stmt->name) { carried = true; break; }
+    }
+    if (!carried) {
+        addError("[env] 只能给当前函数携带的值重新指向: " + stmt->name +
+                 (currentEnvCarried.empty()
+                      ? " (当前函数不属于任何 env 集合)"
+                      : " (当前函数携带的是 " + currentEnvCarried[0].first + ")"));
+        return nullptr;
+    }
+    auto as = std::make_unique<AssignmentStatement>(stmt->name, std::move(stmt->value),
+                                                    stmt->location);
+    return codegen(as.get());
+}
+
+// ============================================================================
+// EXP structs + member access + compound assignment
+// ============================================================================
+
+// Apply a compound-assignment operator to two values of the same LLVM type.
+llvm::Value* LLVMCodegen::applyAssignOp(llvm::Value* cur, llvm::Value* v, llvm::Type* ty,
+                                        AssignOp op) {
+    if (ty->isFloatTy()) {
+        switch (op) {
+            case AssignOp::PLUS_EQ: return builder.CreateFAdd(cur, v, "ca.fadd");
+            case AssignOp::MINUS_EQ: return builder.CreateFSub(cur, v, "ca.fsub");
+            case AssignOp::STAR_EQ: return builder.CreateFMul(cur, v, "ca.fmul");
+            case AssignOp::SLASH_EQ: return builder.CreateFDiv(cur, v, "ca.fdiv");
+            default:
+                addError("[env] 浮点不支持该复合赋值");
+                return nullptr;
+        }
+    }
+    if (ty->isIntegerTy(1)) {
+        addError("[env] 布尔不支持复合赋值");
+        return nullptr;
+    }
+    switch (op) {
+        case AssignOp::PLUS_EQ: return builder.CreateAdd(cur, v, "ca.add");
+        case AssignOp::MINUS_EQ: return builder.CreateSub(cur, v, "ca.sub");
+        case AssignOp::STAR_EQ: return builder.CreateMul(cur, v, "ca.mul");
+        case AssignOp::SLASH_EQ:
+            if (ty->isIntegerTy()) return builder.CreateSDiv(cur, v, "ca.sdiv");
+            return builder.CreateFDiv(cur, v, "ca.fdiv");
+        case AssignOp::PERCENT_EQ:
+            if (ty->isIntegerTy()) return builder.CreateSRem(cur, v, "ca.srem");
+            return builder.CreateFRem(cur, v, "ca.frem");
+        default:
+            return nullptr;
+    }
+}
+
+// Resolve a struct field pointer: GEP into the struct at the field's index.
+llvm::Value* LLVMCodegen::codegenFieldPtr(const std::string& structName, llvm::Value* basePtr,
+                                          const std::string& field, llvm::Type** fieldTy) {
+    auto fit = structFields.find(structName);
+    if (fit == structFields.end()) {
+        addError("[env] 未知类型: " + structName + " (需要先用 type 声明)");
+        return nullptr;
+    }
+    for (size_t i = 0; i < fit->second.size(); i++) {
+        if (fit->second[i].first == field) {
+            if (fieldTy) *fieldTy = fit->second[i].second;
+            return builder.CreateStructGEP(structTypes[structName], basePtr, i, "env.gep");
+        }
+    }
+    addError("[env] 类型 '" + structName + "' 没有字段 '" + field + "'");
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(StructDeclaration* stmt) {
+    if (structTypes.count(stmt->name)) return nullptr;
+    std::vector<llvm::Type*> tys;
+    std::vector<std::pair<std::string, llvm::Type*>> fields;
+    for (const auto& f : stmt->fields) {
+        llvm::Type* t = getLLVMType(f.second);
+        tys.push_back(t);
+        fields.push_back({f.first, t});
+    }
+    structTypes[stmt->name] = llvm::StructType::create(context, tys, stmt->name);
+    structFields[stmt->name] = std::move(fields);
+    return nullptr;
+}
+
+llvm::Value* LLVMCodegen::codegen(StructCreationStatement* stmt) {
+    auto fit = structFields.find(stmt->structName);
+    if (fit == structFields.end()) {
+        addError("[env] 未知类型: " + stmt->structName + " (需要先用 type 声明)");
+        return nullptr;
+    }
+    if (stmt->values.size() != fit->second.size()) {
+        addError("[env] '" + stmt->structName + "' 需要 " + std::to_string(fit->second.size()) +
+                 " 个字段值，得到 " + std::to_string(stmt->values.size()));
+        return nullptr;
+    }
+    llvm::StructType* st = structTypes[stmt->structName];
+    // The `kill` EXP wraps each statement in a conditional diamond, so an
+    // alloca made here would only dominate the current path. Both slots belong
+    // in the entry block (like every other local's slot), and the field stores
+    // stay where the statement is.
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+    llvm::IRBuilderBase::InsertPoint savedIP = builder.saveIP();
+    llvm::BasicBlock* entryBB = &curFn->getEntryBlock();
+    if (entryBB->empty()) {
+        builder.SetInsertPoint(entryBB);
+    } else {
+        builder.SetInsertPoint(entryBB, entryBB->getFirstInsertionPt());
+    }
+    llvm::AllocaInst* obj = builder.CreateAlloca(st, nullptr, (stmt->varName + ".obj").c_str());
+    // Every struct variable reads as a pointer: the slot holds the object's
+    // address, so member writes through it persist and `a = b` re-points it.
+    llvm::AllocaInst* slot = builder.CreateAlloca(builder.getPtrTy(), nullptr, stmt->varName.c_str());
+    builder.restoreIP(savedIP);
+    for (size_t i = 0; i < stmt->values.size(); i++) {
+        llvm::Value* v = codegen(stmt->values[i].get());
+        if (!v) return nullptr;
+        v = wrongCastTo(builder, v, fit->second[i].second, "env.fld");
+        llvm::Value* fp = builder.CreateStructGEP(st, obj, i, "env.fldp");
+        builder.CreateStore(v, fp);
+    }
+    builder.CreateStore(obj, slot);
+    locals[stmt->varName] = slot;
+    localTypes[stmt->varName] = VarType::STRUCT;
+    localStructOf[stmt->varName] = stmt->structName;
+    return obj;
+}
+
+llvm::Value* LLVMCodegen::codegen(MemberExpression* expr) {
+    std::string structName;
+    if (auto* ve = dynamic_cast<VariableExpression*>(expr->base.get())) {
+        auto sit = localStructOf.find(ve->name);
+        if (sit != localStructOf.end()) structName = sit->second;
+    }
+    if (structName.empty()) {
+        addError("[env] '.' 左边必须是结构体变量: " + expr->toString());
+        return nullptr;
+    }
+    llvm::Value* basePtr = codegen(expr->base.get());
+    if (!basePtr) return nullptr;
+    llvm::Type* fieldTy = nullptr;
+    llvm::Value* fp = codegenFieldPtr(structName, basePtr, expr->field, &fieldTy);
+    if (!fp) return nullptr;
+    return builder.CreateLoad(fieldTy, fp, expr->field.c_str());
+}
+
+llvm::Value* LLVMCodegen::codegen(MemberAssignmentStatement* stmt) {
+    std::string structName;
+    if (auto* ve = dynamic_cast<VariableExpression*>(stmt->base.get())) {
+        auto sit = localStructOf.find(ve->name);
+        if (sit != localStructOf.end()) structName = sit->second;
+    }
+    if (structName.empty()) {
+        addError("[env] '.' 左边必须是结构体变量: " +
+                 (stmt->base ? stmt->base->toString() : std::string("?")) + "." + stmt->field);
+        return nullptr;
+    }
+    llvm::Value* basePtr = codegen(stmt->base.get());
+    if (!basePtr) return nullptr;
+    llvm::Type* fieldTy = nullptr;
+    llvm::Value* fp = codegenFieldPtr(structName, basePtr, stmt->field, &fieldTy);
+    if (!fp) return nullptr;
+    llvm::Value* v = codegen(stmt->value.get());
+    if (!v) return nullptr;
+    v = wrongCastTo(builder, v, fieldTy, "env.cast");
+    if (stmt->op == AssignOp::EQ) {
+        builder.CreateStore(v, fp);
+        return v;
+    }
+    llvm::Value* cur = builder.CreateLoad(fieldTy, fp, "env.cur");
+    llvm::Value* res = applyAssignOp(cur, v, fieldTy, stmt->op);
+    if (!res) return nullptr;
+    builder.CreateStore(res, fp);
+    return res;
+}
+
+// EXP `a <->[K] b`: one reaction step. a + b is a constant T; the balance sits
+// at a = T/(1+K), and each execution closes half of the remaining distance, so
+// the step shrinks as the pair approaches balance. Inside one unit of balance
+// the pair floats at random instead of stalling on the wrong side of it.
+llvm::Value* LLVMCodegen::codegen(ReactionStatement* stmt) {
+    auto leftIt = locals.find(stmt->leftName);
+    auto rightIt = locals.find(stmt->rightName);
+    if (leftIt == locals.end() || rightIt == locals.end()) {
+        addError("'" + stmt->leftName + " <->[" + std::to_string(stmt->k) + "] " +
+                 stmt->rightName + "' 只能作用于已声明的数值变量");
+        return nullptr;
+    }
+
+    for (const std::string* name : {&stmt->leftName, &stmt->rightName}) {
+        auto tIt = localTypes.find(*name);
+        // Integers only: the sum a + b is the reaction's conserved quantity, and
+        // reading it as one integer is what makes the pair float around a
+        // fractional balance instead of stalling on it.
+        if (tIt != localTypes.end() && !reactionNumeric(tIt->second)) {
+            addError("'" + *name + "' 不是 int/long 变量，不能参与 <->[K] 反应");
+            return nullptr;
+        }
+    }
+
+    llvm::LLVMContext& ctx = context;
+    llvm::IntegerType* i64 = llvm::Type::getInt64Ty(ctx);
+    // An `int` local may sit in an i32 slot and a `long` in an i64 one, so both
+    // sides are read with their own slot type and widened for the arithmetic.
+    auto readWide = [&](llvm::AllocaInst* slot) -> llvm::Value* {
+        llvm::Value* raw = builder.CreateLoad(slot->getAllocatedType(), slot, "reaction.read");
+        if (raw->getType() == i64) return raw;
+        return builder.CreateSExt(raw, i64, "reaction.wide");
+    };
+    llvm::Value* a = readWide(leftIt->second);
+    llvm::Value* b = readWide(rightIt->second);
+    llvm::Value* total = builder.CreateAdd(a, b, "reaction.total");
+
+    // target = T / (1 + K), in integer arithmetic with a remainder kept aside so
+    // the balance can be the fractional point the pair actually floats around.
+    llvm::Value* kPlusOne = builder.CreateAdd(
+        createConstInt(ctx, i64, stmt->k + 1), createConstInt(ctx, i64, 0));
+    llvm::Value* targetNumer = builder.CreateSDiv(total, kPlusOne, "reaction.target");
+    llvm::Value* targetRem = builder.CreateSRem(total, kPlusOne, "reaction.rem");
+
+    // Half of the remaining distance, and always at least one unit of movement.
+    llvm::Value* diff = builder.CreateSub(targetNumer, a, "reaction.diff");
+    llvm::Value* isNeg = builder.CreateICmpSLT(diff, createConstInt(ctx, i64, 0), "reaction.neg");
+    llvm::Value* negDiff = builder.CreateNeg(diff);
+    llvm::Value* absDiff = builder.CreateSelect(isNeg, negDiff, diff, "reaction.abs");
+    llvm::Value* step = builder.CreateSDiv(absDiff, createConstInt(ctx, i64, 2), "reaction.step");
+    llvm::Value* zero = createConstInt(ctx, i64, 0);
+    llvm::Value* one = createConstInt(ctx, i64, 1);
+    llvm::Value* tooSmall = builder.CreateICmpSLT(absDiff, one, "reaction.close");
+    step = builder.CreateSelect(tooSmall, one, step, "reaction.step.adj");
+    llvm::Value* signedStep = builder.CreateSelect(isNeg,
+                                                   builder.CreateNeg(step), step, "reaction.step.signed");
+
+    // Away from balance: a moves by the step, b takes the rest, so a + b holds.
+    llvm::Value* newA = builder.CreateAdd(a, signedStep, "reaction.a");
+    llvm::Value* newB = builder.CreateSub(total, newA, "reaction.b");
+
+    // At balance (within one unit) it is a coin toss between the two integers
+    // the fractional balance sits between — the reaction never quite settles.
+    usesRandomBuiltin = true;
+    emitRandomCallSeedOnce();
+    llvm::Value* r = builder.CreateCall(getRandFunction(), {}, "reaction.rand");
+    llvm::Value* rand1 = builder.CreateSExt(
+        builder.CreateSRem(r, builder.getInt32(3), "reaction.rand3"),
+        i64, "reaction.jitter1");
+    llvm::Value* jitter = builder.CreateSub(rand1, one, "reaction.jitter");
+    llvm::Value* upA = builder.CreateAdd(a, jitter, "reaction.a.wander");
+    llvm::Value* upB = builder.CreateSub(total, upA, "reaction.b.wander");
+    llvm::Value* atBalance = builder.CreateICmpSLT(absDiff, one, "reaction.near");
+    // The remainder picks which neighbour of the balance is nearer, so a
+    // fractional balance is not always rounded the same way.
+    llvm::Value* pickDown = builder.CreateICmpSGT(targetRem, zero, "reaction.pickdown");
+    llvm::Value* downA = builder.CreateSelect(pickDown,
+                                              builder.CreateSub(targetNumer, one, "reaction.a.down"),
+                                              targetNumer, "reaction.a.downsel");
+    llvm::Value* downB = builder.CreateSub(total, downA, "reaction.b.down");
+    llvm::Value* wanderA = builder.CreateSelect(pickDown, downA, upA, "reaction.a.wander.sel");
+    llvm::Value* wanderB = builder.CreateSelect(pickDown, downB, upB, "reaction.b.wander.sel");
+
+    auto storeNarrow = [&](llvm::AllocaInst* slot, llvm::Value* wide) {
+        llvm::Type* slotTy = slot->getAllocatedType();
+        if (slotTy == i64) {
+            builder.CreateStore(wide, slot);
+        } else {
+            builder.CreateStore(builder.CreateTrunc(wide, slotTy, "reaction.narrow"), slot);
+        }
+    };
+    storeNarrow(leftIt->second, builder.CreateSelect(atBalance, wanderA, newA, "reaction.a.final"));
+    storeNarrow(rightIt->second, builder.CreateSelect(atBalance, wanderB, newB, "reaction.b.final"));
+    return nullptr;
+}
+
+bool LLVMCodegen::denyFactMatches(const std::string& name, int64_t value) const {
+    return denyFacts.count(name + "=" + std::to_string(value)) > 0;
+}
+
+bool LLVMCodegen::reactionNumeric(VarType t) {
+    // `float` is not a reaction partner: the conserved quantity has to be read
+    // as one integer for the pair to float around a fractional balance.
+    return t == VarType::INT || t == VarType::LONG;
 }
 
 llvm::Value* LLVMCodegen::codegen(LieStatement* stmt) {
@@ -4404,6 +6544,569 @@ void LLVMCodegen::emitFateRecovery(const FateSlot& slot, llvm::AllocaInst* varAl
     builder.CreateStore(r, varAlloca);
 }
 
+// ---- EXP `wrong`: a forbidden result, recomputed ----------------------------
+// `wrong <cond>` forbids the result the condition describes. When the condition
+// evaluates true at runtime the program perturbs the participant variables by
+// the minimal amount and recomputes the derived chain until the result no
+// longer exists, permanently (every later write to a watched variable re-tests
+// the condition). The guard runs inside its own small LLVM function that reads
+// the current values, mutates private copies, and writes them back through the
+// closure pointers, so the enclosing function observes the escaped result.
+
+struct WrongExprWalk {
+    std::vector<std::string> order; // unique source-ordered variable names
+    bool badCall = false;           // function calls cannot be "wrong"
+    bool badArray = false;          // array elements cannot be "wrong"
+    bool badSpecial = false;        // strings / special expressions cannot be "wrong"
+};
+
+// Collect variable names in source order; flag constructs `wrong` cannot use.
+static void wrongExprWalk(xfawa::Expression* e, WrongExprWalk& out,
+                          std::set<std::string>& seen) {
+    if (!e) return;
+    switch (e->getNodeType()) {
+        case xfawa::NodeType::VARIABLE_EXPRESSION: {
+            auto* v = static_cast<xfawa::VariableExpression*>(e);
+            if (seen.insert(v->name).second) out.order.push_back(v->name);
+            return;
+        }
+        case xfawa::NodeType::BINARY_OP: {
+            auto* b = static_cast<xfawa::BinaryOp*>(e);
+            wrongExprWalk(b->left.get(), out, seen);
+            wrongExprWalk(b->right.get(), out, seen);
+            return;
+        }
+        case xfawa::NodeType::UNARY_OP: {
+            auto* u = static_cast<xfawa::UnaryOp*>(e);
+            wrongExprWalk(u->expr.get(), out, seen);
+            return;
+        }
+        case xfawa::NodeType::CALL_EXPRESSION:
+            out.badCall = true;
+            return;
+        case xfawa::NodeType::ARRAY_INDEX_EXPRESSION:
+            out.badArray = true;
+            return;
+        case xfawa::NodeType::ARRAY_LITERAL:
+        case xfawa::NodeType::ARRAY_RANGE_EXPRESSION:
+        case xfawa::NodeType::STRING_LITERAL:
+        case xfawa::NodeType::O_LITERAL_EXPRESSION:
+        case xfawa::NodeType::GHOST_EXPRESSION:
+        case xfawa::NodeType::PARADOX_EXPRESSION:
+        case xfawa::NodeType::VALUE_EXPRESSION:
+            out.badSpecial = true;
+            return;
+        default:
+            return; // numeric literals etc. contribute nothing
+    }
+}
+
+// Is `e` a structurally pure scalar expression (no calls/arrays/specials)?
+static bool wrongProducerPure(xfawa::Expression* e) {
+    if (!e) return false;
+    switch (e->getNodeType()) {
+        case xfawa::NodeType::NUMBER_LITERAL:
+        case xfawa::NodeType::FLOAT_LITERAL:
+        case xfawa::NodeType::BOOLEAN_LITERAL:
+        case xfawa::NodeType::VARIABLE_EXPRESSION:
+            return true;
+        case xfawa::NodeType::UNARY_OP: {
+            auto* u = static_cast<xfawa::UnaryOp*>(e);
+            return wrongProducerPure(u->expr.get());
+        }
+        case xfawa::NodeType::BINARY_OP: {
+            auto* b = static_cast<xfawa::BinaryOp*>(e);
+            return wrongProducerPure(b->left.get()) && wrongProducerPure(b->right.get());
+        }
+        default:
+            return false;
+    }
+}
+
+// Static per-function scan: remember the last plain scalar `name = expr` so a
+// derived variable (e.g. `z = x + y`) can be recomputed when it escapes.
+void LLVMCodegen::collectWrongProducers(xfawa::Statement* stmt) {
+    if (!stmt) return;
+    if (auto* a = dynamic_cast<xfawa::AssignmentStatement*>(stmt)) {
+        if (wrongProducerPure(a->value.get())) {
+            functionProducers[a->name] = a;
+        }
+        return;
+    }
+    switch (stmt->getNodeType()) {
+        case xfawa::NodeType::BLOCK_STATEMENT:
+            for (auto& s : static_cast<xfawa::BlockStatement*>(stmt)->statements)
+                collectWrongProducers(s.get());
+            break;
+        case xfawa::NodeType::IF_STATEMENT: {
+            auto* i = static_cast<xfawa::IfStatement*>(stmt);
+            if (i->thenBranch) collectWrongProducers(i->thenBranch.get());
+            for (auto& ei : i->elseIfBranches) collectWrongProducers(ei.second.get());
+            if (i->elseBranch) collectWrongProducers(i->elseBranch.get());
+            break;
+        }
+        case xfawa::NodeType::WHILE_STATEMENT:
+            collectWrongProducers(static_cast<xfawa::WhileStatement*>(stmt)->body.get());
+            break;
+        case xfawa::NodeType::FOR_IN_STATEMENT:
+            collectWrongProducers(static_cast<xfawa::ForInStatement*>(stmt)->body.get());
+            break;
+        case xfawa::NodeType::LOOP_STATEMENT:
+            for (auto& s : static_cast<xfawa::LoopStatement*>(stmt)->body)
+                collectWrongProducers(s.get());
+            break;
+        case xfawa::NodeType::LIE_STATEMENT:
+            collectWrongProducers(static_cast<xfawa::LieStatement*>(stmt)->body.get());
+            break;
+        case xfawa::NodeType::TRY_EXPECT_STATEMENT: {
+            auto* te = static_cast<xfawa::TryExpectStatement*>(stmt);
+            if (te->tryBlock) collectWrongProducers(te->tryBlock.get());
+            if (te->expectBlock) collectWrongProducers(te->expectBlock.get());
+            break;
+        }
+        default:
+            // FUNCTION_DECLARATION and the rest: nested function bodies get
+            // their own scan when their own codegen(Function*) runs.
+            break;
+    }
+}
+
+// Cast `value` to `type` the way this compiler stores scalars.
+static llvm::Value* wrongCastTo(llvm::IRBuilder<>& builder, llvm::Value* value,
+                                llvm::Type* type, const std::string& tag) {
+    if (!value || value->getType() == type) return value;
+    if (type->isIntegerTy() && value->getType()->isIntegerTy()) {
+        unsigned fromW = value->getType()->getIntegerBitWidth();
+        unsigned toW = type->getIntegerBitWidth();
+        if (fromW < toW) return builder.CreateSExt(value, type, tag + ".sext");
+        return builder.CreateTrunc(value, type, tag + ".trunc");
+    }
+    if (type->isFloatTy() && value->getType()->isIntegerTy())
+        return builder.CreateSIToFP(value, type, tag + ".stofp");
+    if (type->isIntegerTy() && value->getType()->isFloatTy())
+        return builder.CreateFPToSI(value, type, tag + ".fptosi");
+    return value;
+}
+
+// Build the guard routine for one `wrong`, then register it. Keeps the builder
+// insert point of the enclosing function untouched.
+void LLVMCodegen::emitWrongGuard(xfawa::WrongStatement* stmt,
+                                 const std::vector<std::string>& closure,
+                                 const std::vector<std::string>& roots,
+                                 const std::vector<std::string>& derived,
+                                 const std::map<std::string, xfawa::Expression*>& producerOf) {
+    const std::string guardName = "__xfawa_wrong_" + std::to_string(wrongGuardCounter++);
+    llvm::Type* ptrTy = llvm::PointerType::get(context, 0);
+
+    std::vector<llvm::Type*> guardParamTypes(closure.size(), ptrTy);
+    llvm::FunctionType* guardTy = llvm::FunctionType::get(builder.getVoidTy(), guardParamTypes, false);
+    llvm::Function* guardFn = llvm::Function::Create(guardTy, llvm::Function::InternalLinkage, 0,
+                                                     guardName, module);
+
+    llvm::IRBuilderBase::InsertPoint savedIP = builder.saveIP();
+    llvm::BasicBlock* entryBB = llvm::BasicBlock::Create(context, "w.entry", guardFn);
+    builder.SetInsertPoint(entryBB);
+
+    // Dummy allocas mirror the real closure values; written back at the end.
+    std::vector<llvm::AllocaInst*> dummies(closure.size(), nullptr);
+    std::vector<llvm::Value*> savedBase(closure.size(), nullptr);
+    std::map<std::string, llvm::AllocaInst*> gLocals;
+    std::map<std::string, VarType> gTypes;
+    for (size_t i = 0; i < closure.size(); i++) {
+        const std::string& name = closure[i];
+        VarType vt = (localTypes.count(name)) ? localTypes[name] : VarType::INT;
+        llvm::Type* ty = getLLVMType(vt);
+        llvm::AllocaInst* dummy = builder.CreateAlloca(ty, nullptr, ("w.d." + name).c_str());
+        llvm::Value* cur = builder.CreateLoad(ty, guardFn->getArg(i), ("w.cur." + name).c_str());
+        builder.CreateStore(cur, dummy);
+        dummies[i] = dummy;
+        savedBase[i] = builder.CreateLoad(ty, dummy, ("w.saved." + name).c_str());
+        gLocals[name] = dummy;
+        gTypes[name] = vt;
+    }
+
+    // Swap the local maps so cond / producer codegen reads the dummies.
+    auto savedLocalsOuter = locals;
+    auto savedTypesOuter = localTypes;
+    locals = gLocals;
+    localTypes = gTypes;
+
+    auto condToBool = [&](llvm::Value* v) -> llvm::Value* {
+        if (!v) return nullptr;
+        if (v->getType()->isIntegerTy(1)) return v;
+        if (v->getType()->isIntegerTy(32))
+            return builder.CreateICmpNE(v, builder.getInt32(0), "w.bool");
+        if (v->getType()->isIntegerTy(64))
+            return builder.CreateICmpNE(v, builder.getInt64(0), "w.bool");
+        return builder.CreateFCmpONE(v, llvm::ConstantFP::get(v->getType(), 0.0), "w.bool");
+    };
+
+    llvm::BasicBlock* doneBB = llvm::BasicBlock::Create(context, "w.done", guardFn);
+    llvm::BasicBlock* blockedBB = llvm::BasicBlock::Create(context, "w.blocked", guardFn);
+
+    // Restore every closure dummy to its baseline, then apply `builder` that
+    // writes one root, then recompute the derived chain, then re-check.
+    auto emitProbeBlock = [&](llvm::BasicBlock* selfBB, llvm::BasicBlock* nextBB,
+                              size_t rootIdx,
+                              std::function<llvm::Value*()> makeCandidate) {
+        builder.SetInsertPoint(selfBB);
+        for (size_t i = 0; i < closure.size(); i++) {
+            llvm::Type* ty = dummies[i]->getAllocatedType();
+            builder.CreateStore(savedBase[i], dummies[i]);
+        }
+        llvm::Value* cand = makeCandidate();
+        llvm::AllocaInst* rootAlloca = dummies[rootIdx];
+        llvm::Type* rootTy = rootAlloca->getAllocatedType();
+        cand = wrongCastTo(builder, cand, rootTy, "w.cast");
+        builder.CreateStore(cand, rootAlloca);
+        for (const std::string& d : derived) {
+            auto pit = producerOf.find(d);
+            if (pit == producerOf.end()) continue;
+            llvm::Value* prodVal = codegen(pit->second);
+            llvm::AllocaInst* dAlloca = dummies[std::distance(
+                closure.begin(), std::find(closure.begin(), closure.end(), d))];
+            if (!dAlloca) continue;
+            prodVal = wrongCastTo(builder, prodVal, dAlloca->getAllocatedType(), "w.prod");
+            builder.CreateStore(prodVal, dAlloca);
+        }
+        llvm::Value* c2 = condToBool(codegen(stmt->condition.get()));
+        builder.CreateCondBr(c2, nextBB, doneBB);
+    };
+
+    std::vector<llvm::BasicBlock*> probeBBs;
+
+    // Build the candidate list: boundary jumps for relational whole-operand
+    // roots first, then minimal ±n perturbations per root in source order.
+    struct Candidate {
+        size_t root;           // closure index of the root to perturb
+        enum { BOUNDARY, PROBE } kind;
+        int sign = 0;          // probe: +1/-1/... ; boundary: shift direction
+        xfawa::Expression* other = nullptr; // boundary: the other whole side
+        bool random = false;   // probe: the upward nudge is a random 1..5
+    };
+    std::vector<Candidate> candidates;
+
+    // roots[] and closure[] are not the same order; map a root index to its
+    // closure index so it can index dummies[].
+    auto closureIdx = [&](const std::string& name) -> size_t {
+        auto it = std::find(closure.begin(), closure.end(), name);
+        return static_cast<size_t>(std::distance(closure.begin(), it));
+    };
+
+    // Boundary detection: cond is a top-level relational op with exactly one
+    // root as a whole operand.
+    {
+        if (auto* bop = dynamic_cast<xfawa::BinaryOp*>(stmt->condition.get())) {
+            bool rel = bop->op == xfawa::BinaryOpType::LESS ||
+                       bop->op == xfawa::BinaryOpType::LESS_EQUAL ||
+                       bop->op == xfawa::BinaryOpType::GREATER ||
+                       bop->op == xfawa::BinaryOpType::GREATER_EQUAL;
+            if (rel) {
+                auto* lv = dynamic_cast<xfawa::VariableExpression*>(bop->left.get());
+                auto* rv = dynamic_cast<xfawa::VariableExpression*>(bop->right.get());
+                size_t li = SIZE_MAX, ri = SIZE_MAX;
+                for (size_t k = 0; k < roots.size(); k++) {
+                    if (lv && lv->name == roots[k]) li = k;
+                    if (rv && rv->name == roots[k]) ri = k;
+                }
+                if (li != SIZE_MAX && ri == SIZE_MAX) {
+                    Candidate c; c.root = closureIdx(roots[li]); c.kind = Candidate::BOUNDARY;
+                    c.other = bop->right.get();
+                    // root op E : boundary such that `root op E` flips.
+                    if (bop->op == xfawa::BinaryOpType::LESS ||
+                        bop->op == xfawa::BinaryOpType::GREATER) c.sign = 0;
+                    else if (bop->op == xfawa::BinaryOpType::LESS_EQUAL) c.sign = 1;
+                    else c.sign = -1; // GREATER_EQUAL
+                    candidates.push_back(c);
+                } else if (ri != SIZE_MAX && li == SIZE_MAX) {
+                    Candidate c; c.root = closureIdx(roots[ri]); c.kind = Candidate::BOUNDARY;
+                    c.other = bop->left.get();
+                    // E op root : mirror of the left-sided case.
+                    if (bop->op == xfawa::BinaryOpType::LESS ||
+                        bop->op == xfawa::BinaryOpType::GREATER) c.sign = 0;
+                    else if (bop->op == xfawa::BinaryOpType::GREATER_EQUAL) c.sign = 1;
+                    else c.sign = -1; // LESS_EQUAL
+                    candidates.push_back(c);
+                }
+            }
+        }
+    }
+    // Minimal perturbations: +R(1..5),-1,+2,-2,+3,-3,+4,-4 per root
+    // (bool -> toggle). The upward nudge is a random 1..5 picked at runtime.
+    for (size_t r = 0; r < roots.size(); r++) {
+        for (int d : {1, -1, 2, -2, 3, -3, 4, -4}) {
+            Candidate c; c.root = closureIdx(roots[r]); c.kind = Candidate::PROBE; c.sign = d;
+            c.random = (d == 1);
+            candidates.push_back(c);
+        }
+    }
+
+    // Create the probe chain blocks.
+    for (size_t k = 0; k < candidates.size(); k++) {
+        probeBBs.push_back(llvm::BasicBlock::Create(context, "w.probe", guardFn));
+    }
+
+    // Initial condition: if it is already false there is nothing to do.
+    // Emitted last so the entry terminator can point at the first probe
+    // block directly (no orphan `w.probe0` block is ever created).
+    builder.SetInsertPoint(entryBB);
+    llvm::Value* firstCond = condToBool(codegen(stmt->condition.get()));
+    builder.CreateCondBr(firstCond,
+                         probeBBs.empty() ? blockedBB
+                                          : static_cast<llvm::BasicBlock*>(probeBBs[0]),
+                         doneBB);
+
+    auto intDelta = [&](llvm::Value* base, int d) -> llvm::Value* {
+        llvm::Type* ty = base->getType();
+        return builder.CreateAdd(base, llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(ty), d), "w.delta");
+    };
+    auto floatDelta = [&](llvm::Value* base, int d) -> llvm::Value* {
+        llvm::Value* neg = builder.CreateFNeg(base, "w.abs0");
+        llvm::Value* isNeg = builder.CreateFCmpOLT(base, llvm::ConstantFP::get(builder.getFloatTy(), 0.0), "w.isneg");
+        llvm::Value* abs0 = builder.CreateSelect(isNeg, neg, base, "w.abs");
+        llvm::Value* pct = builder.CreateFMul(abs0, llvm::ConstantFP::get(builder.getFloatTy(), 0.01f), "w.pct");
+        llvm::Value* eps = llvm::ConstantFP::get(builder.getFloatTy(), 0.01f);
+        llvm::Value* big = builder.CreateFCmpOGT(pct, eps, "w.big");
+        llvm::Value* step = builder.CreateSelect(big, pct, eps, "w.step");
+        llvm::Value* off = builder.CreateFMul(step, llvm::ConstantFP::get(builder.getFloatTy(), (float)d), "w.off");
+        return builder.CreateFAdd(base, off, "w.deltaf");
+    };
+
+    for (size_t k = 0; k < candidates.size(); k++) {
+        Candidate& c = candidates[k];
+        llvm::BasicBlock* nextBB = (k + 1 < candidates.size()) ? probeBBs[k + 1] : blockedBB;
+        llvm::BasicBlock* selfBB = probeBBs[k];
+        emitProbeBlock(selfBB, nextBB, c.root, [&, c]() -> llvm::Value* {
+            llvm::Value* base = builder.CreateLoad(dummies[c.root]->getAllocatedType(),
+                                                   dummies[c.root], "w.base");
+            if (c.kind == Candidate::BOUNDARY && c.other) {
+                llvm::Value* otherVal = codegen(c.other);
+                otherVal = wrongCastTo(builder, otherVal, base->getType(), "w.bnd");
+                if (c.sign == 0) return otherVal;
+                if (base->getType()->isFloatTy()) {
+                    llvm::Value* neg = builder.CreateFNeg(base, "w.babs");
+                    llvm::Value* isNeg = builder.CreateFCmpOLT(base, llvm::ConstantFP::get(builder.getFloatTy(), 0.0), "w.bneg");
+                    llvm::Value* abs0 = builder.CreateSelect(isNeg, neg, base, "w.babs2");
+                    llvm::Value* pct = builder.CreateFMul(abs0, llvm::ConstantFP::get(builder.getFloatTy(), 0.01f), "w.bpct");
+                    llvm::Value* eps = llvm::ConstantFP::get(builder.getFloatTy(), 0.01f);
+                    llvm::Value* big = builder.CreateFCmpOGT(pct, eps, "w.bbig");
+                    llvm::Value* step = builder.CreateSelect(big, pct, eps, "w.bstep");
+                    llvm::Value* off = builder.CreateFMul(step, llvm::ConstantFP::get(builder.getFloatTy(), (float)c.sign), "w.boff");
+                    return builder.CreateFAdd(otherVal, off, "w.bjump");
+                }
+                return builder.CreateAdd(otherVal,
+                                         llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(base->getType()), c.sign),
+                                         "w.bjump");
+            }
+            // PROBE
+            if (base->getType()->isIntegerTy(1)) {
+                return builder.CreateXor(base, builder.getTrue(), "w.toggle");
+            }
+            if (base->getType()->isFloatTy()) return floatDelta(base, c.sign);
+            if (c.random) {
+                // The upward nudge picks 1..5 at runtime: rand()%5+1.
+                llvm::Function* randFunc = getRandFunction();
+                llvm::Value* r = builder.CreateCall(randFunc, {}, "w.rand");
+                llvm::IntegerType* rTy = llvm::cast<llvm::IntegerType>(r->getType());
+                llvm::Value* m = builder.CreateSRem(r, llvm::ConstantInt::get(rTy, 5), "w.mod");
+                llvm::Value* off = builder.CreateAdd(m, llvm::ConstantInt::get(rTy, 1), "w.off");
+                if (base->getType() != rTy) {
+                    off = builder.CreateZExt(off, base->getType(), "w.off64");
+                }
+                return builder.CreateAdd(base, off, "w.delta");
+            }
+            return intDelta(base, c.sign);
+        });
+    }
+
+    // Exhausted: report and terminate.
+    builder.SetInsertPoint(blockedBB);
+    {
+        llvm::Function* printfFn = module->getFunction("printf");
+        if (printfFn) {
+            llvm::Value* msg = builder.CreateGlobalStringPtr("wrong: \xe6\x97\xa0\xe5\xa4\x84\xe5\x8f\xaf\xe9\x80\x83\xef\xbc\x88\xe6\xb2\xa1\xe6\x9c\x89\xe5\x90\x88\xe6\xb3\x95\xe7\xbb\x93\xe6\x9e\x9c\xef\xbc\x89\n", "wrong.msg");
+            builder.CreateCall(printfFn->getFunctionType(), printfFn, {msg});
+        }
+        llvm::Function* exitFn = module->getFunction("exit");
+        if (exitFn) builder.CreateCall(exitFn, {builder.getInt32(1)});
+        builder.CreateRetVoid();
+    }
+
+    // Success: write the evaded values back into the real allocation slots.
+    builder.SetInsertPoint(doneBB);
+    for (size_t i = 0; i < closure.size(); i++) {
+        llvm::Type* ty = dummies[i]->getAllocatedType();
+        llvm::Value* v = builder.CreateLoad(ty, dummies[i], ("w.back." + closure[i]).c_str());
+        builder.CreateStore(v, guardFn->getArg(i));
+    }
+    builder.CreateRetVoid();
+
+    locals = savedLocalsOuter;
+    localTypes = savedTypesOuter;
+    builder.restoreIP(savedIP);
+
+    // Register the slot for this guard so later assignments re-test it.
+    WrongGuardData slot;
+    slot.guard = guardFn;
+    slot.closure = closure;
+    slot.condExpr = stmt->condition.get();
+    wrongSlots.push_back(slot);
+    int slotIdx = static_cast<int>(wrongSlots.size()) - 1;
+    for (const std::string& name : closure) {
+        wrongWatchedNames[name].push_back(slotIdx);
+    }
+}
+
+llvm::Value* LLVMCodegen::codegen(WrongStatement* stmt) {
+    if (!stmt->condition) return nullptr;
+
+    // 1) Participants: every variable the condition reads, in source order.
+    WrongExprWalk direct;
+    std::set<std::string> seen;
+    wrongExprWalk(stmt->condition.get(), direct, seen);
+    if (direct.badCall) { addError("wrong: 条件不能包含函数调用"); return nullptr; }
+    if (direct.badArray) { addError("wrong: 条件不能包含数组元素"); return nullptr; }
+    if (direct.badSpecial) { addError("wrong: 条件只能由数值运算与比较组成"); return nullptr; }
+    if (direct.order.empty()) {
+        addError("wrong: 无可重算的参与值（条件不含任何变量）");
+        return nullptr;
+    }
+
+    // 2) Expand derived variables through their producers. A variable is
+    // derived only when its last producer RHS reads at least one variable;
+    // otherwise it is itself a root (e.g. `x = 10` -> bump x directly).
+    std::vector<std::string> closure;
+    std::set<std::string> closureSet;
+    std::map<std::string, xfawa::Expression*> producerOf;
+    std::set<std::string> derivedSet;
+    std::deque<std::string> queue(direct.order.begin(), direct.order.end());
+    int expandRounds = 0;
+    while (!queue.empty() && expandRounds++ < 128) {
+        std::string v = queue.front();
+        queue.pop_front();
+        if (!closureSet.insert(v).second) continue;
+        closure.push_back(v);
+        auto pit = functionProducers.find(v);
+        if (pit == functionProducers.end()) continue;
+        xfawa::AssignmentStatement* prod = pit->second;
+        WrongExprWalk rhs;
+        std::set<std::string> rhsSeen;
+        wrongExprWalk(prod->value.get(), rhs, rhsSeen);
+        if (rhs.badCall || rhs.badArray || rhs.badSpecial || rhs.order.empty()) continue;
+        producerOf[v] = prod->value.get();
+        derivedSet.insert(v);
+        for (const std::string& w : rhs.order) {
+            if (!closureSet.count(w)) queue.push_back(w);
+        }
+    }
+
+    // 3) Validate every closure variable: born, numeric scalar, not entangled.
+    for (const std::string& v : closure) {
+        if (locals.find(v) == locals.end()) {
+            addError("wrong: 参与者 '" + v + "' 尚未声明");
+            return nullptr;
+        }
+        auto tt = localTypes.find(v);
+        if (tt == localTypes.end()) {
+            addError("wrong: 参与者 '" + v + "' 类型未知");
+            return nullptr;
+        }
+        VarType vt = tt->second;
+        bool numeric = vt == VarType::INT || vt == VarType::LONG ||
+                       vt == VarType::FLOAT || vt == VarType::BOOL;
+        if (!numeric) {
+            addError("wrong: 条件只能引用数值变量（'" + v + "' 不是数值）");
+            return nullptr;
+        }
+        if (backroomVars.count(v) || interestVars.count(v) ||
+            disposableVars.count(v) || dualEchoVars.count(v)) {
+            addError("wrong: 不支持对 '" + v + "' 施加后室/利息/一次性/双身状态");
+            return nullptr;
+        }
+    }
+
+    // 4) Topological order of the derived chain (Kahn). Vars caught in a cycle
+    // are not recomputable and degrade to roots (direct perturbation).
+    std::map<std::string, std::vector<std::string>> deps;
+    for (const std::string& d : closure) {
+        if (!derivedSet.count(d)) continue;
+        WrongExprWalk dv;
+        std::set<std::string> ds;
+        wrongExprWalk(producerOf[d], dv, ds);
+        for (const std::string& w : dv.order)
+            if (derivedSet.count(w)) deps[d].push_back(w);
+    }
+    std::vector<std::string> derived;
+    std::set<std::string> placed;
+    int topoRounds = 0;
+    bool progress = true;
+    while (progress && topoRounds++ < 128) {
+        progress = false;
+        for (const std::string& d : closure) {
+            if (!derivedSet.count(d) || placed.count(d)) continue;
+            bool ready = true;
+            for (const std::string& w : deps[d])
+                if (!placed.count(w)) { ready = false; break; }
+            if (ready) { placed.insert(d); derived.push_back(d); progress = true; }
+        }
+    }
+    std::vector<std::string> roots;
+    for (const std::string& v : closure)
+        if (!placed.count(v)) roots.push_back(v);
+
+    // 5) There must be at least one bumpable participant, and roots may not be
+    // function parameters.
+    if (roots.empty()) {
+        addError("wrong: 无可重算的参与值（条件不含可调整变量）");
+        return nullptr;
+    }
+    for (const std::string& r : roots) {
+        if (currentFuncParams.count(r)) {
+            addError("wrong: 参与值不能是函数参数（'" + r + "'）");
+            return nullptr;
+        }
+    }
+
+    // 6) Build the guard routine (registers a slot), then drive it inline:
+    // if the condition holds, call the guard; otherwise just continue.
+    // Seed rand() here so the guard's random 1..5 nudge varies per run.
+    emitRandomCallSeedOnce();
+    emitWrongGuard(stmt, closure, roots, derived, producerOf);
+    WrongGuardData& slot = wrongSlots.back();
+
+    llvm::Function* curFn = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock* evBB = llvm::BasicBlock::Create(context, "wrong.evade", curFn);
+    llvm::BasicBlock* contBB = llvm::BasicBlock::Create(context, "wrong.cont", curFn);
+
+    llvm::Value* condV = codegen(stmt->condition.get());
+    llvm::Value* condB = nullptr;
+    if (condV->getType()->isIntegerTy(1)) {
+        condB = condV;
+    } else if (condV->getType()->isIntegerTy(64)) {
+        condB = builder.CreateICmpNE(condV, builder.getInt64(0), "wrong.arm");
+    } else if (condV->getType()->isFloatTy()) {
+        condB = builder.CreateFCmpONE(condV, llvm::ConstantFP::get(builder.getFloatTy(), 0.0), "wrong.arm");
+    } else {
+        condB = builder.CreateICmpNE(condV, builder.getInt32(0), "wrong.arm");
+    }
+    builder.CreateCondBr(condB, evBB, contBB);
+
+    builder.SetInsertPoint(evBB);
+    std::vector<llvm::Value*> guardArgs;
+    for (const std::string& cn : slot.closure) {
+        auto gia = locals.find(cn);
+        if (gia == locals.end()) { guardArgs.clear(); break; }
+        guardArgs.push_back(gia->second);
+    }
+    if (!guardArgs.empty()) {
+        builder.CreateCall(slot.guard->getFunctionType(), slot.guard, guardArgs);
+    }
+    builder.CreateBr(contBB);
+
+    builder.SetInsertPoint(contBB);
+    return condV;
+}
+
 llvm::Value* LLVMCodegen::codegen(FateStatement* stmt) {
     llvm::Value* value = codegen(stmt->value.get());
     if (!value) return nullptr;
@@ -5323,6 +8026,18 @@ void LLVMCodegen::collectCallArgTypes(Statement* stmt) {
 }
 
 void LLVMCodegen::collectCallArgTypes(Program* program) {
+    // EXP structs: declare every program- and module-level `type 名字 { ... }`
+    // before the function signatures are built, so carried struct params can
+    // be typed.
+    for (auto& sd : program->structs) {
+        codegen(sd.get());
+    }
+    for (auto& mod : program->modules) {
+        for (auto& sd : mod->structs) {
+            codegen(sd.get());
+        }
+    }
+
     // First pass: collect call argument types from function calls
     for (auto& mod : program->modules) {
         for (auto& func : mod->functions) {
@@ -5438,6 +8153,7 @@ void LLVMCodegen::collectVoidFunctions(Program* program) {
 bool LLVMCodegen::codegenProgram(Program* program) {
     collectCallArgTypes(program);
     collectVoidFunctions(program);
+    collectFunctionAsts(program);
 
     for (auto& imp : program->imports) {
         if (!codegen(imp.get())) {
@@ -5475,6 +8191,24 @@ bool LLVMCodegen::codegenProgram(Program* program) {
             }
             for (size_t i = 0; i < func->params.size(); i++) {
                 VarType paramType = VarType::UNKNOWN;
+                // EXP env: the carried params' types are declared on the env
+                // block and win over call-site inference. A struct-typed
+                // carried param is a pointer so member writes persist.
+                if (i < func->envCarried.size()) { 
+                    const std::string& tn = func->envCarried[i].second;
+                    if (tn == "int") { paramTypes.push_back(builder.getInt32Ty()); continue; }
+                    if (tn == "long") { paramTypes.push_back(builder.getInt64Ty()); continue; }
+                    if (tn == "float") { paramTypes.push_back(builder.getFloatTy()); continue; }
+                    if (tn == "bool") { paramTypes.push_back(builder.getInt1Ty()); continue; }
+                    if (tn == "string") { paramTypes.push_back(llvm::PointerType::get(context, 0)); continue; }
+                    if (structTypes.count(tn)) { paramTypes.push_back(llvm::PointerType::get(context, 0)); continue; }
+                    // A name that is neither a basic type nor a declared struct
+                    // would silently degrade to an integer parameter, so it is a
+                    // compile error instead.
+                    addError("[env] 未知类型 '" + tn + "'（env 块的类型必须是 int/long/float/bool/string，或先用 type 声明）");
+                    paramTypes.push_back(builder.getInt64Ty());
+                    continue;
+                }
                 if (argTypesIt != callArgTypes.end() && i < argTypesIt->second.size()) {
                     paramType = argTypesIt->second[i];
                 }
@@ -5496,6 +8230,13 @@ bool LLVMCodegen::codegenProgram(Program* program) {
                 hasMainFunction = true;
             }
         }
+    }
+
+    // The signature pre-pass can already reject a program (e.g. an `env` block
+    // naming a type that does not exist). The caller only prints the errors when
+    // codegen fails, so stop here instead of compiling on.
+    if (!errors.empty()) {
+        return false;
     }
 
     // EXP `...`: every user function now has a real (declared) LLVM symbol to
@@ -5557,7 +8298,14 @@ bool LLVMCodegen::codegen(Function* func) {
     auto savedDisposableVars = disposableVars; // EXP `disposable`
     auto savedInterestVars = interestVars; // EXP `interest`
     auto savedBackroomVars = backroomVars; // EXP `noclip`
+    auto savedZombieVars = zombieVars;     // EXP `zombie`
+    auto savedCodeVarFragments = codeVarFragments; // EXP `valuable`
+    auto savedWrongSlots = wrongSlots; // EXP `wrong`
+    auto savedWrongWatched = wrongWatchedNames; // EXP `wrong`
+    auto savedProducers = functionProducers; // EXP `wrong`
+    auto savedParams = currentFuncParams; // EXP `wrong`
     std::string savedCurrentFunc = currentFuncName; // EXP `drift`: restore on exit
+    std::vector<std::pair<std::string, std::string>> savedEnvCarried = currentEnvCarried; // EXP `env`: restore on exit
     llvm::BasicBlock* savedInsertBlock = builder.GetInsertBlock();
     llvm::Function* savedInsertFunction = savedInsertBlock ? savedInsertBlock->getParent() : nullptr;
     
@@ -5568,6 +8316,12 @@ bool LLVMCodegen::codegen(Function* func) {
     disposableVars.clear(); // EXP `disposable`: layers never leak across functions
     interestVars.clear(); // EXP `interest`: interest rules never leak across functions
     backroomVars.clear(); // EXP `noclip`: backrooms never leak across functions
+    zombieVars.clear();     // EXP `zombie`: the plague never leaks across functions
+    codeVarFragments.clear(); // EXP `valuable`: code bindings are per function
+    wrongSlots.clear(); // EXP `wrong`: guards never leak across functions
+    wrongWatchedNames.clear(); // EXP `wrong`
+    functionProducers.clear(); // EXP `wrong`
+    currentFuncParams.clear(); // EXP `wrong`
     
     bool isMain = (func->name == "main");
     
@@ -5586,6 +8340,18 @@ bool LLVMCodegen::codegen(Function* func) {
     }
 
     currentFuncName = funcName; // EXP `drift`: used to detect self calls
+    // EXP `env`: what this function silently carries, if anything.
+    currentEnvCarried = func->envCarried;
+
+    // EXP `wrong`: remember the parameter names (roots must not be params) and
+    // scan this function for scalar producers (a plain `name = expr` whose RHS
+    // is a pure scalar expression) so derived variables can be recomputed when
+    // a forbidden result escapes. Static per-function pass: the LAST producer
+    // assigned anywhere in the function wins (documented approximation).
+    for (const auto& p : func->params) {
+        currentFuncParams.insert(p->name);
+    }
+    collectWrongProducers(func->body ? func->body.get() : nullptr);
     if (func->drift.enabled) {
         driftConfigs[funcName] = func->drift;
     }
@@ -5610,6 +8376,17 @@ bool LLVMCodegen::codegen(Function* func) {
         
         for (size_t i = 0; i < func->params.size(); i++) {
             VarType paramType = VarType::UNKNOWN;
+            // EXP env: the carried params' types are declared on the env block
+            // and win over call-site inference (struct -> pointer).
+            if (i < func->envCarried.size()) { 
+                const std::string& tn = func->envCarried[i].second;
+                if (tn == "int") { paramTypes.push_back(builder.getInt32Ty()); continue; }
+                if (tn == "long") { paramTypes.push_back(builder.getInt64Ty()); continue; }
+                if (tn == "float") { paramTypes.push_back(builder.getFloatTy()); continue; }
+                if (tn == "bool") { paramTypes.push_back(builder.getInt1Ty()); continue; }
+                if (tn == "string") { paramTypes.push_back(llvm::PointerType::get(context, 0)); continue; }
+                if (structTypes.count(tn)) { paramTypes.push_back(llvm::PointerType::get(context, 0)); continue; }
+            }
             if (argTypesIt != callArgTypes.end() && i < argTypesIt->second.size()) {
                 paramType = argTypesIt->second[i];
             }
@@ -5633,6 +8410,17 @@ bool LLVMCodegen::codegen(Function* func) {
     }
     
     if (llvmFunc->empty()) {
+        // EXP `valuable`: a code factory is never called at run time - the code it
+        // returns is inlined at every use point - so the symbol is just a stub.
+        // A function whose parameters are always code is the same: every call
+        // site compiles its own copy of the body.
+        if (isCodeFactoryFunction(func) || functionTakesCode(func)) {
+            llvm::BasicBlock* entryBB = llvm::BasicBlock::Create(context, "entry", llvmFunc);
+            builder.SetInsertPoint(entryBB);
+            builder.CreateRet(createConstInt(context, builder.getInt64Ty(), 0));
+            goto functionStateRestored;
+        }
+
         llvm::BasicBlock* entryBB = llvm::BasicBlock::Create(context, "entry", llvmFunc);
         builder.SetInsertPoint(entryBB);
 
@@ -5700,7 +8488,43 @@ bool LLVMCodegen::codegen(Function* func) {
             locals[paramName] = alloca;
             
             localTypes[paramName] = paramType;
+            // EXP env: the carried params' types are known from the env pass
+            // (fn->envCarried). A struct-typed carried param reads as a pointer
+            // (its alloca holds the caller's object address), so member writes
+            // persist and implicit this resolves through it.
+            if (i < func->envCarried.size()) { 
+                const auto& c = func->envCarried[i];
+                if (structTypes.count(c.second)) {
+                    localTypes[paramName] = VarType::STRUCT;
+                    localStructOf[paramName] = c.second;
+                } else if (c.second == "int") localTypes[paramName] = VarType::INT;
+                else if (c.second == "long") localTypes[paramName] = VarType::LONG;
+                else if (c.second == "float") localTypes[paramName] = VarType::FLOAT;
+                else if (c.second == "bool") localTypes[paramName] = VarType::BOOL;
+                else if (c.second == "string") localTypes[paramName] = VarType::STRING;
+            }
             i++;
+        }
+
+        // EXP `valuable`: a specialized copy receives a copy of every variable of
+        // the use point that the spliced code works on, and binds the name to it,
+        // so the code reads and writes that copy. The call site stores it back.
+        auto bindingIt = codeArgBindings.find(funcName);
+        if (bindingIt != codeArgBindings.end()) {
+            const std::vector<CodeBinding>& bindings = bindingIt->second;
+            size_t firstBinding = func->params.size() - bindings.size();
+            for (size_t k = 0; k < bindings.size(); k++) {
+                const CodeBinding& b = bindings[k];
+                llvm::Argument* incoming = llvmFunc->getArg(firstBinding + k);
+                llvm::Type* ty = getLLVMType(b.type);
+                llvm::AllocaInst* slot =
+                    builder.CreateAlloca(ty, nullptr, ("code.slot." + b.name).c_str());
+                builder.CreateStore(builder.CreateLoad(ty, incoming, "code.slot.in"), slot);
+                locals[b.name] = slot;
+                localTypes[b.name] = b.type;
+                currentFuncParams.insert(b.name);
+                if (b.arrayLen > 0) arrayLengths[b.name] = b.arrayLen;
+            }
         }
         
         if (func->disposable) {
@@ -5829,10 +8653,14 @@ bool LLVMCodegen::codegen(Function* func) {
         }
 
         if (builder.GetInsertBlock() && !builder.GetInsertBlock()->getTerminator()) {
-            builder.CreateRet(createConstInt(context, llvm::Type::getInt64Ty(context), 0));
+            // EXP `valuable`: the implicit way out of a specialized copy is a way
+            // out for the copies it worked on too.
+            emitCodeBindingWriteBack(funcName);
+            builder.CreateRet(createConstInt(context, builder.getInt64Ty(), 0));
         }
     }
-    
+
+functionStateRestored:
     locals = savedLocals;
     localTypes = savedLocalTypes;
     arrayLengths = savedArrayLengths;
@@ -5841,7 +8669,14 @@ bool LLVMCodegen::codegen(Function* func) {
     disposableVars = savedDisposableVars; // EXP `disposable`
     interestVars = savedInterestVars; // EXP `interest`
     backroomVars = savedBackroomVars; // EXP `noclip`
+    zombieVars = savedZombieVars;     // EXP `zombie`
+    codeVarFragments = savedCodeVarFragments; // EXP `valuable`
+    wrongSlots = savedWrongSlots; // EXP `wrong`
+    wrongWatchedNames = savedWrongWatched; // EXP `wrong`
+    functionProducers = savedProducers; // EXP `wrong`
+    currentFuncParams = savedParams; // EXP `wrong`
     currentFuncName = savedCurrentFunc; // EXP `drift`
+    currentEnvCarried = savedEnvCarried;   // EXP `env`
     
     if (savedInsertBlock && savedInsertFunction) {
         builder.SetInsertPoint(savedInsertBlock);
@@ -5924,6 +8759,17 @@ bool LLVMCodegen::codegenOnce(Statement* stmt) {
     if (dynamic_cast<CenserStatement*>(stmt)) return codegen(dynamic_cast<CenserStatement*>(stmt)) != nullptr;
     if (dynamic_cast<NoclipStatement*>(stmt)) return codegen(dynamic_cast<NoclipStatement*>(stmt)) != nullptr;
     if (dynamic_cast<ShufflebackStatement*>(stmt)) return codegen(dynamic_cast<ShufflebackStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<ZombieStatement*>(stmt)) return codegen(dynamic_cast<ZombieStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<ValuableUseStatement*>(stmt)) return codegen(dynamic_cast<ValuableUseStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<DenyStatement*>(stmt)) return codegen(dynamic_cast<DenyStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<RegretStatement*>(stmt)) return codegen(dynamic_cast<RegretStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<DoubtStatement*>(stmt)) return codegen(dynamic_cast<DoubtStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<EnvBlockStatement*>(stmt)) return codegen(dynamic_cast<EnvBlockStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<EnvAssignStatement*>(stmt)) return codegen(dynamic_cast<EnvAssignStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<StructCreationStatement*>(stmt)) return codegen(dynamic_cast<StructCreationStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<MemberAssignmentStatement*>(stmt)) return codegen(dynamic_cast<MemberAssignmentStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<ReactionStatement*>(stmt)) return codegen(dynamic_cast<ReactionStatement*>(stmt)) != nullptr;
+    if (dynamic_cast<WrongStatement*>(stmt)) return codegen(dynamic_cast<WrongStatement*>(stmt)) != nullptr;
     if (dynamic_cast<FateStatement*>(stmt)) return codegen(dynamic_cast<FateStatement*>(stmt)) != nullptr;
     if (dynamic_cast<EnvyStatement*>(stmt)) return codegen(dynamic_cast<EnvyStatement*>(stmt)) != nullptr;
     if (dynamic_cast<TryExpectStatement*>(stmt)) return codegen(dynamic_cast<TryExpectStatement*>(stmt)) != nullptr;
@@ -6022,6 +8868,8 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     auto savedDisposableVars = disposableVars; // EXP `disposable`
     auto savedInterestVars = interestVars; // EXP `interest`
     auto savedBackroomVars = backroomVars; // EXP `noclip`
+    auto savedZombieVars = zombieVars;     // EXP `zombie`
+    auto savedCodeVarFragments = codeVarFragments; // EXP `valuable`
     auto savedLoopEndBB = loopEndBB;
     int savedActiveWindowId = activeWindowId;
     llvm::IRBuilderBase::InsertPoint savedInsertPoint = builder.saveIP();
@@ -6034,6 +8882,8 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     disposableVars.clear(); // EXP `disposable`: per-handler layer state
     interestVars.clear(); // EXP `interest`: per-handler rule state
     backroomVars.clear(); // EXP `noclip`: per-handler backroom state
+    zombieVars.clear();     // EXP `zombie`: per-handler plague state
+    codeVarFragments.clear(); // EXP `valuable`: per-handler code bindings
     loopEndBB = nullptr;
     activeWindowId = printWindowId;
     builder.SetInsertPoint(entryBB);
@@ -6060,6 +8910,8 @@ llvm::Function* LLVMCodegen::createButtonHandler(ButtonStatement* buttonStmt, in
     disposableVars = std::move(savedDisposableVars); // EXP `disposable`
     interestVars = std::move(savedInterestVars); // EXP `interest`
     backroomVars = std::move(savedBackroomVars); // EXP `noclip`
+    zombieVars = std::move(savedZombieVars);     // EXP `zombie`
+    codeVarFragments = std::move(savedCodeVarFragments); // EXP `valuable`
     loopEndBB = savedLoopEndBB;
     activeWindowId = savedActiveWindowId;
 
@@ -6860,7 +9712,23 @@ llvm::Value* LLVMCodegen::codegen(Expression* expr) {
     if (auto* e = dynamic_cast<ArrayRangeExpression*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<ArrayLiteral*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<ArrayIndexExpression*>(expr)) return codegen(e);
+    if (auto* e = dynamic_cast<MemberExpression*>(expr)) return codegen(e);
     if (auto* e = dynamic_cast<ValueExpression*>(expr)) return codegen(e);
+    if (auto* e = dynamic_cast<ValuableCallExpression*>(expr)) return codegen(e);
+    if (expr && looksLikeCodeExpr(expr)) {
+        // A code value has no runtime form: `print` renders it, and the
+        // assignment / juxtaposition paths intern it themselves. A body that
+        // only fails to be a factory because it calls itself gets told so.
+        if (Function* cur = lookupFunctionAst(funcAsts, currentFuncName, currentFuncName)) {
+            if (isSelfRecursiveFactoryCandidate(cur)) {
+                addError("valuable: 代码工厂 '" + cur->name +
+                         "' 不能调用自己：代码是在使用点展开的，没有运行期可以逐层展开它");
+                return nullptr;
+            }
+        }
+        addError("valuable: 代码值出现在不能使用代码的位置");
+        return nullptr;
+    }
     return nullptr;
 }
 

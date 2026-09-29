@@ -1,0 +1,109 @@
+#test {
+// 值也可以是代码
+// valuable { ... } 记下的是"还没执行的代码"，不是任何变量的值。
+// 创建处什么都不捕获：片段里的自由变量要到"使用点"才去那个作用域解析。
+// 所以同一段代码在不同地方跑，动的就是不同地方的变量。
+// 代码值可以拼接、重复、注入替换、当参数传给函数、由工厂返回。
+
+    fn step(A) {
+        A
+        A
+    }
+
+    fn twice(A) {
+        return A + A
+    }
+
+    fn main() {
+        // 记下代码，但什么都不执行
+        print("== 1. 记下代码，不执行 ==")
+        int x = 0
+        A = valuable { x = 3 }
+        print(x)      // 0：创建那一刻，代码还没有跑
+        A             // 语句位置写 A = 在这里把代码编译进来跑一次
+        print(x)      // 3
+        print("--")
+
+        // 创建处不捕获 —— 值留到使用点再取
+        print("== 2. 自由变量在使用点解析 ==")
+        int y = 10
+        B = valuable { y = y * 2 }
+        y = 1         // 创建之后、使用之前改掉 y
+        B
+        print(y)      // 2：用使用点那一刻的 y，不是创建时的 10
+        print("--")
+
+        // + 是编译期拼接，* n 是编译期重复
+        print("== 3. 拼接与重复：都发生在编译期 ==")
+        int c = 0
+        P = valuable { c = c + 1 }
+        Q = P + P     // 记号首尾相接：两段"c = c + 1"
+        R = P * 3     // 记号抄三遍
+        E = P * 0     // 空代码
+        Q
+        print(c)      // 2
+        R
+        print(c)      // 5（2 + 3）
+        E
+        print(c)      // 5（空代码什么都不做）
+        print("--")
+
+        // 一次运行、连着写、print 打出 code
+        print("== 4. 语句位置：一次运行 / 连着写 / 打印 ==")
+        int d = 0
+        S = valuable { d = d + 10 }
+        T = valuable { print("我是代码") }
+        S T { print("这一段接在后面") }
+        print(d)      // 10
+        print(S)      // code：代码值没有运行期样子
+        print("--")
+
+        // call valuable A for x 交出一个普通值
+        print("== 5. call valuable ... for x：把结果当普通值取出来 ==")
+        int e = 1
+        F = valuable { e = e + 41 }
+        int got = call valuable F for e
+        print(got)    // 42
+        print(e)      // 1：使用点原来的 e 不被写回
+        print("--")
+
+        // inject —— 记号级替换
+        print("== 6. inject：把片段里的自由变量换成给定的值 ==")
+        int g = 0
+        G = valuable { g = g + 10 }
+        H = inject 5 valuable G for g
+        H
+        print(g)      // 15
+        print("--")
+
+        // 代码当参数 —— 代码被编译进被调函数，变量属于调用点
+        print("== 7. 代码值作为函数参数 ==")
+        int h = 0
+        step(valuable { h = h + 3 })
+        print(h)      // 6：调用点交出一份副本，函数返回时写回
+        print("--")
+
+        // 同一段代码、两个使用点 —— 两份副本，各动各的变量
+        print("== 8. 同一段代码传两次：两份副本 ==")
+        int p = 0
+        int q = 100
+        step(valuable { p = p + 1 })
+        step(valuable { q = q + 1 })
+        print(p)      // 2
+        print(q)      // 102
+        print("--")
+
+        // 代码工厂 —— 调用它得到的是代码，不是运行期结果
+        print("== 9. 代码工厂：return 的是代码 ==")
+        int m = 0
+        int v = 0
+        M = twice(valuable { m = m + 1 })
+        M
+        print(m)      // 2：工厂把代码原样交回来，跑到这里才执行
+        K = valuable { print("工厂造的代码") } + valuable { v = v + 7 }
+        K
+        print(v)      // 7
+        print("--")
+        print("== done ==")
+    }
+}

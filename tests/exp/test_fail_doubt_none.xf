@@ -1,0 +1,7 @@
+#test {
+    fn main() {
+        int answer = 41
+        doubt answer
+        print(answer)
+    }
+}

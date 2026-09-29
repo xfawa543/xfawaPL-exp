@@ -1,0 +1,8 @@
+#test {
+    fn main() {
+        float a = 1.0
+        float b = 2.0
+        a <->[1] b
+        print(a)
+    }
+}

@@ -1,0 +1,7 @@
+#test {
+    // v12 error: inject may only bind a name the fragment really mentions
+    fn main() {
+        A = valuable { x = 1 }
+        B = inject 5 valuable A for y
+    }
+}

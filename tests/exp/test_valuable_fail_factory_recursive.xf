@@ -1,0 +1,10 @@
+#test {
+    // v23 a factory cannot call itself: there is no run time to expand it over
+    fn make() {
+        return valuable { print("m") } + make()
+    }
+    fn main() {
+        A = make()
+        A
+    }
+}

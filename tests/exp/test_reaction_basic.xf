@@ -1,0 +1,15 @@
+#test {
+    fn main() {
+        int a = 10
+        int b = 90
+        a <->[1] b
+        print(a)
+        print(b)
+        a <->[1] b
+        print(a)
+        print(b)
+        a <->[1] b
+        print(a)
+        print(b)
+    }
+}

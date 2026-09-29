@@ -1,0 +1,7 @@
+#test {
+    // v10 error: a name the fragment reads and nobody has
+    fn main() {
+        A = valuable { print(nothing) }
+        A
+    }
+}

@@ -1,0 +1,13 @@
+#test {
+    // v22 only a code factory may hand code back: a function that also does
+    //     runtime work has no way to return a code value
+    fn make(n) {
+        print(n)
+        B = valuable { print("b") }
+        return B
+    }
+    fn main() {
+        A = make(1)
+        A
+    }
+}

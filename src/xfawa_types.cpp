@@ -10,6 +10,7 @@ std::string varTypeToString(VarType type) {
         case VarType::FLOAT: return "float";
         case VarType::BOOL: return "bool";
         case VarType::STRING: return "string";
+        case VarType::STRUCT: return "struct";
         case VarType::ARRAY_INT: return "int[]";
         case VarType::ARRAY_LONG: return "long[]";
         case VarType::ARRAY_FLOAT: return "float[]";
@@ -57,6 +58,16 @@ std::string nodeTypeToString(NodeType type) {
         case NodeType::CENSER_STATEMENT: return "censer_statement";
         case NodeType::NOCLIP_STATEMENT: return "noclip_statement";
         case NodeType::SHUFFLEBACK_STATEMENT: return "shuffleback_statement";
+        case NodeType::WRONG_STATEMENT: return "wrong_statement";
+        case NodeType::ZOMBIE_STATEMENT: return "zombie_statement";
+        case NodeType::STRUCT_DECLARATION: return "struct_declaration";
+        case NodeType::STRUCT_CREATION_STATEMENT: return "struct_creation_statement";
+        case NodeType::MEMBER_EXPRESSION: return "member_expression";
+        case NodeType::MEMBER_ASSIGNMENT_STATEMENT: return "member_assignment_statement";
+        case NodeType::VALUABLE_USE_STATEMENT: return "valuable_use_statement";
+        case NodeType::VALUABLE_FRAGMENT_EXPRESSION: return "valuable_fragment_expression";
+        case NodeType::VALUABLE_CALL_EXPRESSION: return "valuable_call_expression";
+        case NodeType::VALUABLE_INJECT_EXPRESSION: return "valuable_inject_expression";
         case NodeType::VALUE_EXPRESSION: return "value_expression";
         case NodeType::STATEMENT: return "statement";
         case NodeType::PRINT_STATEMENT: return "print_statement";

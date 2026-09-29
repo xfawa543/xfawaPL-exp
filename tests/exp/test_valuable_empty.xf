@@ -1,0 +1,15 @@
+#test {
+    // v9 an empty code value is a valid no-op, and a code value never catches
+    //    the arithmetic plague
+    fn main() {
+        x = 3
+        A = valuable { x = x + 1 }
+        N = A * 0
+        N
+        print(x)
+        zombie x
+        B = valuable { x = x + 1 }
+        B
+        print(x)
+    }
+}

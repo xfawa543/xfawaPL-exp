@@ -1,0 +1,13 @@
+#test {
+    // v6 `inject` substitutes a free name at the token level
+    fn main() {
+        y = 0
+        A = valuable { y = y + 10 }
+        B = inject 5 valuable A for y
+        B
+        print(y)
+        C = inject y valuable A for y
+        C
+        print(y)
+    }
+}

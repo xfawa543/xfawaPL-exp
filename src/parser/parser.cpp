@@ -72,7 +72,8 @@ static const std::vector<std::pair<std::string, TokenType>>& autoFixCandidates()
         {"kill",   TokenType::KEYWORD_KILL},
         {"censer", TokenType::KEYWORD_CENSER},
         {"noclip", TokenType::KEYWORD_NOCLIP},
-        {"shuffleback", TokenType::KEYWORD_SHUFFLEBACK}
+        {"shuffleback", TokenType::KEYWORD_SHUFFLEBACK},
+        {"wrong", TokenType::KEYWORD_WRONG}
     };
     return map;
 }
@@ -173,6 +174,14 @@ std::unique_ptr<Program> Parser::parseProgram() {
             } else {
                 break;
             }
+        } else if (peek().is(TokenType::KEYWORD_TYPE)) {
+            // EXP structs: program-level `type 名字 { 类型 字段, ... }`.
+            auto sd = parseStructDeclaration();
+            if (sd) {
+                program->addStruct(std::move(sd));
+            } else {
+                break;
+            }
         } else if (peek().is(TokenType::PUNCTUATOR_HASH) || peek().is(TokenType::COLOR_LITERAL)) {
             auto mod = parseModule();
             if (mod) {
@@ -217,6 +226,8 @@ std::unique_ptr<Module> Parser::parseModule() {
     
     std::vector<std::unique_ptr<Function>> functions;
     std::vector<std::unique_ptr<ImportStatement>> imports;
+    // EXP structs: module-level `type 名字 { ... }` declarations.
+    std::vector<std::unique_ptr<StructDeclaration>> structs;
     // Note: class declarations are NOT allowed at module level in .xf files.
     // They can only be defined inside `window` blocks (per yfsj spec).
     // Only .xfw library files can define class declarations at top level.
@@ -234,6 +245,15 @@ std::unique_ptr<Module> Parser::parseModule() {
             // class declarations are not allowed at module level in .xf files
             addError("class declarations must be inside 'window' blocks in .xf files (only .xfw libraries allow top-level class)");
             return nullptr;
+        } else if (peek().is(TokenType::KEYWORD_TYPE)) {
+            // EXP structs: module-level `type 名字 { 类型 字段, ... }`.
+            auto sd = parseStructDeclaration();
+            if (sd) {
+                structs.push_back(std::move(sd));
+            } else {
+                addError("Failed to parse struct declaration in module '" + name + "'");
+                return nullptr;
+            }
         } else {
             std::unique_ptr<Function> func;
             if (peek().is(TokenType::KEYWORD_DRIFT)) {
@@ -263,6 +283,7 @@ std::unique_ptr<Module> Parser::parseModule() {
 
     auto module = std::make_unique<Module>(name, std::move(functions), loc);
     module->imports = std::move(imports);
+    module->structs = std::move(structs);
     return module;
 }
 
@@ -1068,15 +1089,26 @@ std::unique_ptr<Function> Parser::parseFunction() {
         return nullptr;
     }
     
+    // EXP `valuable`: remember the body's own tokens, so a call that passes a
+    // code value can splice that code into a fresh copy of this function.
+    size_t bodyStart = current;
     auto body = parseBlockStatement();
     if (!body) {
         return nullptr;
     }
-    
+
     if (ns.empty()) {
-        return std::make_unique<Function>(name, std::move(params), std::move(body), loc);
+        auto fn = std::make_unique<Function>(name, std::move(params), std::move(body), loc);
+        if (bodyStart <= current && current <= tokens.size()) {
+            fn->bodyTokens.assign(tokens.begin() + bodyStart, tokens.begin() + current);
+        }
+        return fn;
     } else {
-        return std::make_unique<Function>(name, ns, std::move(params), std::move(body), loc);
+        auto fn = std::make_unique<Function>(name, ns, std::move(params), std::move(body), loc);
+        if (bodyStart <= current && current <= tokens.size()) {
+            fn->bodyTokens.assign(tokens.begin() + bodyStart, tokens.begin() + current);
+        }
+        return fn;
     }
 }
 
@@ -1180,6 +1212,30 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         return parseNoclipStatement();
     } else if (peek().is(TokenType::KEYWORD_SHUFFLEBACK)) {
         return parseShufflebackStatement();
+    } else if (peek().is(TokenType::KEYWORD_WRONG)) {
+        return parseWrongStatement();
+    } else if (peek().is(TokenType::KEYWORD_ZOMBIE)) {
+        return parseZombieStatement();
+    } else if (peek().is(TokenType::KEYWORD_DENY)) {
+        return parseDenyStatement();
+    } else if (peek().is(TokenType::KEYWORD_REGRET)) {
+        return parseRegretStatement();
+    } else if (peek().is(TokenType::KEYWORD_DOUBT)) {
+        return parseDoubtStatement();
+    } else if (peek().is(TokenType::KEYWORD_ENV)) {
+        // `env 类型 参数名 { f, g }` declares the carrying set; `env 发出者 = 承受者`
+        // re-points a carried value. The type is a built-in type keyword or a
+        // struct name, and the next name must be the carried value's name.
+        bool typeAhead = peek(1).is(TokenType::IDENTIFIER) ||
+                         peek(1).is(TokenType::KEYWORD_INT) ||
+                         peek(1).is(TokenType::KEYWORD_LONG) ||
+                         peek(1).is(TokenType::KEYWORD_FLOAT) ||
+                         peek(1).is(TokenType::KEYWORD_BOOL) ||
+                         peek(1).is(TokenType::KEYWORD_STRING);
+        if (typeAhead && peek(2).is(TokenType::IDENTIFIER)) {
+            return parseEnvBlockStatement();
+        }
+        return parseEnvAssignStatement();
     } else if (peek().is(TokenType::KEYWORD_INT)) {
         advance();
         return parseTypedAssignmentStatement(VarType::INT);
@@ -1197,6 +1253,10 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         return parseTypedAssignmentStatement(VarType::STRING);
     } else if (peek().is(TokenType::PUNCTUATOR_LBRACE)) {
         return parseBlockStatement();
+    } else if (peek().is(TokenType::KEYWORD_VALUABLE)) {
+        // EXP `valuable`: a code value written out in full can be run directly,
+        // the same way naming a code variable runs it: `valuable { x = 1 }`.
+        return parseValuableUseStatement();
     } else if (peek().is(TokenType::IDENTIFIER)) {
         // EXP auto-fix: detect a plausible keyword typo, and — only after the
         // user explicitly confirms — correct it. Never silently modify source.
@@ -1208,6 +1268,12 @@ std::unique_ptr<Statement> Parser::parseStatement() {
                 // skipped and the typo becomes a catchable parse error (recorded
                 // by parseTryExpectStatement's error recovery, swallowed).
                 if (inTryBody) {
+                    return nullptr;
+                }
+                // EXP `valuable`: re-parsed code has no console to ask on, so a
+                // typo is a plain error of the fragment's use point.
+                if (inValuableFragment) {
+                    addError("Unknown statement in valuable code: " + peek().text);
                     return nullptr;
                 }
                 std::cout << "Unknown statement: " << peek().text << std::endl;
@@ -1231,6 +1297,18 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         // 1. identifier(  - direct function call
         // 2. identifier:  - namespace:function() syntax
         // 3. identifier.  - block.function() syntax
+        // EXP member assignment `a.b op= v` / `a.b = v`: recognised before the
+        // `identifier.` call branch so the base is not dropped.
+        if (peek(0).is(TokenType::IDENTIFIER) && peek(1).is(TokenType::PUNCTUATOR_DOT) &&
+            peek(2).is(TokenType::IDENTIFIER) &&
+            (peek(3).is(TokenType::PUNCTUATOR_EQUAL) ||
+             peek(3).is(TokenType::PUNCTUATOR_MINUS_EQUAL) ||
+             peek(3).is(TokenType::PUNCTUATOR_PLUS_EQUAL) ||
+             peek(3).is(TokenType::PUNCTUATOR_STAR_EQUAL) ||
+             peek(3).is(TokenType::PUNCTUATOR_SLASH_EQUAL) ||
+             peek(3).is(TokenType::PUNCTUATOR_PERCENT_EQUAL))) {
+            return parseMemberAssignmentStatement();
+        }
         if (peek(1).is(TokenType::PUNCTUATOR_LPAREN) ||
             peek(1).is(TokenType::PUNCTUATOR_COLON) ||
             peek(1).is(TokenType::PUNCTUATOR_DOT)) {
@@ -1245,9 +1323,43 @@ std::unique_ptr<Statement> Parser::parseStatement() {
         if (peek(1).is(TokenType::PUNCTUATOR_LBRACKET)) {
             return parseIndexedAssignmentStatement();
         }
+        // EXP `<->[K]`: `a <->[1] 90` starts like an assignment but continues with
+        // a reaction, so it has to be recognised before the expression fallback.
+        if (peek(1).is(TokenType::PUNCTUATOR_REACTION)) {
+            return parseReactionStatement();
+        }
+        // EXP compound assignment: `x -= 1` / `x += v` / `x *= ...`.
+        if (peek(1).is(TokenType::PUNCTUATOR_MINUS_EQUAL) ||
+            peek(1).is(TokenType::PUNCTUATOR_PLUS_EQUAL) ||
+            peek(1).is(TokenType::PUNCTUATOR_STAR_EQUAL) ||
+            peek(1).is(TokenType::PUNCTUATOR_SLASH_EQUAL) ||
+            peek(1).is(TokenType::PUNCTUATOR_PERCENT_EQUAL)) {
+            return parseCompoundAssignmentStatement();
+        }
+        // EXP structs: `类型名 变量 = { 值, ... }` creates a struct value. It
+        // starts like a valuable use (`A B`) so it is recognised first, but only
+        // a name that a `type` declaration introduced counts.
+        if (structNames.count(peek().text) && peek(1).is(TokenType::IDENTIFIER) &&
+            peek(2).is(TokenType::PUNCTUATOR_EQUAL)) {
+            return parseStructCreationStatement();
+        }
         // Note: Xraphics object definitions (name = x3d.box(...)) are only allowed
         // inside class blocks (parseClassDeclarationStatement), not in regular statements.
         // Class blocks themselves are only allowed inside window blocks.
+        //
+        // EXP `valuable`: a statement that neither assigns nor calls may still be a
+        // code value being executed. `A B { ... }` juxtaposes code values left to
+        // right and splices the raw block at the end of the merged fragment.
+        if (peek(1).is(TokenType::IDENTIFIER) || peek(1).is(TokenType::PUNCTUATOR_LBRACE)) {
+            return parseValuableUseStatement();
+        }
+        if (!peek(1).is(TokenType::PUNCTUATOR_EQUAL) &&
+            !peek(1).is(TokenType::PUNCTUATOR_SEMICOLON)) {
+            SourceLocation exprLoc = peek().location;
+            auto expr = parseExpression();
+            if (!expr) return nullptr;
+            return std::make_unique<ExpressionStatement>(std::move(expr), exprLoc);
+        }
         return parseAssignmentStatement();
     } else {
         addError("Unexpected token: " + peek().toString());
@@ -1292,6 +1404,164 @@ std::unique_ptr<PrintStatement> Parser::parsePrintStatement() {
     return printStmt;
 }
 
+// EXP structs: module-level `type 名字 { 类型 字段, ... }`. Fields are basic
+// types only, separated by commas (newlines also work since they are skipped).
+std::unique_ptr<StructDeclaration> Parser::parseStructDeclaration() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_TYPE)) return nullptr;
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected struct name after 'type'");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+    structNames.insert(name);
+    if (!consume(TokenType::PUNCTUATOR_LBRACE)) {
+        addError("Expected '{' after struct name");
+        return nullptr;
+    }
+    std::vector<std::pair<std::string, VarType>> fields;
+    while (!isAtEnd() && !peek().is(TokenType::PUNCTUATOR_RBRACE)) {
+        VarType ft = VarType::UNKNOWN;
+        if (peek().is(TokenType::KEYWORD_INT)) ft = VarType::INT;
+        else if (peek().is(TokenType::KEYWORD_LONG)) ft = VarType::LONG;
+        else if (peek().is(TokenType::KEYWORD_FLOAT)) ft = VarType::FLOAT;
+        else if (peek().is(TokenType::KEYWORD_BOOL)) ft = VarType::BOOL;
+        else if (peek().is(TokenType::KEYWORD_STRING)) ft = VarType::STRING;
+        else {
+            addError("Expected a basic field type (int/long/float/bool/string) in struct '" +
+                     name + "', got: " + peek().text);
+            return nullptr;
+        }
+        advance();
+        if (!consume(TokenType::IDENTIFIER)) {
+            addError("Expected field name after field type in struct '" + name + "'");
+            return nullptr;
+        }
+        fields.push_back({peek(-1).text, ft});
+        structFieldNames.insert(peek(-1).text);
+        if (consume(TokenType::PUNCTUATOR_COMMA)) continue;
+        if (peek().is(TokenType::PUNCTUATOR_RBRACE)) break;
+        // Field declarations may also be separated by newlines alone; anything
+        // else is a mistake.
+        if (!peek().is(TokenType::KEYWORD_INT) && !peek().is(TokenType::KEYWORD_LONG) &&
+            !peek().is(TokenType::KEYWORD_FLOAT) && !peek().is(TokenType::KEYWORD_BOOL) &&
+            !peek().is(TokenType::KEYWORD_STRING)) {
+            addError("Expected ',' or a new field in struct '" + name + "'");
+            return nullptr;
+        }
+    }
+    if (!consume(TokenType::PUNCTUATOR_RBRACE)) {
+        addError("Expected '}' to close struct '" + name + "'");
+        return nullptr;
+    }
+    return std::make_unique<StructDeclaration>(name, std::move(fields), loc);
+}
+
+// EXP compound assignment: `x -= 1` / `x += v` / `x *= ...`.
+std::unique_ptr<AssignmentStatement> Parser::parseCompoundAssignmentStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected variable name before compound assignment");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+    AssignOp op = AssignOp::EQ;
+    if (peek().is(TokenType::PUNCTUATOR_PLUS_EQUAL)) op = AssignOp::PLUS_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_MINUS_EQUAL)) op = AssignOp::MINUS_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_STAR_EQUAL)) op = AssignOp::STAR_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_SLASH_EQUAL)) op = AssignOp::SLASH_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_PERCENT_EQUAL)) op = AssignOp::PERCENT_EQ;
+    advance();
+    auto expr = parseExpression();
+    if (!expr) return nullptr;
+    // EXP structs / env: a bare field name is an implicit `this` write, not an
+    // implicit local declaration. The codegen decides whether a carried struct
+    // really owns the field.
+    bool isField = structFieldNames.count(name) > 0;
+    bool alreadyDeclared = isVariableDeclared(name);
+    if (!alreadyDeclared && !isField) {
+        addWarning("Implicit type declaration for variable '" + name + "'. Consider using explicit type declaration (e.g., int " + name + " = ...)");
+        declareVariable(name);
+    }
+    auto stmt = std::make_unique<AssignmentStatement>(name, std::move(expr), loc);
+    stmt->isReassignment = alreadyDeclared;
+    stmt->op = op;
+    return stmt;
+}
+
+// EXP member assignment: `a.b = v` / `a.b -= v` — the base is a struct variable.
+std::unique_ptr<MemberAssignmentStatement> Parser::parseMemberAssignmentStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::IDENTIFIER)) return nullptr;
+    std::string baseName = peek(-1).text;
+    if (!consume(TokenType::PUNCTUATOR_DOT)) {
+        addError("Expected '.' after the base name");
+        return nullptr;
+    }
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected field name after '.'");
+        return nullptr;
+    }
+    std::string field = peek(-1).text;
+    AssignOp op = AssignOp::EQ;
+    if (peek().is(TokenType::PUNCTUATOR_PLUS_EQUAL)) op = AssignOp::PLUS_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_MINUS_EQUAL)) op = AssignOp::MINUS_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_STAR_EQUAL)) op = AssignOp::STAR_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_SLASH_EQUAL)) op = AssignOp::SLASH_EQ;
+    else if (peek().is(TokenType::PUNCTUATOR_PERCENT_EQUAL)) op = AssignOp::PERCENT_EQ;
+    else if (!peek().is(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after the field name");
+        return nullptr;
+    }
+    if (peek().is(TokenType::PUNCTUATOR_EQUAL) ||
+        peek().is(TokenType::PUNCTUATOR_MINUS_EQUAL) ||
+        peek().is(TokenType::PUNCTUATOR_PLUS_EQUAL) ||
+        peek().is(TokenType::PUNCTUATOR_STAR_EQUAL) ||
+        peek().is(TokenType::PUNCTUATOR_SLASH_EQUAL) ||
+        peek().is(TokenType::PUNCTUATOR_PERCENT_EQUAL)) {
+        advance();
+    }
+    auto expr = parseExpression();
+    if (!expr) return nullptr;
+    auto base = std::make_unique<VariableExpression>(baseName, loc);
+    return std::make_unique<MemberAssignmentStatement>(std::move(base), field, op,
+                                                       std::move(expr), loc);
+}
+
+// EXP struct creation: `类型名 变量 = { 值, ... }` (positional, in field order).
+std::unique_ptr<StructCreationStatement> Parser::parseStructCreationStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::IDENTIFIER)) return nullptr;
+    std::string structName = peek(-1).text;
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name after the struct type");
+        return nullptr;
+    }
+    std::string varName = peek(-1).text;
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after the variable name in struct creation");
+        return nullptr;
+    }
+    if (!consume(TokenType::PUNCTUATOR_LBRACE)) {
+        addError("Expected '{' with the field values in struct creation");
+        return nullptr;
+    }
+    std::vector<std::unique_ptr<Expression>> values;
+    while (!isAtEnd() && !peek().is(TokenType::PUNCTUATOR_RBRACE)) {
+        auto v = parseExpression();
+        if (!v) return nullptr;
+        values.push_back(std::move(v));
+        if (consume(TokenType::PUNCTUATOR_COMMA)) continue;
+        break;
+    }
+    if (!consume(TokenType::PUNCTUATOR_RBRACE)) {
+        addError("Expected '}' to close the struct creation");
+        return nullptr;
+    }
+    declareVariable(varName);
+    return std::make_unique<StructCreationStatement>(varName, structName, std::move(values), loc);
+}
+
 std::unique_ptr<AssignmentStatement> Parser::parseAssignmentStatement() {
     SourceLocation loc = peek().location;
     
@@ -1305,7 +1575,6 @@ std::unique_ptr<AssignmentStatement> Parser::parseAssignmentStatement() {
         addError("Expected '=' after variable name");
         return nullptr;
     }
-    
     bool isValuePrefix = false;
     if (peek().is(TokenType::IDENTIFIER) && peek().text == "value") {
         TokenType nextType = peek(1).type;
@@ -1326,8 +1595,11 @@ std::unique_ptr<AssignmentStatement> Parser::parseAssignmentStatement() {
         expr = std::make_unique<ValueExpression>(std::move(expr), loc);
     }
     
+    // EXP structs / env: a bare field name is an implicit `this` write, not an
+    // implicit local declaration (see parseCompoundAssignmentStatement).
+    bool isField = structFieldNames.count(name) > 0;
     bool alreadyDeclared = isVariableDeclared(name);
-    if (!alreadyDeclared) {
+    if (!alreadyDeclared && !isField) {
         addWarning("Implicit type declaration for variable '" + name + "'. Consider using explicit type declaration (e.g., int " + name + " = ...)");
         declareVariable(name);
     }
@@ -1455,6 +1727,216 @@ std::unique_ptr<LieStatement> Parser::parseLieStatement() {
     }
     
     return std::make_unique<LieStatement>(name, std::move(expr), std::move(body), loc);
+}
+
+std::unique_ptr<WrongStatement> Parser::parseWrongStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_WRONG)) {
+        return nullptr;
+    }
+
+    auto cond = parseExpression();
+    if (!cond) {
+        return nullptr;
+    }
+
+    return std::make_unique<WrongStatement>(std::move(cond), loc);
+}
+
+// EXP `deny`: two forms, both additive.
+//   deny answer = 41     -> the fact "answer == 41" stops being acknowledged
+//   deny "2 + 2 = 5"     -> takes a `believe` rule back
+std::unique_ptr<Statement> Parser::parseDenyStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_DENY)) {
+        return nullptr;
+    }
+
+    if (consume(TokenType::STRING_LITERAL)) {
+        return std::make_unique<DenyStatement>(peek(-1).text, loc);
+    }
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name or a string after 'deny', e.g. deny answer = 41");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after the variable name in 'deny', e.g. deny answer = 41");
+        return nullptr;
+    }
+
+    if (peek().is(TokenType::STRING_LITERAL) || !peek().is(TokenType::NUMBER_LITERAL)) {
+        addError("'deny " + name + " =' needs an integer value, e.g. deny " + name + " = 41");
+        return nullptr;
+    }
+    advance();
+    int64_t value = std::stoll(peek(-1).text);
+
+    return std::make_unique<DenyStatement>(name, value, loc);
+}
+
+// EXP `regret`: `regret "1 + 1 = 3"` takes one belief back, `regret all` takes
+// every belief the program holds.
+std::unique_ptr<Statement> Parser::parseRegretStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_REGRET)) {
+        return nullptr;
+    }
+
+    if (peek().is(TokenType::IDENTIFIER) && peek().text == "all") {
+        advance();
+        return std::make_unique<RegretStatement>(true, loc);
+    }
+
+    if (consume(TokenType::STRING_LITERAL)) {
+        return std::make_unique<RegretStatement>(peek(-1).text, loc);
+    }
+
+    addError("Expected a string or 'all' after 'regret', e.g. regret \"1 + 1 = 3\" / regret all");
+    return nullptr;
+}
+
+// EXP `doubt x`: break the lie currently covering x. Rewritten by the lie pass.
+std::unique_ptr<Statement> Parser::parseDoubtStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_DOUBT)) {
+        return nullptr;
+    }
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name after 'doubt', e.g. doubt answer");
+        return nullptr;
+    }
+
+    return std::make_unique<DoubtStatement>(peek(-1).text, loc);
+}
+
+// EXP `env 类型 参数名 { f, g, h }`: those functions silently carry 参数名.
+std::unique_ptr<Statement> Parser::parseEnvBlockStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_ENV)) {
+        return nullptr;
+    }
+    // The type is a built-in type keyword or a struct name.
+    std::string typeName;
+    if (peek().is(TokenType::KEYWORD_INT) || peek().is(TokenType::KEYWORD_LONG) ||
+        peek().is(TokenType::KEYWORD_FLOAT) || peek().is(TokenType::KEYWORD_BOOL) ||
+        peek().is(TokenType::KEYWORD_STRING) || peek().is(TokenType::IDENTIFIER)) {
+        typeName = peek().text;
+        advance();
+    } else {
+        addError("Expected a type name after 'env', e.g. env 角色 发出者 { 攻击, 防御 }");
+        return nullptr;
+    }
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected the carried parameter's name in 'env " + typeName + " <name> { ... }'");
+        return nullptr;
+    }
+    std::string paramName = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_LBRACE)) {
+        addError("Expected '{' in 'env " + typeName + " " + paramName + " { ... }'");
+        return nullptr;
+    }
+
+    std::vector<std::string> functions;
+    if (!peek().is(TokenType::PUNCTUATOR_RBRACE)) {
+        while (true) {
+            if (!consume(TokenType::IDENTIFIER)) {
+                addError("Expected a function name in 'env " + typeName + " " + paramName + " { ... }'");
+                return nullptr;
+            }
+            functions.push_back(peek(-1).text);
+            if (consume(TokenType::PUNCTUATOR_COMMA)) continue;
+            break;
+        }
+    }
+    if (!consume(TokenType::PUNCTUATOR_RBRACE)) {
+        addError("Expected '}' to close the function list of 'env " + typeName + " " + paramName + "'");
+        return nullptr;
+    }
+    if (functions.empty()) {
+        addError("'env " + typeName + " " + paramName + "' needs at least one function name");
+        return nullptr;
+    }
+
+    return std::make_unique<EnvBlockStatement>(typeName, paramName, std::move(functions), loc);
+}
+
+// EXP `env 发出者 = 承受者`: re-point the carried value.
+std::unique_ptr<Statement> Parser::parseEnvAssignStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::KEYWORD_ENV)) {
+        return nullptr;
+    }
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected the carried parameter's name after 'env', e.g. env 发出者 = 承受者");
+        return nullptr;
+    }
+    std::string name = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_EQUAL)) {
+        addError("Expected '=' after 'env " + name + "'");
+        return nullptr;
+    }
+
+    auto expr = parseExpression();
+    if (!expr) {
+        return nullptr;
+    }
+
+    return std::make_unique<EnvAssignStatement>(name, std::move(expr), loc);
+}
+
+// EXP `a <->[K] b`: one reaction step, K is an integer ratio (b/a at balance).
+std::unique_ptr<Statement> Parser::parseReactionStatement() {
+    SourceLocation loc = peek().location;
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        return nullptr;
+    }
+    std::string left = peek(-1).text;
+
+    if (!consume(TokenType::PUNCTUATOR_REACTION)) {
+        return nullptr;
+    }
+    if (!consume(TokenType::PUNCTUATOR_LBRACKET)) {
+        addError("Expected '[' and the equilibrium ratio in '" + left + " <->[K] ...'");
+        return nullptr;
+    }
+    if (!consume(TokenType::NUMBER_LITERAL)) {
+        addError("Expected the equilibrium ratio in '" + left + " <->[K] ...' (an integer)");
+        return nullptr;
+    }
+    int64_t k = std::stoll(peek(-1).text);
+    if (!consume(TokenType::PUNCTUATOR_RBRACKET)) {
+        addError("Expected ']' after the equilibrium ratio in '" + left + " <->[K] ...'");
+        return nullptr;
+    }
+    if (k < 0) {
+        addError("The equilibrium ratio in '" + left + " <->[K] ...' must not be negative");
+        return nullptr;
+    }
+
+    if (!consume(TokenType::IDENTIFIER)) {
+        addError("Expected the second variable name in '" + left + " <->[K] ...'");
+        return nullptr;
+    }
+    std::string right = peek(-1).text;
+    if (right == left) {
+        addError("'" + left + " <->[K] " + right + "' needs two different variables");
+        return nullptr;
+    }
+
+    return std::make_unique<ReactionStatement>(left, right, k, loc);
 }
 
 std::unique_ptr<UnStatement> Parser::parseUnStatement() {
@@ -1951,6 +2433,139 @@ std::unique_ptr<Statement> Parser::parseNoclipStatement() {
     std::string name = peek().text;
     advance();
     return std::make_unique<NoclipStatement>(name, loc);
+}
+
+// EXP `zombie a`: variable `a` becomes a plague for every later arithmetic step.
+std::unique_ptr<Statement> Parser::parseZombieStatement() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_ZOMBIE)) return nullptr;
+    if (!peek().is(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name after 'zombie'");
+        return nullptr;
+    }
+    std::string name = peek().text;
+    advance();
+    return std::make_unique<ZombieStatement>(name, loc);
+}
+
+// EXP `valuable`: capture `{ ... }` as a raw token slice without parsing it. The
+// slice may be incomplete on purpose; it only has to parse once spliced.
+bool Parser::captureBraceBlock(std::vector<Token>& out, bool includeBraces) {
+    if (!consume(TokenType::PUNCTUATOR_LBRACE)) {
+        addError("Expected '{' to open a valuable code block");
+        return false;
+    }
+    if (includeBraces) out.push_back(peek(-1));
+    int depth = 1;
+    while (!isAtEnd()) {
+        if (peek().is(TokenType::PUNCTUATOR_LBRACE)) {
+            depth++;
+        } else if (peek().is(TokenType::PUNCTUATOR_RBRACE)) {
+            depth--;
+            if (depth == 0) {
+                if (includeBraces) out.push_back(peek());
+                advance();
+                return true;
+            }
+        }
+        out.push_back(peek());
+        advance();
+    }
+    addError("Unclosed '{' in a valuable code block");
+    return false;
+}
+
+std::unique_ptr<Expression> Parser::parseValuableFragmentExpression() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_VALUABLE)) return nullptr;
+    std::vector<Token> inner;
+    if (!captureBraceBlock(inner, false)) return nullptr;
+    return std::make_unique<ValuableFragmentExpression>(std::move(inner), loc);
+}
+
+std::unique_ptr<Expression> Parser::parseValuableCallExpression() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_CALL)) return nullptr;
+    if (!consume(TokenType::KEYWORD_VALUABLE)) {
+        addError("Expected 'valuable' after 'call'");
+        return nullptr;
+    }
+    auto base = parseAdditive();
+    if (!base) return nullptr;
+    if (!consume(TokenType::KEYWORD_FOR)) {
+        addError("Expected 'for <name>' in 'call valuable ... for <name>'");
+        return nullptr;
+    }
+    if (!peek().is(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name after 'for'");
+        return nullptr;
+    }
+    std::string target = peek().text;
+    advance();
+    return std::make_unique<ValuableCallExpression>(std::move(base), target, loc);
+}
+
+std::unique_ptr<Expression> Parser::parseValuableInjectExpression() {
+    SourceLocation loc = peek().location;
+    if (!consume(TokenType::KEYWORD_INJECT)) return nullptr;
+    auto target = parseAdditive();
+    if (!target) return nullptr;
+    if (!consume(TokenType::KEYWORD_VALUABLE)) {
+        addError("Expected 'valuable' after the inject target");
+        return nullptr;
+    }
+    auto base = parseAdditive();
+    if (!base) return nullptr;
+    if (!consume(TokenType::KEYWORD_FOR)) {
+        addError("Expected 'for <name>' in 'inject ... valuable ... for <name>'");
+        return nullptr;
+    }
+    if (!peek().is(TokenType::IDENTIFIER)) {
+        addError("Expected a variable name after 'for'");
+        return nullptr;
+    }
+    std::string freeName = peek().text;
+    advance();
+    return std::make_unique<ValuableInjectExpression>(std::move(target),
+                                                      std::move(base), freeName, loc);
+}
+
+// EXP `valuable` in statement position: juxtapose code values left to right and
+// splice the raw `{ ... }` block that closes the chain, if there is one.
+std::unique_ptr<Statement> Parser::parseValuableUseStatement() {
+    SourceLocation loc = peek().location;
+    auto stmt = std::make_unique<ValuableUseStatement>(loc);
+    while (true) {
+        auto part = parseAdditive();
+        if (!part) return nullptr;
+        stmt->parts.push_back(std::move(part));
+        if (!peek().is(TokenType::IDENTIFIER) || peek().text == "in") break;
+        // `A f(x)`, `A x = 1` and `A x: int = 1` are the statement that follows,
+        // not one more piece of the chain
+        const Token& after = peek(1);
+        if (after.is(TokenType::PUNCTUATOR_LPAREN) || after.is(TokenType::PUNCTUATOR_EQUAL) ||
+            after.is(TokenType::PUNCTUATOR_COLON)) {
+            break;
+        }
+    }
+    if (peek().is(TokenType::PUNCTUATOR_LBRACE) &&
+        !captureBraceBlock(stmt->blockTokens, true)) {
+        return nullptr;
+    }
+    return stmt;
+}
+
+// EXP `valuable`: re-parse a captured fragment at its use point.
+std::vector<std::unique_ptr<Statement>> Parser::parseFragmentStatements() {
+    setValuableFragmentMode();
+    std::vector<std::unique_ptr<Statement>> out;
+    while (!isAtEnd()) {
+        size_t before = current;
+        auto stmt = parseStatement();
+        if (stmt) out.push_back(std::move(stmt));
+        if (current == before) advance(); // never spin on an unparsable token
+    }
+    return out;
 }
 
 // EXP `shuffleback`: reshuffle the values of all backroom variables.
@@ -2450,6 +3065,17 @@ std::unique_ptr<Expression> Parser::parsePrimary() {
         return std::make_unique<StringLiteral>(value, peek(-1).location);
     }
     
+    // EXP `valuable { ... }` / `call valuable ... for x` / `inject y valuable ... for x`
+    if (peek().is(TokenType::KEYWORD_VALUABLE)) {
+        return parseValuableFragmentExpression();
+    }
+    if (peek().is(TokenType::KEYWORD_CALL)) {
+        return parseValuableCallExpression();
+    }
+    if (peek().is(TokenType::KEYWORD_INJECT)) {
+        return parseValuableInjectExpression();
+    }
+    
     if (peek().is(TokenType::PUNCTUATOR_LBRACKET)) {
         return parseArrayLiteral();
     }
@@ -2495,9 +3121,11 @@ std::unique_ptr<Expression> Parser::parsePrimary() {
         }
 
         std::string blockName;
+        bool dotted = false;
 
         // 支持 block.function() 语法（使用点号）
         if (consume(TokenType::PUNCTUATOR_DOT)) {
+            dotted = true;
             blockName = name;
             if (!consume(TokenType::IDENTIFIER)) {
                 addError("Expected function name after block name '.'");
@@ -2653,6 +3281,15 @@ std::unique_ptr<Expression> Parser::parsePrimary() {
             return std::make_unique<ArrayRangeExpression>(std::move(varExprForRange), std::move(startExpr), std::move(endExpr), loc);
         }
         
+        // EXP member access: `a.field` (no parens, not a mouse/keyboard/camera
+        // block). The base is kept instead of being dropped; a bare field of a
+        // carried struct resolves at codegen (implicit this).
+        if (dotted) {
+            auto baseExpr = std::make_unique<VariableExpression>(blockName, loc);
+            auto member = std::make_unique<MemberExpression>(std::move(baseExpr), name, loc);
+            return parsePostfix(std::move(member));
+        }
+
         auto varExpr = std::make_unique<VariableExpression>(name, loc);
         return parsePostfix(std::move(varExpr));
     }

@@ -56,7 +56,7 @@ namespace xfawa {
     int g_debug_global = 0;
 }
 
-const char* COMPILER_VERSION = "1.0.0-a.19";
+const char* COMPILER_VERSION = "1.0.0-exp.2";
 const char* MODS_KERNEL_VERSION = "mods-a-1.0.3";
 
 static xfawa::LogLanguage g_log_language = xfawa::LogLanguage::EN;
@@ -494,12 +494,28 @@ static void lieRewriteLeaf(xfawa::Statement* stmt, const std::unordered_map<std:
         if (f->iterable) f->iterable = lieRewriteExpr(std::move(f->iterable), lies);
     } else if (auto* es = dynamic_cast<xfawa::ExpressionStatement*>(stmt)) {
         if (es->expr) es->expr = lieRewriteExpr(std::move(es->expr), lies);
+    } else if (auto* w = dynamic_cast<xfawa::WrongStatement*>(stmt)) {
+        // EXP `wrong`: inside a lie scope the condition observes the lied values,
+        // so any wrong targeting a lied variable degenerates to a constant
+        // condition with no live participants (compile error) — a lied value
+        // can never be "wrong" for the liar.
+        if (w->condition) w->condition = lieRewriteExpr(std::move(w->condition), lies);
     }
 }
 
 static void lieRewriteBlock(xfawa::BlockStatement* block, std::unordered_map<std::string, int64_t> lies) {
     for (auto& s : block->statements) {
-        if (auto* lie = dynamic_cast<xfawa::LieStatement*>(s.get())) {
+        if (auto* doubt = dynamic_cast<xfawa::DoubtStatement*>(s.get())) {
+            // EXP `doubt x`: break the lie that is currently covering x. The rest
+            // of this block (and any scope nested in it) reads the real value
+            // again. A doubt with no lie to break is left unmarked so codegen can
+            // reject it — a transform-stage report would not stop compilation.
+            auto it = lies.find(doubt->name);
+            if (it != lies.end()) {
+                lies.erase(it);
+                doubt->broken = true;
+            }
+        } else if (auto* lie = dynamic_cast<xfawa::LieStatement*>(s.get())) {
             // Block-scoped lie: only reads inside `body` observe the falsified
             // value. The outer scope (and anything after the `}`) is unaffected.
             if (auto* num = dynamic_cast<xfawa::NumberLiteral*>(lie->value.get())) {
@@ -564,6 +580,297 @@ static void applyLieTransform(xfawa::Program* program) {
     for (auto& mod : program->modules) {
         for (auto& fn : mod->functions) {
             if (fn->body) lieRewriteBlock(fn->body.get(), {});
+        }
+    }
+}
+
+// ---- EXP `env`: functions that carry one value nobody has to pass ------------
+// `env 类型 参数名 { f, g, h }` gives the listed functions one extra parameter
+// (`参数名`). After the pass the extra parameter is an ordinary first parameter,
+// so nothing in codegen has to know about `env`; what the pass leaves behind is
+// the part users can actually see: a call from one carrying function to another
+// passes the current value on by itself. Entering the set from the outside still
+// passes it once, as the first argument.
+
+namespace env_pass {
+
+struct World {
+    // function -> carried params (paramName, typeName) in block declaration
+    // order. A function may sit in several blocks and carries one value per
+    // block it is listed in.
+    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> envCarriedOf;
+    std::unordered_map<std::string, std::string> envTypeOf;   // carried name -> type name
+    std::unordered_map<std::string, xfawa::Function*> functionByName;
+};
+
+using CarriedList = std::vector<std::pair<std::string, std::string>>;
+
+void walkExpr(xfawa::Expression* e, const World& w, const CarriedList& carried);
+
+void injectCall(xfawa::CallExpression* c, const World& w, const CarriedList& carried) {
+    auto callerHas = [&carried](const std::string& n) {
+        for (const auto& cp : carried) if (cp.first == n) return true;
+        return false;
+    };
+    if (c->ns.empty() && !carried.empty()) {
+        auto it = w.envCarriedOf.find(c->name);
+        // Only a call into the carrying set gets values for free.
+        if (it != w.envCarriedOf.end() && c->name != "print") {
+            const auto& calleeCarried = it->second;
+            bool anyShared = false;
+            for (const auto& cp : calleeCarried) {
+                if (callerHas(cp.first)) { anyShared = true; break; }
+            }
+            if (anyShared) {
+                // Build the callee's argument list in its own parameter order:
+                // each carried param is either injected (the caller carries the
+                // same name) or filled by the next written argument; the rest
+                // of the written arguments go to the declared parameters.
+                std::vector<std::unique_ptr<xfawa::Expression>> args;
+                size_t wi = 0;
+                for (const auto& cp : calleeCarried) {
+                    if (callerHas(cp.first)) {
+                        args.push_back(std::make_unique<xfawa::VariableExpression>(cp.first));
+                    } else if (wi < c->args.size()) {
+                        args.push_back(std::move(c->args[wi++]));
+                    } else {
+                        // A needed written argument is missing: leave the call
+                        // untouched so the codegen's arity check reports it.
+                        args.clear();
+                        break;
+                    }
+                }
+                if (!args.empty() || calleeCarried.empty()) {
+                    for (; wi < c->args.size(); wi++) args.push_back(std::move(c->args[wi]));
+                    c->args = std::move(args);
+                }
+            }
+        }
+    }
+    for (auto& a : c->args) walkExpr(a.get(), w, carried);
+}
+
+void walkExpr(xfawa::Expression* e, const World& w, const CarriedList& carried) {
+    if (!e) return;
+    if (auto* c = dynamic_cast<xfawa::CallExpression*>(e)) { injectCall(c, w, carried); return; }
+    if (auto* m = dynamic_cast<xfawa::MemberExpression*>(e)) { walkExpr(m->base.get(), w, carried); return; }
+    if (auto* b = dynamic_cast<xfawa::BinaryOp*>(e)) {
+        walkExpr(b->left.get(), w, carried);
+        walkExpr(b->right.get(), w, carried);
+        return;
+    }
+    if (auto* u = dynamic_cast<xfawa::UnaryOp*>(e)) { walkExpr(u->expr.get(), w, carried); return; }
+    if (auto* i = dynamic_cast<xfawa::ArrayIndexExpression*>(e)) {
+        walkExpr(i->array.get(), w, carried);
+        walkExpr(i->index.get(), w, carried);
+        return;
+    }
+    if (auto* r = dynamic_cast<xfawa::ArrayRangeExpression*>(e)) {
+        walkExpr(r->array.get(), w, carried);
+        walkExpr(r->start.get(), w, carried);
+        walkExpr(r->end.get(), w, carried);
+        return;
+    }
+    if (auto* a = dynamic_cast<xfawa::ArrayLiteral*>(e)) {
+        for (auto& el : a->elements) walkExpr(el.get(), w, carried);
+        return;
+    }
+    if (auto* t = dynamic_cast<xfawa::TupleExpression*>(e)) {
+        for (auto& el : t->elements) walkExpr(el.get(), w, carried);
+        return;
+    }
+    if (auto* v = dynamic_cast<xfawa::ValueExpression*>(e)) { walkExpr(v->inner.get(), w, carried); return; }
+}
+
+void walkStmt(xfawa::Statement* s, World& w, const CarriedList& carried) {
+    if (!s) return;
+    if (auto* es = dynamic_cast<xfawa::ExpressionStatement*>(s)) { walkExpr(es->expr.get(), w, carried); return; }
+    if (auto* p = dynamic_cast<xfawa::PrintStatement*>(s)) { walkExpr(p->expr.get(), w, carried); return; }
+    if (auto* a = dynamic_cast<xfawa::AssignmentStatement*>(s)) { walkExpr(a->value.get(), w, carried); return; }
+    if (auto* r = dynamic_cast<xfawa::ReturnStatement*>(s)) { walkExpr(r->value.get(), w, carried); return; }
+    if (auto* sc = dynamic_cast<xfawa::StructCreationStatement*>(s)) {
+        for (auto& v : sc->values) walkExpr(v.get(), w, carried);
+        return;
+    }
+    if (auto* ma = dynamic_cast<xfawa::MemberAssignmentStatement*>(s)) { walkExpr(ma->value.get(), w, carried); return; }
+    if (auto* i = dynamic_cast<xfawa::IfStatement*>(s)) {
+        walkExpr(i->condition.get(), w, carried);
+        walkStmt(i->thenBranch.get(), w, carried);
+        for (auto& ei : i->elseIfBranches) {
+            walkExpr(ei.first.get(), w, carried);
+            walkStmt(ei.second.get(), w, carried);
+        }
+        walkStmt(i->elseBranch.get(), w, carried);
+        return;
+    }
+    if (auto* wh = dynamic_cast<xfawa::WhileStatement*>(s)) {
+        walkExpr(wh->condition.get(), w, carried);
+        walkStmt(wh->body.get(), w, carried);
+        return;
+    }
+    if (auto* f = dynamic_cast<xfawa::ForInStatement*>(s)) {
+        walkExpr(f->iterable.get(), w, carried);
+        walkStmt(f->body.get(), w, carried);
+        return;
+    }
+    if (auto* l = dynamic_cast<xfawa::LoopStatement*>(s)) {
+        for (auto& inner : l->body) walkStmt(inner.get(), w, carried);
+        return;
+    }
+    if (auto* t = dynamic_cast<xfawa::TryExpectStatement*>(s)) {
+        walkStmt(t->tryBlock.get(), w, carried);
+        walkStmt(t->expectBlock.get(), w, carried);
+        return;
+    }
+    if (auto* l = dynamic_cast<xfawa::LieStatement*>(s)) {
+        walkExpr(l->value.get(), w, carried);
+        walkStmt(l->body.get(), w, carried);
+        return;
+    }
+    if (auto* ig = dynamic_cast<xfawa::IgnoreStatement*>(s)) { walkStmt(ig->inner.get(), w, carried); return; }
+    if (auto* d = dynamic_cast<xfawa::DoStatement*>(s)) { walkStmt(d->inner.get(), w, carried); return; }
+    if (auto* pl = dynamic_cast<xfawa::PleaseStatement*>(s)) { walkStmt(pl->inner.get(), w, carried); return; }
+    if (auto* ea = dynamic_cast<xfawa::EnvAssignStatement*>(s)) { walkExpr(ea->value.get(), w, carried); return; }
+    if (auto* fd = dynamic_cast<xfawa::FunctionDeclarationStatement*>(s)) {
+        // A function nested in a body is carried by its own env entry, if any.
+        if (fd->func) {
+            CarriedList nested;
+            auto it = w.envCarriedOf.find(fd->func->name);
+            if (it != w.envCarriedOf.end()) nested = it->second;
+            walkStmt(fd->func->body.get(), w, nested);
+        }
+        return;
+    }
+    if (auto* b = dynamic_cast<xfawa::BlockStatement*>(s)) {
+        for (auto& sub : b->statements) walkStmt(sub.get(), w, carried);
+        return;
+    }
+    // Everything else holds no sub-expression worth rewriting.
+}
+
+void collectBlocks(xfawa::Statement* s, std::vector<xfawa::EnvBlockStatement*>& out) {
+    if (!s) return;
+    if (auto* e = dynamic_cast<xfawa::EnvBlockStatement*>(s)) out.push_back(e);
+    if (auto* b = dynamic_cast<xfawa::BlockStatement*>(s)) {
+        for (auto& sub : b->statements) collectBlocks(sub.get(), out);
+        return;
+    }
+    if (auto* i = dynamic_cast<xfawa::IfStatement*>(s)) {
+        collectBlocks(i->thenBranch.get(), out);
+        for (auto& ei : i->elseIfBranches) collectBlocks(ei.second.get(), out);
+        collectBlocks(i->elseBranch.get(), out);
+        return;
+    }
+    if (auto* wh = dynamic_cast<xfawa::WhileStatement*>(s)) { collectBlocks(wh->body.get(), out); return; }
+    if (auto* f = dynamic_cast<xfawa::ForInStatement*>(s)) { collectBlocks(f->body.get(), out); return; }
+    if (auto* l = dynamic_cast<xfawa::LoopStatement*>(s)) {
+        for (auto& inner : l->body) collectBlocks(inner.get(), out);
+        return;
+    }
+    if (auto* t = dynamic_cast<xfawa::TryExpectStatement*>(s)) {
+        collectBlocks(t->tryBlock.get(), out);
+        collectBlocks(t->expectBlock.get(), out);
+        return;
+    }
+    if (auto* li = dynamic_cast<xfawa::LieStatement*>(s)) { collectBlocks(li->body.get(), out); return; }
+    if (auto* fd = dynamic_cast<xfawa::FunctionDeclarationStatement*>(s)) {
+        if (fd->func) collectBlocks(fd->func->body.get(), out);
+        return;
+    }
+}
+
+} // namespace env_pass
+
+static void applyEnvTransform(xfawa::Program* program) {
+    using namespace env_pass;
+    World w;
+
+    for (auto& mod : program->modules) {
+        for (auto& fn : mod->functions) {
+            if (w.functionByName.count(fn->name) == 0) w.functionByName[fn->name] = fn.get();
+        }
+    }
+
+    std::vector<xfawa::EnvBlockStatement*> blocks;
+    for (auto& mod : program->modules) {
+        for (auto& fn : mod->functions) collectBlocks(fn->body.get(), blocks);
+    }
+
+    // Pass 1: the declarations themselves. Every listed function must exist; a
+    // function may sit in several blocks (one value per block); a carried name
+    // may only be declared with one type.
+    for (auto* blk : blocks) {
+        for (auto& fname : blk->functions) {
+            if (!w.functionByName.count(fname)) {
+                if (blk->error.empty()) {
+                    blk->error = "[env] 找不到被携带的函数: " + fname;
+                }
+                continue;
+            }
+            auto& carriedList = w.envCarriedOf[fname];
+            bool already = false;
+            for (const auto& cp : carriedList) {
+                if (cp.first == blk->paramName) { already = true; break; }
+            }
+            if (already) continue; // the same carried name from another block
+            carriedList.push_back({blk->paramName, blk->typeName});
+        }
+        auto typeIt = w.envTypeOf.find(blk->paramName);
+        if (typeIt == w.envTypeOf.end()) {
+            w.envTypeOf[blk->paramName] = blk->typeName;
+        } else if (typeIt->second != blk->typeName && blk->error.empty()) {
+            blk->error = "[env] " + blk->paramName + " 在别处被声明为 " +
+                         typeIt->second + "，这里却是 " + blk->typeName;
+        }
+    }
+
+    // Pass 2: give each carrying function its extra parameters, in block order.
+    // A declared param with a carried name must sit at its expected position;
+    // the missing ones are inserted at the front in reverse block order so the
+    // final prefix matches the block declaration order.
+    for (auto& entry : w.envCarriedOf) {
+        xfawa::Function* fn = w.functionByName[entry.first];
+        const auto& expected = entry.second;
+        for (size_t i = 0; i < fn->params.size(); i++) {
+            const std::string& pn = fn->params[i]->name;
+            for (size_t e = 0; e < expected.size(); e++) {
+                if (pn != expected[e].first) continue;
+                if (i != e) {
+                    for (auto* blk : blocks) {
+                        if (blk->paramName != pn) continue;
+                        if (std::find(blk->functions.begin(), blk->functions.end(), entry.first) ==
+                            blk->functions.end()) continue;
+                        if (blk->error.empty()) {
+                            blk->error = "[env] " + entry.first + " 把携带的值 " + pn +
+                                         " 声明在了第 " + std::to_string(i + 1) +
+                                         " 个参数上；它必须排在携带列表的第 " +
+                                         std::to_string(e + 1) + " 位";
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        for (size_t e = expected.size(); e-- > 0;) {
+            bool has = false;
+            for (auto& p : fn->params) {
+                if (p->name == expected[e].first) { has = true; break; }
+            }
+            if (!has) {
+                fn->params.insert(fn->params.begin(),
+                                  std::make_unique<xfawa::VariableDeclaration>(expected[e].first));
+            }
+        }
+        fn->envCarried = expected;
+    }
+
+    // Pass 3: inside a carrying function, a call to another carrying function
+    // receives the shared values on its own.
+    for (auto& mod : program->modules) {
+        for (auto& fn : mod->functions) {
+            auto it = w.envCarriedOf.find(fn->name);
+            if (it == w.envCarriedOf.end()) continue;
+            walkStmt(fn->body.get(), w, it->second);
         }
     }
 }
@@ -1048,6 +1355,19 @@ static void buildRepeatMap(
 // Non-parseable comments stay ordinary comments. `repeat:` comments handled above.
 // ---------------------------------------------------------------------------
 
+// A comment is executable only when it says something. Prose that starts with a
+// word can lex as a bare name or even as a binary expression once the operator
+// characters of a non-ASCII text fall out of the token stream, so an expression
+// statement counts as code only when it calls or holds a code value.
+static bool isExecutableCommentExpr(const xfawa::Expression* e) {
+    if (!e) return false;
+    if (dynamic_cast<const xfawa::CallExpression*>(e)) return true;
+    if (dynamic_cast<const xfawa::ValuableFragmentExpression*>(e)) return true;
+    if (dynamic_cast<const xfawa::ValuableInjectExpression*>(e)) return true;
+    if (dynamic_cast<const xfawa::ValuableCallExpression*>(e)) return true;
+    return false;
+}
+
 // Try to parse comment text as one or more xfawa statements.
 // Returns an empty vector if parsing fails (treated as plain comment).
 static std::vector<std::unique_ptr<xfawa::Statement>> tryParseExecutableComment(const std::string& text) {
@@ -1063,6 +1383,11 @@ static std::vector<std::unique_ptr<xfawa::Statement>> tryParseExecutableComment(
     if (mod->functions.empty()) return {};
     auto& fn = mod->functions[0];
     if (!fn->body) return {};
+    for (const auto& s : fn->body->statements) {
+        if (dynamic_cast<xfawa::ValuableUseStatement*>(s.get())) return {};
+        auto* exprStmt = dynamic_cast<xfawa::ExpressionStatement*>(s.get());
+        if (exprStmt && !isExecutableCommentExpr(exprStmt->expr.get())) return {};
+    }
     std::vector<std::unique_ptr<xfawa::Statement>> out;
     for (auto& s : fn->body->statements) {
         out.push_back(std::move(s));
@@ -1178,6 +1503,7 @@ static std::string expAnnotationDescription(xfawa::NodeType t) {
         case xfawa::NodeType::CENSER_STATEMENT:     return "// EXP: censer —— 内容熔断：之后控制台打印若与登记文本完全相等，打印完即退出程序";
         case xfawa::NodeType::NOCLIP_STATEMENT:     return "// EXP: noclip —— 变量跌入后室：离开正常执行空间，此后读取出现随机不稳定与传播";
         case xfawa::NodeType::SHUFFLEBACK_STATEMENT:return "// EXP: shuffleback —— 现实挫败：将所有后室变量数值随机重新洗排，顺序被打乱";
+        case xfawa::NodeType::WRONG_STATEMENT:      return "// EXP: wrong —— 程序发现一个不该出现的结果，重新计算";
         default: return "";
     }
 }
@@ -1691,6 +2017,9 @@ int main(int argc, char** argv) {
     
     // ---- EXP `lie`: rewrite variable reads to their falsified value -------
     applyLieTransform(program.get());
+    
+    // ---- EXP `env`: the carried parameter, then the calls that skip it ----
+    applyEnvTransform(program.get());
     
     // ---- EXP `wrath` / `paradox`: retroactive history + causal paradox -----
     applyWrathParadoxTransform(program.get(), xfawa::ErrorReporter::get());

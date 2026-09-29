@@ -1,0 +1,6 @@
+#test {
+    fn main() {
+        env int who { nosuch }
+        print(1)
+    }
+}

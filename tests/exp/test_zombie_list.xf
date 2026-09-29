@@ -1,0 +1,10 @@
+#test {
+    // t7 error: the plague cannot hide inside a list
+    fn main() {
+        a = 5
+        zombie a
+        b = a + 1
+        arr = [b, 2, 3]
+        print(arr[0])
+    }
+}
